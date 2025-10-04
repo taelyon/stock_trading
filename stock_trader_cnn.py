@@ -2765,7 +2765,7 @@ class CnnTrainerThread(QThread):
     def __init__(self, trader, pipe_handle, pipe_lock, partial_update=False, seq_length=5, parent=None):
         super().__init__(parent=parent)
         # Validate paths at startup
-        self.MODEL_DIR = r"C:\MyAPP\day_trading"
+        self.MODEL_DIR = r"C:\MyAPP\stock_trading"
         if not os.path.exists(self.MODEL_DIR):
             os.makedirs(self.MODEL_DIR)
         if not os.access(self.MODEL_DIR, os.W_OK):
@@ -3282,8 +3282,8 @@ class AutoTraderThread(QThread):
 
     def start_cnn_process(self):
         try:
-            python64_path = r"C:\MyAPP\day_trading\venv64\Scripts\python.exe"
-            script_path = r"C:\MyAPP\day_trading\cnn_server.py"
+            python64_path = r"C:\MyAPP\stock_trading\venv64\Scripts\python.exe"
+            script_path = r"C:\MyAPP\stock_trading\cnn_server.py"
             self.cnn_process = QProcess()
             self.cnn_process.start(python64_path, [script_path])
             if not self.cnn_process.waitForStarted():
@@ -4101,7 +4101,7 @@ class MyWindow(QWidget):
             logging.info(f"자동 매매 시작")
             send_slack_message(self.login_handler, "#stock", f"자동 매매 시작")
 
-            self.MODEL_DIR = r"C:\MyAPP\day_trading"
+            self.MODEL_DIR = r"C:\MyAPP\stock_trading"
             if not os.path.exists(self.MODEL_DIR):
                 os.makedirs(self.MODEL_DIR)
             if not os.access(self.MODEL_DIR, os.W_OK):
