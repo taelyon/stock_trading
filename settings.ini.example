@@ -1,0 +1,52 @@
+[LOGIN]
+username = YOUR_USERNAME
+password = YOUR_PASSWORD
+certpassword = YOUR_CERTPASSWORD
+autologin = True
+
+[SLACK]
+token = YOUR_SLACK_BOT_TOKEN
+channel = #stock
+
+[SETTINGS]
+last_strategy = 
+
+[TRADE_PARAMS]
+atr_weight = 0.05
+entropy_weight = 0.05
+buy_threshold_base = 0.58
+sell_threshold_base = 0.53
+threshold_weight = 0.05
+
+[STRATEGIES]
+stg_1 = VI 발동
+stg_2 = VI 발동 D1
+stg_3 = 전일상한가
+stg_4 = 급등주
+
+[VI 발동]
+buy_stg_1 = {"name": "골든크로스", "content": "(MAT5[-1] > MAT20[-1] > MAT60[-1]) and (min_close_price[-1] > MAM5[-1] > MAM10[-1]) and (OSCT[-1] > 0) and RSIT[-1] > 60 and (OSC[-1] > 0) and RSI[-1] > 60 and (tick_close_price[-1] > bb_upper[-1] * 1.02) and positive_candle and (min_close_price[-1] > VWAP[-1])"}
+sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip(tick_high_price[-3:], tick_low_price[-3:])) and (tick_high_price[-1] == tick_high_price[-2] == tick_high_price[-3])"}
+sell_stg_2 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.995 and self.stock_rate > 0.3"}
+sell_stg_3 = {"name": "OSCT 음수 전환", "content": "(OSCT[-2] < OSCT[-1] < 0)"}
+
+[VI 발동 D1]
+buy_stg_1 = {"name": "시초가", "content": "(tick_close_price[-1] > day_open_price[-1]) and (MAT60[-3] < MAT60[-2] < MAT60[-1]) and (MAT120[-3] < MAT120[-2] < MAT120[-1]) and (MA5[-1] > MA10[-1] > MA20[-1]) and (min_close_price[-1] > MA10[-1]) and (OSC[-2] < OSC[-1]) and (OSC[-1] > 0)"}
+sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip(tick_high_price[-3:], tick_low_price[-3:])) and (tick_high_price[-1] == tick_high_price[-2] == tick_high_price[-3])"}
+sell_stg_2 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.993 and self.stock_rate > 0.3"}
+
+[전일상한가]
+buy_stg_1 = {"name": "전일 상한가 시초가", "content": "(MAT5[-1] > MAT20[-1] > MAT60[-1]) and positive_candle"}
+sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip(tick_high_price[-3:], tick_low_price[-3:])) and (tick_high_price[-1] == tick_high_price[-2] == tick_high_price[-3])"}
+sell_stg_2 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.993 and self.stock_rate > 0.3"}
+
+[급등주]
+buy_stg_1 = {"name": "골든크로스", "content": "(MAT5[-1] > MAT20[-1]) and (min_close_price[-1] > MAM5[-1] > MAM10[-1]) and (OSCT[-1] > 0) and RSIT[-1] > 60 and (OSC[-1] > 0) and RSI[-1] > 60 and (tick_close_price[-1] > bb_upper[-1] * 1.02) and positive_candle and (min_close_price[-1] > VWAP[-1])"}
+sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip(tick_high_price[-3:], tick_low_price[-3:])) and (tick_high_price[-1] == tick_high_price[-2] == tick_high_price[-3])"}
+sell_stg_2 = {"name": "데드크로스", "content": "(min_close_price[-1] < MAM5[-1]) or (MAT5[-1] < MAT20[-1])"}
+sell_stg_3 = {"name": "OSCT 음수 전환", "content": "(OSCT[-2] < OSCT[-1] < 0)"}
+sell_stg_4 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.993 and self.stock_rate > 0.3"}
+
+[BUYCOUNT]
+target_buy_count = 3
+
