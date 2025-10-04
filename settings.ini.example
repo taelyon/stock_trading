@@ -11,13 +11,6 @@ channel = #stock
 [SETTINGS]
 last_strategy = 
 
-[TRADE_PARAMS]
-atr_weight = 0.05
-entropy_weight = 0.05
-buy_threshold_base = 0.58
-sell_threshold_base = 0.53
-threshold_weight = 0.05
-
 [STRATEGIES]
 stg_1 = VI 발동
 stg_2 = VI 발동 D1
