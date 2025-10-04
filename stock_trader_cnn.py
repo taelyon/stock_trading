@@ -2759,381 +2759,593 @@ class ChartDrawer(QObject):
         return labels
 
 class CnnTrainerThread(QThread):
+    """CNN 훈련 스레드 - 개선 버전"""
+    
     training_completed = pyqtSignal(bool, str, float)
     training_error = pyqtSignal(str)
 
     def __init__(self, trader, pipe_handle, pipe_lock, partial_update=False, seq_length=5, parent=None):
         super().__init__(parent=parent)
-        # Validate paths at startup
-        self.MODEL_DIR = r"C:\MyAPP\stock_trading"
-        if not os.path.exists(self.MODEL_DIR):
-            os.makedirs(self.MODEL_DIR)
-        if not os.access(self.MODEL_DIR, os.W_OK):
-            raise PermissionError(f"No write access to {self.MODEL_DIR}")
+        
+        # 경로 설정
+        self.MODEL_DIR = self._get_model_dir()
         
         self.trader = trader
         self.pipe_handle = pipe_handle
         self.pipe_lock = pipe_lock
         self.partial_update = partial_update
         self.running = True
-        self.chunk_size = 65536  # 64KB 청크 단위
-        self.max_data_size = 52428800  # 50MB 최대 데이터 크기
-        self.seq_length = seq_length  # 동적 seq_length
+        self.seq_length = seq_length
+        
+        # 통신 설정
+        self.chunk_size = 65536  # 64KB
+        self.max_data_size = 52428800  # 50MB
+        self.max_partial_update_size = 10485760  # 10MB
+        
+        # 특징 정의
+        self.tick_features = [
+            'C', 'V', 'MAT5', 'MAT20', 'MAT60', 'MAT120', 'RSIT', 'RSIT_SIGNAL',
+            'MACDT', 'MACDT_SIGNAL', 'OSCT', 'STOCHK', 'STOCHD', 'ATR', 'CCI',
+            'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER', 'BB_POSITION', 'BB_BANDWIDTH',
+            'MAT5_MAT20_DIFF', 'MAT20_MAT60_DIFF', 'MAT60_MAT120_DIFF',
+            'C_MAT5_DIFF', 'MAT5_CHANGE', 'MAT20_CHANGE', 'MAT60_CHANGE', 
+            'MAT120_CHANGE', 'VWAP'
+        ]
+        self.min_features = [
+            'MAM5', 'MAM10', 'MAM20', 'RSI', 'RSI_SIGNAL', 'MACD', 'MACD_SIGNAL',
+            'OSC', 'STOCHK', 'STOCHD', 'CCI', 'MAM5_MAM10_DIFF', 'MAM10_MAM20_DIFF',
+            'C_MAM5_DIFF', 'C_ABOVE_MAM5', 'VWAP'
+        ]
+
+    def _get_model_dir(self):
+        """모델 디렉토리 동적 설정"""
+        # 1순위: 환경변수
+        model_dir = os.getenv('CNN_MODEL_DIR')
+        if model_dir and os.path.exists(model_dir):
+            return model_dir
+        
+        # 2순위: 현재 작업 디렉토리
+        cwd_model_dir = os.path.join(os.getcwd(), 'models')
+        if not os.path.exists(cwd_model_dir):
+            os.makedirs(cwd_model_dir)
+        
+        return cwd_model_dir
 
     def run(self):
+        """훈련 메인 루프"""
         try:
             if not self.pipe_handle or not self.running:
-                logging.error("훈련 파이프 연결 없음 또는 스레드 중지됨")
-                self.training_error.emit("훈련 파이프 연결 없음 또는 스레드 중지됨")
+                self.training_error.emit("훈련 파이프 연결 없음")
                 return
 
+            # 1. 데이터 로드
+            df_tick, df_min = self._load_training_data()
+            if df_tick is None or df_min is None:
+                return
+            
+            # 2. 시퀀스 생성
+            X, y = self._create_training_sequences(df_tick, df_min)
+            if X is None or y is None:
+                return
+            
+            # 3. 데이터 검증
+            if not self._validate_training_data(X, y):
+                return
+            
+            # 4. 클래스 가중치 계산
+            scale_pos_weight = self._calculate_class_weight(y)
+            
+            # 5. 훈련 데이터 전송
+            if not self._send_training_data(X, y, scale_pos_weight):
+                return
+            
+            # 6. 응답 수신
+            self._receive_training_response()
+            
+        except Exception as ex:
+            logging.error(f"CnnTrainerThread 오류: {ex}\n{traceback.format_exc()}")
+            self.training_error.emit(f"훈련 실패: {str(ex)}")
+        finally:
+            self.running = False
+            self.quit()
+
+    # ==================== 데이터 로드 ====================
+    
+    def _load_training_data(self):
+        """훈련 데이터 로드"""
+        try:
             today = datetime.now().strftime('%Y%m%d')
-            tick_features = ['C', 'V', 'MAT5', 'MAT20', 'MAT60', 'MAT120', 'RSIT', 'RSIT_SIGNAL',
-                            'MACDT', 'MACDT_SIGNAL', 'OSCT', 'STOCHK', 'STOCHD', 'ATR', 'CCI',
-                            'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER', 'BB_POSITION', 'BB_BANDWIDTH',
-                            'MAT5_MAT20_DIFF', 'MAT20_MAT60_DIFF', 'MAT60_MAT120_DIFF',
-                            'C_MAT5_DIFF', 'MAT5_CHANGE', 'MAT20_CHANGE', 'MAT60_CHANGE', 'MAT120_CHANGE',
-                            'VWAP']
-            min_features = ['MAM5', 'MAM10', 'MAM20', 'RSI', 'RSI_SIGNAL', 'MACD', 'MACD_SIGNAL',
-                            'OSC', 'STOCHK', 'STOCHD', 'CCI', 'MAM5_MAM10_DIFF', 'MAM10_MAM20_DIFF',
-                            'C_MAM5_DIFF', 'C_ABOVE_MAM5', 'VWAP']
-
-            # 데이터 로드
+            
             if self.partial_update:
-                with self.trader.tickdata.stockdata_lock:
-                    dfs_tick = []
-                    for code, td in self.trader.tickdata.stockdata.items():
-                        if not td.get('C'):
-                            continue
-                        
-                        # ✅ VI 발동 시각 정확히 파싱
-                        if code in self.trader.starting_time:
-                            try:
-                                start_time_str = self.trader.starting_time[code]
-                                # "mm/dd HH:MM:SS" 형식을 파싱
-                                start_dt = datetime.strptime(f"{datetime.now().year}/{start_time_str}", '%Y/%m/%d %H:%M:%S')
-                                start_date = start_dt.strftime('%Y%m%d')
-                                start_hhmm = start_dt.strftime('%H%M')
-                                logging.debug(f"{code}: VI 발동 시각 = {start_time_str}, 필터 시작 = {start_hhmm}")
-                            except ValueError as ve:
-                                logging.error(f"{code}: starting_time 형식 오류 - {start_time_str}: {ve}")
-                                start_date = today
-                                start_hhmm = '0900'
-                        else:
-                            logging.debug(f"{code}: starting_time 없음, 기본값 0900 사용")
-                            start_date = today
-                            start_hhmm = '0900'
-                        
-                        # ✅ 오늘 날짜 확인
-                        if start_date != today:
-                            logging.debug(f"{code}: VI 발동 날짜({start_date})가 오늘({today}) 아님, 스킵")
-                            continue
-
-                        min_length = min(len(td.get(f, [])) for f in ['C', 'V', 'D', 'T'])
-                        
-                        # ✅ VI 발동 시각 이후 ~ 15:15까지 데이터만 필터링
-                        indices = [
-                            i for i, (d, t) in enumerate(zip(td['D'], td['T']))
-                            if i < min_length 
-                            and str(d) == today 
-                            and start_hhmm <= f"{t:04d}" <= '1515'
-                            and all(f in td and len(td[f]) > i and td[f][i] is not None 
-                                and not np.isnan(float(td[f][i])) for f in ['C', 'V'])
-                        ]
-                        
-                        if not indices:
-                            logging.debug(f"{code}: VI 발동({start_hhmm}) 이후 15:15까지 유효 데이터 없음")
-                            continue
-
-                        filtered_times = [td['T'][i] for i in indices]
-                        sequence_map = {}
-                        current_seq = {}
-                        for t in filtered_times:
-                            if t not in current_seq:
-                                current_seq[t] = 0
-                            else:
-                                current_seq[t] += 1
-                            sequence_map[t] = current_seq[t]
-
-                        # 가격 관련 피처 사용
-                        prices = np.array([td['C'][i] for i in indices])
-                        volumes = np.array([td['V'][i] for i in indices])
-
-                        mat5 = np.array([td.get('MAT5', [0]*len(indices))[i] for i in indices])
-                        mat20 = np.array([td.get('MAT20', [0]*len(indices))[i] for i in indices])
-                        mat60 = np.array([td.get('MAT60', [0]*len(indices))[i] for i in indices])
-                        mat120 = np.array([td.get('MAT120', [0]*len(indices))[i] for i in indices])
-                        
-                        if len(mat5) > 0:
-                            mat5_changes = [(mat5[k] - mat5[k-1]) if k > 0 else 0 for k in range(len(mat5))]
-                            mat20_changes = [(mat20[k] - mat20[k-1]) if k > 0 else 0 for k in range(len(mat20))]
-                            mat60_changes = [(mat60[k] - mat60[k-1]) if k > 0 else 0 for k in range(len(mat60))]
-                            mat120_changes = [(mat120[k] - mat120[k-1]) if k > 0 else 0 for k in range(len(mat120))]
-                        else:
-                            mat5_changes = [0] * len(indices)
-                            mat20_changes = [0] * len(indices)
-                            mat60_changes = [0] * len(indices)
-                            mat120_changes = [0] * len(indices)
-
-                        data_dict = {
-                            'code': code,
-                            'date': [td['D'][i] for i in indices],
-                            'time': [td['T'][i] for i in indices],
-                            'sequence': [sequence_map[td['T'][i]] for i in indices],
-                            'C': prices,
-                            'V': volumes,
-                            'MAT5_CHANGE': mat5_changes,
-                            'MAT20_CHANGE': mat20_changes,
-                            'MAT60_CHANGE': mat60_changes,
-                            'MAT120_CHANGE': mat120_changes,
-                        }
-                        for f in tick_features:
-                            if f not in ['C', 'V', 'MAT5_CHANGE', 'MAT20_CHANGE', 'MAT60_CHANGE', 'MAT120_CHANGE']:
-                                values = np.array([td.get(f, [0]*len(indices))[i] for i in indices])
-                                data_dict[f] = values
-                        
-                        logging.debug(f"{code}: 틱 데이터 {len(indices)}개 추출 (VI 발동 {start_hhmm} 이후)")
-                        dfs_tick.append(pd.DataFrame(data_dict))
-
-                    if not dfs_tick:
-                        self.training_error.emit("실시간 tick_data 없음")
-                        return
-                    df_tick = pd.concat(dfs_tick, ignore_index=True)
-
-                with self.trader.mindata.stockdata_lock:
-                    dfs_min = []
-                    for code, md in self.trader.mindata.stockdata.items():
-                        if not md.get('C'):
-                            continue
-                        
-                        # ✅ VI 발동 시각 정확히 파싱
-                        if code in self.trader.starting_time:
-                            try:
-                                start_time_str = self.trader.starting_time[code]
-                                start_dt = datetime.strptime(f"{datetime.now().year}/{start_time_str}", '%Y/%m/%d %H:%M:%S')
-                                start_date = start_dt.strftime('%Y%m%d')
-                                start_hhmm = start_dt.strftime('%H%M')
-                            except ValueError as ve:
-                                logging.error(f"{code}: starting_time 형식 오류 - {start_time_str}: {ve}")
-                                start_date = today
-                                start_hhmm = '0900'
-                        else:
-                            logging.debug(f"{code}: starting_time 없음, 기본값 0900 사용")
-                            start_date = today
-                            start_hhmm = '0900'
-                        
-                        if start_date != today:
-                            logging.debug(f"{code}: VI 발동 날짜({start_date})가 오늘({today}) 아님, 스킵")
-                            continue
-
-                        min_length = min(len(md.get(f, [])) for f in min_features + ['C', 'V', 'MAM5', 'MAM10', 'MAM20', 'D', 'T'])
-                        
-                        # ✅ VI 발동 시각 이후 데이터만 필터링
-                        indices = [
-                            i for i, (d, t) in enumerate(zip(md['D'], md['T']))
-                            if i < min_length 
-                            and str(d) == today 
-                            and start_hhmm <= f"{t:04d}" <= '1515'
-                            and all(f in md and len(md[f]) > i and md[f][i] is not None 
-                                and not np.isnan(float(md[f][i])) for f in ['C', 'V', 'MAM5', 'MAM10', 'MAM20'])
-                        ]
-                        
-                        if not indices:
-                            logging.debug(f"{code}: VI 발동({start_hhmm}) 이후 15:15까지 유효 데이터 없음")
-                            continue
-
-                        missing_features = [f for f in min_features if f not in md]
-                        if missing_features:
-                            logging.error(f"{code}: min_data 누락된 피처: {missing_features}")
-                            continue
-
-                        # 분봉 데이터
-                        prices = np.array([md['C'][i] for i in indices])
-                        volumes = np.array([md['V'][i] for i in indices])
-
-                        data_dict = {
-                            'code': code,
-                            'date': [md['D'][i] for i in indices],
-                            'time': [md['T'][i] for i in indices],
-                            'sequence': [0] * len(indices),
-                            'C': prices,
-                            'V': volumes,
-                        }
-                        for f in min_features:
-                            if f not in ['C', 'V']:
-                                values = np.array([md[f][i] for i in indices])
-                                data_dict[f] = values
-                        
-                        logging.debug(f"{code}: 분 데이터 {len(indices)}개 추출 (VI 발동 {start_hhmm} 이후)")
-                        dfs_min.append(pd.DataFrame(data_dict))
-
-                    if not dfs_min:
-                        self.training_error.emit("실시간 min_data 없음")
-                        return
-                    df_min = pd.concat(dfs_min, ignore_index=True)
+                # 실시간 데이터 로드
+                df_tick, df_min = self._load_realtime_data(today)
             else:
-                # ✅ DB에서 로드 시에도 동일하게 VI 발동 시각 필터링
-                conn = sqlite3.connect(self.trader.db_name)
-                df_tick = pd.read_sql_query(
-                    "SELECT * FROM tick_data WHERE date = ?",
-                    conn, params=(today,))
-                df_min = pd.read_sql_query(
-                    "SELECT * FROM min_data WHERE date = ?",
-                    conn, params=(today,))
-                conn.close()
+                # DB에서 로드
+                df_tick, df_min = self._load_from_database(today)
+            
+            if df_tick is None or df_tick.empty:
+                self.training_error.emit("tick_data 없음")
+                return None, None
+            
+            if df_min is None or df_min.empty:
+                self.training_error.emit("min_data 없음")
+                return None, None
+            
+            logging.info(f"데이터 로드 완료: tick={len(df_tick)}, min={len(df_min)}")
+            return df_tick, df_min
+            
+        except Exception as ex:
+            logging.error(f"_load_training_data 오류: {ex}")
+            self.training_error.emit(f"데이터 로드 실패: {str(ex)}")
+            return None, None
 
-                if df_tick.empty or df_min.empty:
-                    self.training_error.emit("tick_data or min_data 없음")
-                    return
+    def _load_realtime_data(self, today):
+        """실시간 데이터 로드 (부분 업데이트)"""
+        try:
+            df_tick = self._extract_realtime_tick_data(today)
+            df_min = self._extract_realtime_min_data(today)
+            
+            return df_tick, df_min
+            
+        except Exception as ex:
+            logging.error(f"_load_realtime_data 오류: {ex}")
+            return None, None
 
-                # 데이터베이스에서 로드된 데이터는 별도 정규화를 수행하지 않음
-                required_tick_cols = tick_features + ['code', 'date', 'time', 'sequence']
-                required_min_cols = min_features + ['code', 'date', 'time']
-                missing_tick_cols = [col for col in required_tick_cols if col not in df_tick.columns]
-                missing_min_cols = [col for col in required_min_cols if col not in df_min.columns]
-                if missing_tick_cols:
-                    self.training_error.emit(f"tick_data 누락된 컬럼: {missing_tick_cols}")
-                    return
-                if missing_min_cols:
-                    self.training_error.emit(f"min_data 누락된 컬럼: {missing_min_cols}")
-                    return
-
-                df_tick = df_tick.replace([None], np.nan)
-                df_min = df_min.replace([None], np.nan)
-                
-                for feature in tick_features:
-                    if df_tick[feature].isna().any():
-                        logging.debug(f"tick_data {feature} NaN 발견: {df_tick[feature].isna().sum()}개")
-                        df_tick[feature] = df_tick.groupby('code')[feature].fillna(method='ffill').fillna(method='bfill').fillna(0)
-                for feature in min_features:
-                    if df_min[feature].isna().any():
-                        logging.debug(f"min_data {feature} NaN 발견: {df_min[feature].isna().sum()}개")
-                        df_min[feature] = df_min.groupby('code')[feature].fillna(method='ffill').fillna(method='bfill').fillna(0)
-
-            df_tick = df_tick.sort_values(['code', 'date', 'time', 'sequence']).reset_index(drop=True)
-            df_min = df_min.sort_values(['code', 'date', 'time']).reset_index(drop=True)
-            if 'sequence' not in df_min.columns:
-                df_min['sequence'] = 0
-
-            X, y = [], []
-            for code in df_tick['code'].unique():
-                code_tick = df_tick[df_tick['code'] == code].sort_values(['date', 'time', 'sequence'])
-                code_min = df_min[df_min['code'] == code].sort_values(['date', 'time'])
-                
-                if len(code_tick) < self.seq_length + 3:
-                    logging.debug(f"{code}: tick 데이터 부족 ({len(code_tick)} < {self.seq_length + 3})")
+    def _extract_realtime_tick_data(self, today):
+        """실시간 틱 데이터 추출"""
+        with self.trader.tickdata.stockdata_lock:
+            dfs_tick = []
+            
+            for code, td in self.trader.tickdata.stockdata.items():
+                if not td.get('C'):
                     continue
+                
+                # VI 발동 시각 추출
+                start_hhmm = self._get_vi_start_time(code, today)
+                if start_hhmm is None:
+                    continue
+                
+                # 유효 인덱스 추출
+                indices = self._get_valid_realtime_tick_indices(td, code, today, start_hhmm)
+                if not indices:
+                    continue
+                
+                # 데이터프레임 생성
+                df = self._create_tick_dataframe(td, code, indices)
+                if df is not None:
+                    dfs_tick.append(df)
+            
+            if not dfs_tick:
+                return None
+            
+            return pd.concat(dfs_tick, ignore_index=True)
 
+    def _get_vi_start_time(self, code, today):
+        """VI 발동 시각 추출"""
+        if code not in self.trader.starting_time:
+            return '0900'
+        
+        try:
+            start_dt = datetime.strptime(
+                f"{datetime.now().year}/{self.trader.starting_time[code]}", 
+                '%Y/%m/%d %H:%M:%S'
+            )
+            if start_dt.strftime('%Y%m%d') == today:
+                return start_dt.strftime('%H%M')
+        except ValueError as ve:
+            logging.error(f"{code}: starting_time 형식 오류: {ve}")
+        
+        return '0900'
+
+    def _get_valid_realtime_tick_indices(self, td, code, today, start_hhmm):
+        """유효 실시간 틱 인덱스 추출"""
+        min_length = min(len(td.get(f, [])) for f in ['C', 'V', 'D', 'T'])
+        
+        indices = [
+            i for i, (d, t) in enumerate(zip(td['D'], td['T']))
+            if i < min_length 
+            and str(d) == today 
+            and start_hhmm <= f"{t:04d}" <= '1515'
+            and all(
+                f in td and len(td[f]) > i 
+                and td[f][i] is not None 
+                and not np.isnan(float(td[f][i])) 
+                for f in ['C', 'V']
+            )
+        ]
+        
+        if len(indices) < self.seq_length + 10:  # 최소 시퀀스 + 미래 데이터
+            logging.debug(f"{code}: 데이터 부족 ({len(indices)} < {self.seq_length + 10})")
+            return []
+        
+        return indices
+
+    def _create_tick_dataframe(self, td, code, indices):
+        """틱 데이터프레임 생성"""
+        try:
+            # 시퀀스 매핑
+            sequence_map = {}
+            current_seq = {}
+            for i in indices:
+                t = td['T'][i]
+                if t not in current_seq:
+                    current_seq[t] = 0
+                else:
+                    current_seq[t] += 1
+                sequence_map[i] = current_seq[t]
+            
+            # 데이터 딕셔너리 생성
+            data_dict = {
+                'code': code,
+                'date': [td['D'][i] for i in indices],
+                'time': [td['T'][i] for i in indices],
+                'sequence': [sequence_map[i] for i in indices],
+            }
+            
+            # 특징 추가
+            for feature in self.tick_features:
+                if feature.endswith('_CHANGE'):
+                    base_feature = feature.replace('_CHANGE', '')
+                    values = np.array([td.get(base_feature, [0]*len(indices))[i] for i in indices])
+                    changes = np.diff(values, prepend=values[0])
+                    data_dict[feature] = changes
+                else:
+                    data_dict[feature] = [td.get(feature, [0]*len(indices))[i] for i in indices]
+            
+            return pd.DataFrame(data_dict)
+            
+        except Exception as ex:
+            logging.error(f"{code}: 틱 데이터프레임 생성 오류: {ex}")
+            return None
+
+    def _extract_realtime_min_data(self, today):
+        """실시간 분 데이터 추출"""
+        with self.trader.mindata.stockdata_lock:
+            dfs_min = []
+            
+            for code, md in self.trader.mindata.stockdata.items():
+                if not md.get('C'):
+                    continue
+                
+                start_hhmm = self._get_vi_start_time(code, today)
+                if start_hhmm is None:
+                    continue
+                
+                indices = self._get_valid_realtime_min_indices(md, code, today, start_hhmm)
+                if not indices:
+                    continue
+                
+                df = self._create_min_dataframe(md, code, indices)
+                if df is not None:
+                    dfs_min.append(df)
+            
+            if not dfs_min:
+                return None
+            
+            return pd.concat(dfs_min, ignore_index=True)
+
+    def _get_valid_realtime_min_indices(self, md, code, today, start_hhmm):
+        """유효 실시간 분 인덱스 추출"""
+        min_length = min(len(md.get(f, [])) for f in self.min_features + ['C', 'V', 'D', 'T'])
+        
+        indices = [
+            i for i, (d, t) in enumerate(zip(md['D'], md['T']))
+            if i < min_length 
+            and str(d) == today 
+            and start_hhmm <= f"{t:04d}" <= '1515'
+            and all(
+                f in md and len(md[f]) > i 
+                and md[f][i] is not None 
+                and not np.isnan(float(md[f][i])) 
+                for f in ['C', 'V', 'MAM5', 'MAM10', 'MAM20']
+            )
+        ]
+        
+        if len(indices) < self.seq_length:
+            logging.debug(f"{code}: 분 데이터 부족 ({len(indices)} < {self.seq_length})")
+            return []
+        
+        return indices
+
+    def _create_min_dataframe(self, md, code, indices):
+        """분 데이터프레임 생성"""
+        try:
+            data_dict = {
+                'code': code,
+                'date': [md['D'][i] for i in indices],
+                'time': [md['T'][i] for i in indices],
+                'sequence': [0] * len(indices),
+            }
+            
+            for feature in self.min_features:
+                data_dict[feature] = [md.get(feature, [0]*len(indices))[i] for i in indices]
+            
+            return pd.DataFrame(data_dict)
+            
+        except Exception as ex:
+            logging.error(f"{code}: 분 데이터프레임 생성 오류: {ex}")
+            return None
+
+    def _load_from_database(self, today):
+        """DB에서 데이터 로드"""
+        try:
+            conn = sqlite3.connect(self.trader.db_name)
+            
+            df_tick = pd.read_sql_query(
+                "SELECT * FROM tick_data WHERE date = ?",
+                conn, params=(today,)
+            )
+            
+            df_min = pd.read_sql_query(
+                "SELECT * FROM min_data WHERE date = ?",
+                conn, params=(today,)
+            )
+            
+            conn.close()
+            
+            # NaN 처리
+            df_tick = df_tick.replace([None], np.nan)
+            df_min = df_min.replace([None], np.nan)
+            
+            # Forward/Backward fill
+            for feature in self.tick_features:
+                if feature in df_tick.columns and df_tick[feature].isna().any():
+                    df_tick[feature] = df_tick.groupby('code')[feature].fillna(method='ffill').fillna(method='bfill').fillna(0)
+            
+            for feature in self.min_features:
+                if feature in df_min.columns and df_min[feature].isna().any():
+                    df_min[feature] = df_min.groupby('code')[feature].fillna(method='ffill').fillna(method='bfill').fillna(0)
+            
+            return df_tick, df_min
+            
+        except Exception as ex:
+            logging.error(f"_load_from_database 오류: {ex}")
+            return None, None
+
+    # ==================== 시퀀스 생성 ====================
+    
+    def _create_training_sequences(self, df_tick, df_min):
+        """훈련 시퀀스 생성"""
+        try:
+            X, y = [], []
+            
+            for code in df_tick['code'].unique():
+                code_tick = df_tick[df_tick['code'] == code].sort_values(['date', 'time', 'sequence']).reset_index(drop=True)
+                code_min = df_min[df_min['code'] == code].sort_values(['date', 'time']).reset_index(drop=True)
+                
+                # 최소 길이 체크
+                if len(code_tick) < self.seq_length + 10:  # seq + 미래 데이터
+                    logging.debug(f"{code}: 틱 데이터 부족 ({len(code_tick)})")
+                    continue
+                
+                # 부분 업데이트 시 최근 데이터만
                 if self.partial_update:
                     code_tick = code_tick.tail(100).reset_index(drop=True)
                     code_min = code_min.tail(100).reset_index(drop=True)
-
-                data = []
-                targets = []
-                for i in range(len(code_tick) - self.seq_length + 1):
-                    tick_seq = code_tick.iloc[i:i + self.seq_length]
-                    if len(tick_seq) < self.seq_length:
-                        continue
-
-                    tick_data = tick_seq[tick_features].values
-                    if np.isnan(tick_data).any():
-                        logging.debug(f"{code}: tick_data NaN 발견, 스킵")
-                        continue
-
-                    tick_times = tick_seq['time'].values
-                    min_data_values = np.zeros((self.seq_length, len(min_features)))
-                    used_min_times = []
-                    
-                    for idx, tick_time in enumerate(tick_times):
-                        hh, mm = divmod(int(tick_time), 100)
-                        converted_mintime = hh * 60 + mm
-                        a, _ = divmod(converted_mintime, 3)
-                        interval_time = a * 3
-                        chart_time = interval_time + 3
-                        hour, minute = divmod(chart_time, 60)
-                        min_time_mapped = hour * 100 + minute
-                        if min_time_mapped > 1515:
-                            min_time_mapped = 1515
-
-                        used_min_times.append(min_time_mapped)
-                        min_data_row = code_min[code_min['time'].astype(int) == min_time_mapped][min_features]
-                        
-                        if min_data_row.empty:
-                            prev_data = code_min[code_min['time'].astype(int) < min_time_mapped][min_features + ['time']]
-                            if not prev_data.empty:
-                                min_data_values[idx] = prev_data.tail(1)[min_features].values[0]
-                                used_min_times[-1] = prev_data['time'].tail(1).iloc[0]
-                                logging.debug(f"{code}: T={tick_time}에 매핑된 min_data T={min_time_mapped} 없음, T={used_min_times[-1]} 데이터로 채움")
-                            else:
-                                logging.debug(f"{code}: T={tick_time}에 매핑된 min_data T={min_time_mapped} 없음, 0으로 채움")
-                                min_data_values[idx] = np.zeros(len(min_features))
-                        else:
-                            min_data_values[idx] = min_data_row.values[0]
-
-                    combined_data = np.hstack((tick_data, min_data_values)).flatten()
-                    expected_size = self.seq_length * (len(tick_features) + len(min_features))
-                    if len(combined_data) != expected_size:
-                        logging.error(f"{code}: 데이터 크기 불일치 - 예상 {expected_size}, 실제 {len(combined_data)}")
-                        continue
-
-                    base_price = code_tick['C'].iloc[i + self.seq_length - 1]
-                    target = np.nan
-                    max_ticks = min(3, len(code_tick) - (i + self.seq_length))
-
-                    if base_price == 0:
-                        continue
-                    if max_ticks > 0:
-                        last_price = code_tick['C'].iloc[i + self.seq_length - 1 + max_ticks]
-                        cumulative_change = (last_price - base_price) / base_price * 100
-                        if cumulative_change >= 0.5:
-                            target = 1  # 매수
-                        else:
-                            target = 0  # 매도
-
-                    data.append(combined_data)
-                    targets.append(target)
-
-                data = np.array(data)
-                targets = np.array(targets)
-                valid_mask = ~np.isnan(targets)
-                if not valid_mask.any():
-                    logging.debug(f"{code}: 유효한 타겟 없음")
-                    continue
-                data = data[valid_mask]
-                targets = targets[valid_mask].astype(int)
-
-                if np.isnan(data).any():
-                    logging.error(f"{code}: X 데이터에 NaN 존재")
-                    continue
-                if np.isnan(targets).any():
-                    logging.error(f"{code}: y 데이터에 NaN 존재")
-                    continue
-
-                X.append(data)
-                y.append(targets)
-
+                
+                # 시퀀스 생성
+                sequences = self._generate_sequences_for_code(code, code_tick, code_min)
+                if sequences:
+                    X.extend(sequences['X'])
+                    y.extend(sequences['y'])
+            
             if not X:
-                self.training_error.emit("훈련할 시퀀스 없음")
-                return
-            X = np.vstack(X)
-            y = np.hstack(y)
+                self.training_error.emit("시퀀스 생성 실패")
+                return None, None
+            
+            X = np.array(X)
+            y = np.array(y)
+            
+            logging.info(f"시퀀스 생성 완료: X={X.shape}, y={y.shape}")
+            return X, y
+            
+        except Exception as ex:
+            logging.error(f"_create_training_sequences 오류: {ex}")
+            self.training_error.emit(f"시퀀스 생성 실패: {str(ex)}")
+            return None, None
 
-            if np.isnan(X).any() or np.isnan(y).any():
-                self.training_error.emit("최종 X 또는 y에 NaN 존재")
-                return
+    def _generate_sequences_for_code(self, code, code_tick, code_min):
+        """종목별 시퀀스 생성"""
+        try:
+            data_list = []
+            targets = []
+            
+            for i in range(len(code_tick) - self.seq_length + 1):
+                # 틱 시퀀스
+                tick_seq = code_tick.iloc[i:i + self.seq_length]
+                tick_data = tick_seq[self.tick_features].values
+                
+                # NaN 체크
+                if np.isnan(tick_data).any():
+                    continue
+                
+                # 분 데이터 매핑
+                min_data = self._map_min_data_to_ticks(tick_seq, code_min)
+                if min_data is None:
+                    continue
+                
+                # 결합
+                combined_data = np.hstack((tick_data, min_data)).flatten()
+                
+                # 크기 검증
+                expected_size = self.seq_length * (len(self.tick_features) + len(self.min_features))
+                if len(combined_data) != expected_size:
+                    logging.warning(f"{code}: 데이터 크기 불일치 ({len(combined_data)} != {expected_size})")
+                    continue
+                
+                # 레이블 생성 (개선됨)
+                target = self._create_label(code_tick, i)
+                if target is None:
+                    continue
+                
+                data_list.append(combined_data)
+                targets.append(target)
+            
+            if not data_list:
+                return None
+            
+            return {'X': data_list, 'y': targets}
+            
+        except Exception as ex:
+            logging.error(f"{code}: 시퀀스 생성 오류: {ex}")
+            return None
 
-            unique_classes = np.unique(y)
+    def _map_min_data_to_ticks(self, tick_seq, code_min):
+        """틱에 분 데이터 매핑"""
+        try:
+            min_data_values = np.zeros((self.seq_length, len(self.min_features)))
+            
+            # 분 데이터 딕셔너리
+            min_dict = {
+                row['time']: idx 
+                for idx, row in code_min.iterrows()
+            }
+            
+            for idx, tick_time in enumerate(tick_seq['time'].values):
+                # 틱 시간을 분봉 시간으로 변환
+                hh, mm = divmod(int(tick_time), 100)
+                converted_mintime = hh * 60 + mm
+                a, _ = divmod(converted_mintime, 3)
+                interval_time = a * 3
+                chart_time = interval_time + 3
+                hour, minute = divmod(chart_time, 60)
+                min_time_mapped = hour * 100 + minute
+                
+                if min_time_mapped > 1515:
+                    min_time_mapped = 1515
+                
+                # 매핑
+                if min_time_mapped in min_dict:
+                    min_idx = min_dict[min_time_mapped]
+                    min_data_values[idx] = code_min.iloc[min_idx][self.min_features].values
+                else:
+                    # 이전 데이터 사용
+                    prev_times = [t for t in min_dict.keys() if t < min_time_mapped]
+                    if prev_times:
+                        prev_time = max(prev_times)
+                        min_idx = min_dict[prev_time]
+                        min_data_values[idx] = code_min.iloc[min_idx][self.min_features].values
+            
+            return min_data_values
+            
+        except Exception as ex:
+            logging.error(f"_map_min_data_to_ticks 오류: {ex}")
+            return None
+
+    def _create_label(self, code_tick, index):
+        """레이블 생성 (개선됨)"""
+        try:
+            base_price = code_tick['C'].iloc[index + self.seq_length - 1]
+            
+            if base_price == 0:
+                return None
+            
+            # ✅ 10틱 후 최고가 확인 (3틱 → 10틱)
+            max_future_ticks = min(10, len(code_tick) - (index + self.seq_length))
+            
+            if max_future_ticks < 5:  # 최소 5틱 필요
+                return None
+            
+            # 미래 가격
+            future_prices = code_tick['C'].iloc[
+                index + self.seq_length:index + self.seq_length + max_future_ticks
+            ]
+            
+            max_future_price = future_prices.max()
+            cumulative_change = (max_future_price - base_price) / base_price * 100
+            
+            # ✅ 3단계 레이블링
+            if cumulative_change >= 1.5:  # 1.5% 이상 상승
+                return 2  # 강한 매수
+            elif cumulative_change >= 0.5:  # 0.5~1.5% 상승
+                return 1  # 약한 매수
+            else:
+                return 0  # 매도
+                
+        except Exception as ex:
+            logging.error(f"_create_label 오류: {ex}")
+            return None
+
+    # ==================== 데이터 검증 ====================
+    
+    def _validate_training_data(self, X, y):
+        """훈련 데이터 검증"""
+        try:
+            # NaN/Inf 체크
+            if np.isnan(X).any():
+                nan_count = np.isnan(X).sum()
+                self.training_error.emit(f"X에 NaN {nan_count}개 존재")
+                return False
+            
+            if np.isinf(X).any():
+                inf_count = np.isinf(X).sum()
+                self.training_error.emit(f"X에 Inf {inf_count}개 존재")
+                return False
+            
+            if np.isnan(y).any():
+                self.training_error.emit("y에 NaN 존재")
+                return False
+            
+            # 클래스 분포 체크
+            unique_classes, counts = np.unique(y, return_counts=True)
+            class_dist = dict(zip(unique_classes, counts))
+            
+            logging.info(f"클래스 분포: {class_dist}")
+            
             if len(unique_classes) < 2:
-                self.training_error.emit(f"타겟 클래스 부족: {unique_classes}")
-                return
+                self.training_error.emit(f"클래스 부족: {unique_classes}")
+                return False
+            
+            # 최소 샘플 수 체크
+            min_samples_per_class = 10
+            for cls, count in class_dist.items():
+                if count < min_samples_per_class:
+                    self.training_error.emit(f"클래스 {cls} 샘플 부족 ({count} < {min_samples_per_class})")
+                    return False
+            
+            # 데이터 범위 체크
+            x_min, x_max = X.min(), X.max()
+            if abs(x_min) > 1e6 or abs(x_max) > 1e6:
+                logging.warning(f"X 범위 비정상: [{x_min:.2e}, {x_max:.2e}]")
+            
+            logging.info(f"데이터 검증 완료: X={X.shape}, y={y.shape}, 클래스={class_dist}")
+            return True
+            
+        except Exception as ex:
+            logging.error(f"_validate_training_data 오류: {ex}")
+            self.training_error.emit(f"데이터 검증 실패: {str(ex)}")
+            return False
 
-            class_counts = np.bincount(y)
-            if len(class_counts) < 2:
-                self.training_error.emit("클래스 수가 부족함")
-                return
-            scale_pos_weight = class_counts[0] / class_counts[1] if class_counts[1] > 0 else 1.0
+    def _calculate_class_weight(self, y):
+        """클래스 가중치 계산"""
+        try:
+            unique_classes, counts = np.unique(y, return_counts=True)
+            
+            if len(unique_classes) == 2:
+                # 이진 분류
+                scale_pos_weight = counts[0] / counts[1] if counts[1] > 0 else 1.0
+            else:
+                # 다중 분류
+                total = len(y)
+                scale_pos_weight = {
+                    int(cls): total / (len(unique_classes) * count)
+                    for cls, count in zip(unique_classes, counts)
+                }
+            
+            logging.info(f"클래스 가중치: {scale_pos_weight}")
+            return scale_pos_weight
+            
+        except Exception as ex:
+            logging.error(f"_calculate_class_weight 오류: {ex}")
+            return 1.0
 
+    # ==================== 데이터 전송/수신 ====================
+    
+    def _send_training_data(self, X, y, scale_pos_weight):
+        """훈련 데이터 전송"""
+        try:
             request_id = str(uuid.uuid4())
+            
             training_data = {
                 'request_id': request_id,
                 'X': X,
@@ -3142,94 +3354,133 @@ class CnnTrainerThread(QThread):
                 'partial_update': self.partial_update,
                 'seq_length': self.seq_length
             }
+            
             data_bytes = pickle.dumps(training_data)
             data_len = len(data_bytes)
-            logging.debug(f"훈련 데이터 준비 완료, 크기: {data_len} 바이트, X.shape={X.shape}, y.shape={y.shape}")
-
-            if self.partial_update and data_len > 5242880:
-                self.training_error.emit(f"훈련 데이터가 버퍼 크기(5MB)를 초과: {data_len} 바이트")
-                return
-
-            # 데이터 전송
+            
+            logging.info(f"훈련 데이터 전송 시작: {data_len} 바이트")
+            
+            # 크기 제한 체크
+            if self.partial_update and data_len > self.max_partial_update_size:
+                self.training_error.emit(f"부분 업데이트 데이터 크기 초과: {data_len} > {self.max_partial_update_size}")
+                return False
+            
+            if data_len > self.max_data_size:
+                self.training_error.emit(f"데이터 크기 초과: {data_len} > {self.max_data_size}")
+                return False
+            
+            # 청크 전송
             total_chunks = (data_len + self.chunk_size - 1) // self.chunk_size
+            
             with self.pipe_lock:
-                logging.debug("훈련 파이프 락 획득, 데이터 전송 시작")
-                try:
-                    win32file.WriteFile(self.pipe_handle, struct.pack('I', data_len))
-                    win32file.WriteFile(self.pipe_handle, struct.pack('I', total_chunks))
-                    win32file.WriteFile(self.pipe_handle, b'TRAIN')
-                    total_sent = 0
-                    for chunk_idx in range(total_chunks):
-                        if not self.running:
-                            logging.info("스레드 중지 요청, 전송 중단")
-                            return
-                        start_idx = chunk_idx * self.chunk_size
-                        end_idx = min((chunk_idx + 1) * self.chunk_size, data_len)
-                        chunk = data_bytes[start_idx:end_idx]
-                        chunk_header = struct.pack('I', chunk_idx)
-                        win32file.WriteFile(self.pipe_handle, chunk_header + chunk)
-                        total_sent += len(chunk)
-                        result = win32file.ReadFile(self.pipe_handle, 4)
-                        if result[0] != 0 or struct.unpack('I', result[1])[0] != chunk_idx:
-                            self.training_error.emit(f"청크 {chunk_idx} 전송 확인 실패")
-                            return
-
-                    if total_sent != data_len:
-                        self.training_error.emit(f"데이터 전송 불완전: {total_sent}/{data_len} 바이트")
-                        return
-                except pywintypes.error as e:
-                    if e.winerror == 109:  # ERROR_BROKEN_PIPE
-                        self.training_error.emit("훈련 파이프 연결 끊김")
-                        return
-                    raise
-
-            # 서버 응답 수신
-            with self.pipe_lock:
-                logging.debug("훈련 파이프 락 획득, 서버 응답 대기")
-                try:
+                # 헤더 전송
+                win32file.WriteFile(self.pipe_handle, struct.pack('I', data_len))
+                win32file.WriteFile(self.pipe_handle, struct.pack('I', total_chunks))
+                win32file.WriteFile(self.pipe_handle, b'TRAIN')
+                
+                # 청크 전송
+                for chunk_idx in range(total_chunks):
+                    if not self.running:
+                        logging.info("훈련 중지 요청")
+                        return False
+                    
+                    start_idx = chunk_idx * self.chunk_size
+                    end_idx = min((chunk_idx + 1) * self.chunk_size, data_len)
+                    chunk = data_bytes[start_idx:end_idx]
+                    
+                    chunk_header = struct.pack('I', chunk_idx)
+                    win32file.WriteFile(self.pipe_handle, chunk_header + chunk)
+                    
+                    # 확인 수신
                     result = win32file.ReadFile(self.pipe_handle, 4)
                     if result[0] != 0:
-                        self.training_error.emit(f"응답 길이 수신 실패: {result}")
-                        return
-                    response_len = struct.unpack('I', result[1])[0]
-                    response_data = b''
-                    while len(response_data) < response_len:
-                        chunk = win32file.ReadFile(self.pipe_handle, response_len - len(response_data))[1]
-                        response_data += chunk
-                    response = pickle.loads(response_data)
-                    if isinstance(response, dict) and response.get('status') == "TRAINING_COMPLETED":
-                        best_thr = response.get('best_threshold')
-                        self.training_completed.emit(True, f"CNN 모델 {'부분 업데이트' if self.partial_update else '전체 훈련'} 완료, {len(X)} samples", best_thr if best_thr is not None else -1.0)
-                    else:
-                        self.training_error.emit(f"훈련 실패: {response}")
-                except pywintypes.error as e:
-                    if e.winerror == 109:  # ERROR_BROKEN_PIPE
-                        self.training_error.emit("훈련 파이프 연결 끊김")
-                        return
-                    raise
-                except struct.error as e:
-                    self.training_error.emit(f"응답 파싱 실패: {e}")
-                    return
-                except Exception as e:
-                    self.training_error.emit(f"응답 처리 오류: {e}")
-                    return
-
+                        self.training_error.emit(f"청크 {chunk_idx} 확인 실패")
+                        return False
+                    
+                    ack_idx = struct.unpack('I', result[1])[0]
+                    if ack_idx != chunk_idx:
+                        self.training_error.emit(f"청크 인덱스 불일치: {ack_idx} != {chunk_idx}")
+                        return False
+                
+                logging.info("훈련 데이터 전송 완료")
+                return True
+                
+        except pywintypes.error as e:
+            if e.winerror == 109:  # ERROR_BROKEN_PIPE
+                self.training_error.emit("훈련 파이프 연결 끊김")
+            else:
+                self.training_error.emit(f"파이프 오류: {e}")
+            return False
         except Exception as ex:
-            logging.error(f"train_cnn_model -> {ex}\n{traceback.format_exc()}")
-            self.training_error.emit(str(ex))
-        finally:
-            self.running = False
-            self.quit()
-            logging.debug("CnnTrainerThread run completed")
+            logging.error(f"_send_training_data 오류: {ex}")
+            self.training_error.emit(f"데이터 전송 실패: {str(ex)}")
+            return False
+
+    def _receive_training_response(self):
+        """훈련 응답 수신"""
+        try:
+            with self.pipe_lock:
+                # 응답 길이 수신
+                result = win32file.ReadFile(self.pipe_handle, 4)
+                if result[0] != 0:
+                    self.training_error.emit("응답 길이 수신 실패")
+                    return
+                
+                response_len = struct.unpack('I', result[1])[0]
+                
+                # 응답 데이터 수신
+                response_data = b''
+                while len(response_data) < response_len:
+                    chunk = win32file.ReadFile(self.pipe_handle, response_len - len(response_data))[1]
+                    if not chunk:
+                        self.training_error.emit("응답 데이터 수신 중단")
+                        return
+                    response_data += chunk
+                
+                # 응답 파싱
+                response = pickle.loads(response_data)
+                
+                if isinstance(response, dict):
+                    status = response.get('status')
+                    
+                    if status == "TRAINING_COMPLETED":
+                        best_threshold = response.get('best_threshold', -1.0)
+                        f1_score = response.get('f1', 0.0)
+                        
+                        logging.info(f"훈련 완료: threshold={best_threshold:.3f}, f1={f1_score:.3f}")
+                        
+                        self.training_completed.emit(
+                            True, 
+                            f"훈련 완료 (F1: {f1_score:.3f})", 
+                            best_threshold
+                        )
+                    else:
+                        error_msg = response.get('status', '알 수 없는 오류')
+                        self.training_error.emit(f"훈련 실패: {error_msg}")
+                else:
+                    self.training_error.emit("응답 형식 오류")
+                    
+        except pywintypes.error as e:
+            if e.winerror == 109:
+                self.training_error.emit("훈련 파이프 연결 끊김")
+            else:
+                self.training_error.emit(f"응답 수신 오류: {e}")
+        except Exception as ex:
+            logging.error(f"_receive_training_response 오류: {ex}")
+            self.training_error.emit(f"응답 처리 실패: {str(ex)}")
 
     def stop(self):
-        logging.info("Stopping CnnTrainerThread...")
+        """스레드 정지"""
+        logging.info("CnnTrainerThread 정지 중...")
         self.running = False
         self.quit()
         self.wait()
-        logging.info("CnnTrainerThread stopped")
+        logging.info("CnnTrainerThread 정지 완료")
 
 class AutoTraderThread(QThread):
+    """자동매매 스레드"""
+    
+    # 시그널 정의
     buy_signal = pyqtSignal(str, str, str, str)
     sell_signal = pyqtSignal(str, str)
     sell_half_signal = pyqtSignal(str, str)
@@ -3239,15 +3490,51 @@ class AutoTraderThread(QThread):
     prediction_signal = pyqtSignal(str, float)
     stock_data_updated = pyqtSignal(list)
 
-    def __init__(self, trader, window, seq_length=5, buy_threshold_base=0.75, sell_threshold_base=0.65, threshold_weight=0.05):
+    def __init__(self, trader, window, seq_length=5, 
+                 buy_threshold_base=0.75, sell_threshold_base=0.65, 
+                 threshold_weight=0.05):
         super().__init__()
+        
+        # 핵심 참조
         self.trader = trader
         self.window = window
-        self.counter = 0
-        self.sell_all_emitted = False
+        
+        # 상태 플래그
         self.running = True
+        self.sell_all_emitted = False
+        self.restart_after_training = False
+        self.last_partial_update = False
+        
+        # 카운터
+        self.counter = 0
+        
+        # 매매 파라미터
+        self.buy_threshold_base = buy_threshold_base
+        self.sell_threshold_base = sell_threshold_base
+        self.threshold_weight = threshold_weight
+        self.seq_length = seq_length
+        
+        # 예측 시스템 초기화
+        self._init_prediction_system()
+        
+        # CNN 프로세스 초기화
+        self._init_cnn_process()
+        
+        # 훈련 스레드
+        self.trainer_thread = None
+
+    # ==================== 초기화 메서드 ====================
+    
+    def _init_prediction_system(self):
+        """예측 시스템 초기화"""
         self.prediction_history = {}
         self.prediction_ema = {}
+        self.prediction_cache = {}
+        self.last_prediction_time = {}
+        self.prediction_update_interval = 3.0
+
+    def _init_cnn_process(self):
+        """CNN 프로세스 관련 초기화"""
         self.training_pipe_name = r'\\.\pipe\CnnTrainingPipe'
         self.prediction_pipe_name = r'\\.\pipe\CnnPredictionPipe'
         self.training_pipe_handle = None
@@ -3255,408 +3542,681 @@ class AutoTraderThread(QThread):
         self.training_pipe_lock = threading.Lock()
         self.prediction_pipe_lock = threading.Lock()
         self.cnn_process = None
-        self.trainer_thread = None
-        self.restart_after_training = False
-        self.seq_length = seq_length
-        self.buy_threshold_base = buy_threshold_base
-        self.sell_threshold_base = sell_threshold_base
-        self.threshold_weight = threshold_weight
-        self.last_partial_update = False
-        
-        # CNN 예측 최적화 관련 추가
-        self.prediction_cache = {}  # {code: (recommendation, ema, timestamp)}
-        self.last_prediction_time = {}
-        self.prediction_update_interval = 3.0  # 3초마다 CNN 예측 갱신
 
-    def save_trade_params(self):
-        config = configparser.ConfigParser()
-        if os.path.exists('settings.ini'):
-            config.read('settings.ini', encoding='utf-8')
-        if not config.has_section('TRADE_PARAMS'):
-            config.add_section('TRADE_PARAMS')
-        config.set('TRADE_PARAMS', 'buy_threshold_base', str(round(self.buy_threshold_base, 3)))
-        config.set('TRADE_PARAMS', 'sell_threshold_base', str(round(self.sell_threshold_base, 3)))
-        config.set('TRADE_PARAMS', 'threshold_weight', str(self.threshold_weight))
-        with open('settings.ini', 'w', encoding='utf-8') as cfg:
-            config.write(cfg)
-
-    def start_cnn_process(self):
-        try:
-            python64_path = r"C:\MyAPP\stock_trading\venv64\Scripts\python.exe"
-            script_path = r"C:\MyAPP\stock_trading\cnn_server.py"
-            self.cnn_process = QProcess()
-            self.cnn_process.start(python64_path, [script_path])
-            if not self.cnn_process.waitForStarted():
-                logging.error("cnn 프로세스 시작 실패")
-                return
-            for attempt in range(20):
-                try:
-                    self.training_pipe_handle = win32file.CreateFile(
-                        self.training_pipe_name,
-                        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                        0, None,
-                        win32file.OPEN_EXISTING,
-                        0, None
-                    )
-                    self.prediction_pipe_handle = win32file.CreateFile(
-                        self.prediction_pipe_name,
-                        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-                        0, None,
-                        win32file.OPEN_EXISTING,
-                        0, None
-                    )
-                    logging.info("훈련 및 예측 파이프 연결 성공")
-                    break
-                except Exception as e:
-                    logging.debug("파이프 연결 시도 %d 실패: %s", attempt + 1, e)
-                    time.sleep(0.5)
-            else:
-                logging.error("파이프 연결 실패: 최대 시도 횟수 초과")
-                self.stop_cnn_process()
-
-        except Exception as ex:
-            logging.error(f"start_cnn_process -> %s", ex)
-
-    def stop_cnn_process(self):
-        try:
-            if self.training_pipe_handle:
-                with self.training_pipe_lock:
-                    try:
-                        win32file.WriteFile(self.training_pipe_handle, struct.pack('I', 0) + b'STOP')
-                        logging.debug("훈련 파이프에 종료 신호 전송")
-                    except pywintypes.error as e:
-                        if e.winerror != 6:
-                            logging.error(f"훈련 파이프 종료 신호 전송 오류: {e}")
-                    except Exception as e:
-                        logging.error(f"훈련 파이프 종료 신호 전송 오류: {e}")
-
-            if self.prediction_pipe_handle:
-                with self.prediction_pipe_lock:
-                    try:
-                        win32file.WriteFile(self.prediction_pipe_handle, struct.pack('I', 0) + b'STOP')
-                        logging.debug("예측 파이프에 종료 신호 전송")
-                    except pywintypes.error as e:
-                        if e.winerror != 6:
-                            logging.error(f"예측 파이프 종료 신호 전송 오류: {e}")
-                    except Exception as e:
-                        logging.error(f"예측 파이프 종료 신호 전송 오류: {e}")
-
-            if self.training_pipe_handle:
-                with self.training_pipe_lock:
-                    try:
-                        win32file.CloseHandle(self.training_pipe_handle)
-                        logging.debug("훈련 파이프 핸들 닫힘")
-                    except Exception as e:
-                        logging.error(f"훈련 파이프 핸들 닫기 오류: {e}")
-                    self.training_pipe_handle = None
-
-            if self.prediction_pipe_handle:
-                with self.prediction_pipe_lock:
-                    try:
-                        win32file.CloseHandle(self.prediction_pipe_handle)
-                        logging.debug("예측 파이프 핸들 닫힘")
-                    except Exception as e:
-                        logging.error(f"예측 파이프 핸들 닫기 오류: {e}")
-                    self.prediction_pipe_handle = None
-
-            if self.cnn_process:
-                try:
-                    self.cnn_process.terminate()
-                    if not self.cnn_process.waitForFinished(3000):
-                        self.cnn_process.kill()
-                    logging.info("cnn 프로세스 중지")
-                except Exception as e:
-                    logging.error(f"cnn 프로세스 종료 오류: {e}")
-
-        except Exception as ex:
-            logging.error(f"stop_cnn_process -> {ex}")
-
-    def start_training(self, partial_update=False):
-        if self.trainer_thread and self.trainer_thread.isRunning():
-            logging.info("이미 훈련 스레드가 실행 중입니다")
-            return
-        self.last_partial_update = partial_update
-        self.trainer_thread = CnnTrainerThread(self.trader, self.training_pipe_handle, self.training_pipe_lock, partial_update, self.seq_length)
-        self.trainer_thread.training_completed.connect(self.on_training_completed)
-        self.trainer_thread.training_error.connect(self.on_training_error)
-        self.trainer_thread.start()
-
-    def on_training_completed(self, success, message, threshold):
-        logging.info(f"{message}")
-        self.trainer_thread = None
-        if threshold and threshold > 0:
-            self.buy_threshold_base = float(threshold)
-            self.sell_threshold_base = max(0.5, self.buy_threshold_base - 0.05)
-            if self.sell_threshold_base >= self.buy_threshold_base:
-                # 매수 직후 매도되는 상황을 방지하기 위해 차이를 유지한다
-                self.buy_threshold_base = self.sell_threshold_base + 0.05
-            self.save_trade_params()
-            logging.info(f"임계치 업데이트: buy={self.buy_threshold_base:.3f}, sell={self.sell_threshold_base:.3f}")
-        if success and self.restart_after_training:
-            logging.info("모델/스케일러 생성 완료")
-            self.restart_after_training = False
-        if success and not self.last_partial_update:
-            self.trader.init_database()
-            # self.stop_cnn_process()
-            # self.start_cnn_process()
-
-    def on_training_error(self, error_message):
-        logging.error(f"훈련 오류: {error_message}")
-        self.trainer_thread = None
-        self.restart_after_training = False
-
+    # ==================== 스레드 생명주기 ====================
+    
     def run(self):
+        """메인 루프"""
         while self.running:
             self.autotrade()
             self.msleep(1000)
 
     def stop(self):
+        """스레드 정지"""
+        logging.info("AutoTraderThread 정지 시작...")
         self.running = False
+        
+        # 훈련 스레드 정지
         if self.trainer_thread and self.trainer_thread.isRunning():
-            logging.info("Stopping CnnTrainerThread...")
+            logging.info("CnnTrainerThread 정지 중...")
             self.trainer_thread.stop()
             self.trainer_thread = None
+        
+        # CNN 프로세스 정지
         self.stop_cnn_process()
+        
+        # 스레드 종료 대기
         self.quit()
         self.wait()
-        logging.info("AutoTraderThread stopped")
+        logging.info("AutoTraderThread 정지 완료")
 
-    def autotrade(self):
+    # ==================== 설정 저장 ====================
+    
+    def save_trade_params(self):
+        """거래 파라미터 저장"""
+        config = configparser.ConfigParser()
+        if os.path.exists('settings.ini'):
+            config.read('settings.ini', encoding='utf-8')
+        
+        if not config.has_section('TRADE_PARAMS'):
+            config.add_section('TRADE_PARAMS')
+        
+        config.set('TRADE_PARAMS', 'buy_threshold_base', str(round(self.buy_threshold_base, 3)))
+        config.set('TRADE_PARAMS', 'sell_threshold_base', str(round(self.sell_threshold_base, 3)))
+        config.set('TRADE_PARAMS', 'threshold_weight', str(self.threshold_weight))
+        
+        with open('settings.ini', 'w', encoding='utf-8') as cfg:
+            config.write(cfg)
+
+    # ==================== CNN 프로세스 관리 ====================
+    
+    def start_cnn_process(self):
+        """CNN 서버 프로세스 시작"""
         try:
-            t_now = datetime.now()
-            t_0903 = t_now.replace(hour=9, minute=3, second=0, microsecond=0)
-            t_0940 = t_now.replace(hour=9, minute=40, second=0, microsecond=0)
-            t_1515 = t_now.replace(hour=15, minute=15, second=0, microsecond=0)
-            t_exit = t_now.replace(hour=15, minute=20, second=0, microsecond=0)
-
-            self.counter += 1
-            self.counter_updated.emit(self.counter)
-
-            stock_data_list = []
-            for code in list(self.trader.monistock_set):
-                # 빠른 읽기: 스냅샷 사용 (락 불필요)
-                tick_latest = self.trader.tickdata.get_latest_data(code)
-                current_price = tick_latest.get('C', 0.0) if tick_latest else 0.0
-
-                upward_prob = self.prediction_ema.get(code, 0.5)
-                buy_price = self.trader.buy_price.get(code, 0.0)
-                quantity = self.trader.buy_qty.get(code, 0)
-
-                stock_data_list.append({
-                    'code': code,
-                    'current_price': float(current_price),
-                    'upward_probability': float(upward_prob),
-                    'buy_price': float(buy_price),
-                    'quantity': quantity
-                })
-
-            self.stock_data_updated.emit(stock_data_list)
-
-            if t_0903 < t_now <= t_1515:
-                current_strategy = self.window.comboStg.currentText()
-                buy_strategies = [stg for stg in self.window.strategies.get(current_strategy, []) if stg['key'].startswith('buy')]
-                sell_strategies = [stg for stg in self.window.strategies.get(current_strategy, []) if stg['key'].startswith('sell')]
-
-                if self.restart_after_training:
-                    return
-                if not self.prediction_pipe_handle:
-                    logging.warning("예측 파이프 연결 없음")
-                    return
-
-                for code in list(self.trader.monistock_set):
-                    # 실시간 최신 데이터 스냅샷 사용 (락 불필요, 매우 빠름)
-                    tick_latest = self.trader.tickdata.get_latest_data(code)
-                    min_latest = self.trader.mindata.get_latest_data(code)
-                    
-                    if not tick_latest or not min_latest:
-                        continue
-                    
-                    # 틱 데이터 최신값
-                    tick_close_price_latest = tick_latest.get('C', 0)
-                    tick_open_price_latest = tick_latest.get('O', 0)
-                    tick_high_price_latest = tick_latest.get('H', 0)
-                    tick_low_price_latest = tick_latest.get('L', 0)
-                    MAT5_latest = tick_latest.get('MAT5', 0)
-                    MAT20_latest = tick_latest.get('MAT20', 0)
-                    MAT60_latest = tick_latest.get('MAT60', 0)
-                    MAT120_latest = tick_latest.get('MAT120', 0)
-                    RSIT_latest = tick_latest.get('RSIT', 0)
-                    OSCT_latest = tick_latest.get('OSCT', 0)
-                    MACDT_SIGNAL_latest = tick_latest.get('MACDT_SIGNAL', 0)
-                    bb_upper_latest = tick_latest.get('BB_UPPER', 0)
-                    
-                    # 최근 몇 개 값 (전략 평가용)
-                    tick_close_price_recent = tick_latest.get('C_recent', [0, 0, 0])
-                    tick_high_price_recent = tick_latest.get('H_recent', [0, 0, 0])
-                    tick_low_price_recent = tick_latest.get('L_recent', [0, 0, 0])
-                    
-                    # 분 데이터 최신값
-                    min_close_price_latest = min_latest.get('C', 0)
-                    min_open_price_latest = min_latest.get('O', 0)
-                    MAM5_latest = min_latest.get('MAM5', 0)
-                    MAM10_latest = min_latest.get('MAM10', 0)
-                    MAM20_latest = min_latest.get('MAM20', 0)
-                    RSI_latest = min_latest.get('RSI', 0)
-                    OSC_latest = min_latest.get('OSC', 0)
-                    VWAP_latest = min_latest.get('VWAP', 0)
-                    
-                    # 최근 몇 개 값
-                    min_close_price_recent = min_latest.get('C_recent', [0, 0])
-                    min_open_price_recent = min_latest.get('O_recent', [0, 0])
-                    min_high_price_recent = min_latest.get('H_recent', [0, 0])
-                    min_low_price_recent = min_latest.get('L_recent', [0, 0])
-                    
-                    # positive_candle 계산 (최근 2개)
-                    positive_candle = all(
-                        min_close_price_recent[i] > min_open_price_recent[i] 
-                        for i in range(min(2, len(min_close_price_recent), len(min_open_price_recent)))
-                    )
-
-                    # 매수 로직
-                    if code not in self.trader.buyorder_set and code not in self.trader.bought_set:
-                        # 투자 대상 종목 제거 조건
-                        if code in self.trader.starting_price:
-                            if (min_close_price_latest < self.trader.starting_price[code] * 0.99 
-                                and MAM5_latest < MAM10_latest):
-                                if t_now - datetime.strptime(f"{datetime.now().year}/{self.trader.starting_time[code]}", '%Y/%m/%d %H:%M:%S') > timedelta(hours=1):
-                                    logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 투자 대상 종목 삭제")
-                                    self.stock_removed_from_monitor.emit(code)
-                                    continue
-                        
-                        # 상한가 종목 제거
-                        if len(min_high_price_recent) >= 2 and len(min_low_price_recent) >= 2:
-                            if all(x == y for x, y in zip(min_high_price_recent[-2:], min_low_price_recent[-2:])):
-                                logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 상한가 종목 삭제")
-                                self.stock_removed_from_monitor.emit(code)
-                                continue
-
-                        # CNN 예측 (캐시 사용)
-                        recommendation, ema = self.get_cnn_recommendation_cached(code)
-                        
-                        # 매수 조건 검사
-                        if t_now < t_0940:
-                            if (recommendation == "BUY" and len(self.trader.bought_set) < self.trader.target_buy_count 
-                                and min_close_price_latest > MAM5_latest > MAM10_latest 
-                                and MAT60_latest > MAT120_latest 
-                                and MACDT_SIGNAL_latest > 0  # 이전값 비교는 full_data 필요
-                                and MAT5_latest > MAT20_latest 
-                                and positive_candle 
-                                and OSCT_latest > 0  # 연속 상승 체크는 full_data 필요
-                                and ema > 0.6):
-                                self.buy_signal.emit(code, f"CNN 추천 매수({(ema * 100):.1f}%)", "0", "03")
-
-                            # 전략 기반 매수 (복잡한 조건은 full_data 필요)
-                            if current_strategy in ["급등주", "VI 발동"]:
-                                for buy_stg in buy_strategies:
-                                    buy_condition = buy_stg.get('content', '')
-                                    buy_message = buy_stg.get('name', '')
-                                    
-                                    # 복잡한 조건은 전체 데이터 필요
-                                    tick_data_full = self.trader.tickdata.get_recent_data(code, 10)
-                                    min_data_full = self.trader.mindata.get_recent_data(code, 10)
-                                    
-                                    # 전략 평가용 변수 설정
-                                    tick_close_price = tick_data_full.get('C', [0])
-                                    tick_high_price = tick_data_full.get('H', [0])
-                                    tick_low_price = tick_data_full.get('L', [0])
-                                    MAT5 = tick_data_full.get('MAT5', [0])
-                                    MAT20 = tick_data_full.get('MAT20', [0])
-                                    MAT60 = tick_data_full.get('MAT60', [0])
-                                    RSIT = tick_data_full.get('RSIT', [0])
-                                    OSCT = tick_data_full.get('OSCT', [0])
-                                    bb_upper = tick_data_full.get('BB_UPPER', [0])
-                                    
-                                    min_close_price = min_data_full.get('C', [0])
-                                    MAM5 = min_data_full.get('MAM5', [0])
-                                    MAM10 = min_data_full.get('MAM10', [0])
-                                    RSI = min_data_full.get('RSI', [0])
-                                    OSC = min_data_full.get('OSC', [0])
-                                    VWAP = min_data_full.get('VWAP', [0])
-                                    
-                                    if eval(buy_condition):
-                                        logging.debug(f"{code}, {buy_message} 매수 조건 만족")
-                                        self.buy_signal.emit(code, f"{buy_message}({(ema * 100):.1f}%)", "0", "03")
-                                        break
-
-                    # 매도 로직
-                    if code in self.trader.bought_set and code not in self.trader.buyorder_set and code not in self.trader.sellorder_set:
-                        self.trader.update_highest_price(code, tick_close_price_latest)
-                        self.stock_rate = (tick_close_price_latest / self.trader.buy_price[code] - 1) * 100
-                        
-                        # 손절매
-                        if self.stock_rate < -0.5:
-                            logging.info(f"{cpCodeMgr.CodeToName(code)}({code}), 손절매 조건 만족")
-                            self.sell_signal.emit(code, "손절매")
-                            continue
-                        
-                        # 분할 매도
-                        if self.stock_rate > 1.0:
-                            if code not in self.trader.sell_half_set:
-                                logging.info(f"{cpCodeMgr.CodeToName(code)}({code}), 분할 매도 조건 만족")
-                                self.sell_half_signal.emit(code, "1.0P 초과")
-                                continue
-
-                        # CNN 예측 (캐시 사용)
-                        recommendation, ema = self.get_cnn_recommendation_cached(code)
-                        
-                        if current_strategy == "VI 발동":
-                            if recommendation == "SELL":
-                                self.sell_signal.emit(code, f"CNN 추천 매도({(ema * 100):.1f}%)")
-
-                        # 전략 기반 매도
-                        for sell_stg in sell_strategies:
-                            sell_condition = sell_stg.get('content', '')
-                            sell_message = sell_stg.get('name', '')
-                            
-                            # 복잡한 조건은 전체 데이터 필요
-                            tick_data_full = self.trader.tickdata.get_recent_data(code, 10)
-                            min_data_full = self.trader.mindata.get_recent_data(code, 10)
-                            
-                            tick_close_price = tick_data_full.get('C', [0])
-                            tick_high_price = tick_data_full.get('H', [0])
-                            tick_low_price = tick_data_full.get('L', [0])
-                            MAT5 = tick_data_full.get('MAT5', [0])
-                            MAT20 = tick_data_full.get('MAT20', [0])
-                            OSCT = tick_data_full.get('OSCT', [0])
-                            
-                            min_close_price = min_data_full.get('C', [0])
-                            MAM5 = min_data_full.get('MAM5', [0])
-                            
-                            if eval(sell_condition):
-                                logging.debug(f"{code}, {sell_message} 매도 조건 만족")
-                                self.sell_signal.emit(code, f"{sell_message}({(ema * 100):.1f}%)")
-                                break
-
-            elif t_1515 < t_now < t_exit and not self.sell_all_emitted:
-                if self.trader.buyorder_set or self.trader.sellorder_set:
-                    return
-                
-                if self.trader.bought_set:
-                    logging.info("보유 주식 전부 매도")
-                    self.sell_all_signal.emit()
-                else:
-                    self.sell_all_emitted = True
+            python64_path = r"C:\MyAPP\day_trading\venv64\Scripts\python.exe"
+            script_path = r"C:\MyAPP\day_trading\cnn_server.py"
+            
+            # 경로 검증
+            if not os.path.exists(python64_path):
+                logging.error(f"Python 실행 파일 없음: {python64_path}")
+                logging.info("가상환경 경로를 확인하세요. 예: .venv/Scripts/python.exe")
+                return False
+            
+            if not os.path.exists(script_path):
+                logging.error(f"CNN 서버 스크립트 없음: {script_path}")
+                return False
+            
+            # 기존 프로세스 정리
+            if self.cnn_process is not None:
+                logging.warning("기존 CNN 프로세스 종료 중...")
+                self.stop_cnn_process()
+                time.sleep(1)
+            
+            logging.info("CNN 프로세스 시작 중...")
+            
+            self.cnn_process = QProcess()
+            self.cnn_process.setProcessChannelMode(QProcess.MergedChannels)
+            
+            # 시그널 연결
+            self.cnn_process.readyReadStandardOutput.connect(self._on_cnn_output)
+            self.cnn_process.readyReadStandardError.connect(self._on_cnn_error)
+            self.cnn_process.errorOccurred.connect(self._on_cnn_process_error)
+            self.cnn_process.finished.connect(self._on_cnn_finished)
+            
+            # 프로세스 시작
+            self.cnn_process.start(python64_path, [script_path])
+            
+            # 타임아웃 30초
+            if not self.cnn_process.waitForStarted(30000):
+                error_msg = self.cnn_process.errorString()
+                logging.error(f"CNN 프로세스 시작 실패: {error_msg}")
+                self._cleanup_failed_process()
+                return False
+            
+            logging.info("CNN 프로세스 시작 성공")
+            
+            # 파이프 연결
+            if not self._connect_pipes():
+                logging.error("파이프 연결 실패")
+                self.stop_cnn_process()
+                return False
+            
+            return True
 
         except Exception as ex:
-            logging.error(f"autotrade -> {ex}\n{traceback.format_exc()}")
+            logging.error(f"start_cnn_process 오류: {ex}\n{traceback.format_exc()}")
+            self._cleanup_failed_process()
+            return False
 
+    def _connect_pipes(self, max_attempts=20, retry_delay=0.5):
+        """파이프 연결"""
+        for attempt in range(max_attempts):
+            try:
+                self.training_pipe_handle = win32file.CreateFile(
+                    self.training_pipe_name,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0, None,
+                    win32file.OPEN_EXISTING,
+                    0, None
+                )
+                self.prediction_pipe_handle = win32file.CreateFile(
+                    self.prediction_pipe_name,
+                    win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                    0, None,
+                    win32file.OPEN_EXISTING,
+                    0, None
+                )
+                logging.info("파이프 연결 성공")
+                return True
+                
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    logging.debug(f"파이프 연결 시도 {attempt + 1}/{max_attempts}: {e}")
+                    time.sleep(retry_delay)
+                else:
+                    logging.error(f"파이프 연결 최종 실패: {e}")
+                    return False
+        
+        return False
+
+    def _cleanup_failed_process(self):
+        """실패한 프로세스 정리"""
+        if self.cnn_process:
+            try:
+                if self.cnn_process.state() != QProcess.NotRunning:
+                    self.cnn_process.terminate()
+                    if not self.cnn_process.waitForFinished(3000):
+                        self.cnn_process.kill()
+            except Exception as ex:
+                logging.error(f"프로세스 정리 오류: {ex}")
+            finally:
+                self.cnn_process = None
+
+    def _on_cnn_output(self):
+        """CNN 서버 출력 처리"""
+        try:
+            data = self.cnn_process.readAllStandardOutput().data().decode('utf-8', errors='ignore')
+            for line in data.strip().split('\n'):
+                if line:
+                    logging.debug(f"[CNN] {line}")
+        except Exception as ex:
+            logging.error(f"CNN 출력 처리 오류: {ex}")
+
+    def _on_cnn_error(self):
+        """CNN 서버 에러 처리"""
+        try:
+            data = self.cnn_process.readAllStandardError().data().decode('utf-8', errors='ignore')
+            for line in data.strip().split('\n'):
+                if line:
+                    logging.error(f"[CNN Error] {line}")
+        except Exception as ex:
+            logging.error(f"CNN 에러 처리 오류: {ex}")
+
+    def _on_cnn_process_error(self, error):
+        """QProcess 에러 핸들러"""
+        error_map = {
+            QProcess.FailedToStart: "프로세스 시작 실패 (파일 없음 또는 권한 부족)",
+            QProcess.Crashed: "프로세스 비정상 종료",
+            QProcess.Timedout: "프로세스 타임아웃",
+            QProcess.WriteError: "쓰기 오류",
+            QProcess.ReadError: "읽기 오류",
+            QProcess.UnknownError: "알 수 없는 오류"
+        }
+        logging.error(f"CNN 프로세스 오류: {error_map.get(error, '알 수 없음')}")
+
+    def _on_cnn_finished(self, exit_code, exit_status):
+        """CNN 프로세스 종료 핸들러"""
+        if exit_status == QProcess.CrashExit:
+            logging.error(f"CNN 프로세스 비정상 종료 (코드: {exit_code})")
+        else:
+            logging.info(f"CNN 프로세스 정상 종료 (코드: {exit_code})")
+
+    def stop_cnn_process(self):
+        """CNN 프로세스 안전 종료"""
+        try:
+            # 1. 파이프에 종료 신호 전송
+            self._send_stop_signal_to_pipes()
+            
+            # 2. 파이프 핸들 닫기
+            self._close_pipe_handles()
+            
+            # 3. 프로세스 종료
+            self._terminate_cnn_process()
+            
+            logging.info("CNN 프로세스 종료 완료")
+            
+        except Exception as ex:
+            logging.error(f"stop_cnn_process 오류: {ex}\n{traceback.format_exc()}")
+
+    def _send_stop_signal_to_pipes(self):
+        """파이프에 종료 신호 전송"""
+        stop_signal = struct.pack('I', 0) + b'STOP'
+        
+        if self.training_pipe_handle:
+            with self.training_pipe_lock:
+                try:
+                    win32file.WriteFile(self.training_pipe_handle, stop_signal)
+                    logging.debug("훈련 파이프에 종료 신호 전송")
+                except pywintypes.error as e:
+                    # ERROR_INVALID_HANDLE(6), ERROR_BROKEN_PIPE(109) 등은 무시
+                    if e.winerror not in (6, 109, 232):
+                        logging.warning(f"훈련 파이프 종료 신호 전송 실패: {e}")
+                except Exception as e:
+                    logging.warning(f"훈련 파이프 종료 신호 오류: {e}")
+        
+        if self.prediction_pipe_handle:
+            with self.prediction_pipe_lock:
+                try:
+                    win32file.WriteFile(self.prediction_pipe_handle, stop_signal)
+                    logging.debug("예측 파이프에 종료 신호 전송")
+                except pywintypes.error as e:
+                    if e.winerror not in (6, 109, 232):
+                        logging.warning(f"예측 파이프 종료 신호 전송 실패: {e}")
+                except Exception as e:
+                    logging.warning(f"예측 파이프 종료 신호 오류: {e}")
+
+    def _close_pipe_handles(self):
+        """파이프 핸들 닫기"""
+        if self.training_pipe_handle:
+            with self.training_pipe_lock:
+                try:
+                    win32file.CloseHandle(self.training_pipe_handle)
+                    logging.debug("훈련 파이프 핸들 닫기 완료")
+                except Exception as e:
+                    logging.warning(f"훈련 파이프 핸들 닫기 오류: {e}")
+                finally:
+                    self.training_pipe_handle = None
+        
+        if self.prediction_pipe_handle:
+            with self.prediction_pipe_lock:
+                try:
+                    win32file.CloseHandle(self.prediction_pipe_handle)
+                    logging.debug("예측 파이프 핸들 닫기 완료")
+                except Exception as e:
+                    logging.warning(f"예측 파이프 핸들 닫기 오류: {e}")
+                finally:
+                    self.prediction_pipe_handle = None
+
+    def _terminate_cnn_process(self):
+        """CNN 프로세스 종료"""
+        if not self.cnn_process:
+            return
+        
+        try:
+            state = self.cnn_process.state()
+            
+            if state == QProcess.NotRunning:
+                logging.debug("CNN 프로세스가 이미 종료됨")
+                return
+            
+            # 정상 종료 시도
+            self.cnn_process.terminate()
+            
+            # 3초 대기
+            if not self.cnn_process.waitForFinished(3000):
+                logging.warning("CNN 프로세스 정상 종료 실패, 강제 종료 시도")
+                self.cnn_process.kill()
+                
+                # 추가 1초 대기
+                if not self.cnn_process.waitForFinished(1000):
+                    logging.error("CNN 프로세스 강제 종료 실패")
+            else:
+                logging.debug("CNN 프로세스 정상 종료 완료")
+                
+        except Exception as e:
+            logging.error(f"CNN 프로세스 종료 오류: {e}")
+        finally:
+            self.cnn_process = None
+
+    # ==================== 훈련 관리 ====================
+    
+    def start_training(self, partial_update=False):
+        """훈련 시작"""
+        if self.trainer_thread and self.trainer_thread.isRunning():
+            logging.info("이미 훈련 스레드가 실행 중입니다")
+            return
+        
+        self.last_partial_update = partial_update
+        self.trainer_thread = CnnTrainerThread(
+            self.trader, 
+            self.training_pipe_handle, 
+            self.training_pipe_lock, 
+            partial_update, 
+            self.seq_length
+        )
+        self.trainer_thread.training_completed.connect(self.on_training_completed)
+        self.trainer_thread.training_error.connect(self.on_training_error)
+        self.trainer_thread.start()
+
+    def on_training_completed(self, success, message, threshold):
+        """훈련 완료 핸들러"""
+        logging.info(f"{message}")
+        self.trainer_thread = None
+        
+        if threshold and threshold > 0:
+            self.buy_threshold_base = float(threshold)
+            self.sell_threshold_base = max(0.5, self.buy_threshold_base - 0.05)
+            
+            # 매수 직후 매도 방지
+            if self.sell_threshold_base >= self.buy_threshold_base:
+                self.buy_threshold_base = self.sell_threshold_base + 0.05
+            
+            self.save_trade_params()
+            logging.info(f"임계치 업데이트: buy={self.buy_threshold_base:.3f}, sell={self.sell_threshold_base:.3f}")
+        
+        if success and self.restart_after_training:
+            logging.info("모델/스케일러 생성 완료")
+            self.restart_after_training = False
+        
+        if success and not self.last_partial_update:
+            self.trader.init_database()
+
+    def on_training_error(self, error_message):
+        """훈련 오류 핸들러"""
+        logging.error(f"훈련 오류: {error_message}")
+        self.trainer_thread = None
+        self.restart_after_training = False
+
+    # ==================== 자동매매 메인 로직 ====================
+    
+    def autotrade(self):
+        """자동매매 메인 루프"""
+        try:
+            t_now = datetime.now()
+            
+            # 카운터 업데이트
+            self.counter += 1
+            self.counter_updated.emit(self.counter)
+            
+            # 주식 데이터 업데이트
+            self._update_stock_data_table()
+            
+            # 시간대별 로직 실행
+            if self._is_trading_hours(t_now):
+                self._execute_trading_logic(t_now)
+            elif self._is_market_close_time(t_now):
+                self._handle_market_close()
+                
+        except Exception as ex:
+            logging.error(f"autotrade 오류: {ex}\n{traceback.format_exc()}")
+
+    def _is_trading_hours(self, t_now):
+        """거래 시간인지 확인"""
+        t_0903 = t_now.replace(hour=9, minute=3, second=0, microsecond=0)
+        t_1515 = t_now.replace(hour=15, minute=15, second=0, microsecond=0)
+        return t_0903 < t_now <= t_1515
+
+    def _is_market_close_time(self, t_now):
+        """장 종료 시간인지 확인"""
+        t_1515 = t_now.replace(hour=15, minute=15, second=0, microsecond=0)
+        t_exit = t_now.replace(hour=15, minute=20, second=0, microsecond=0)
+        return t_1515 < t_now < t_exit and not self.sell_all_emitted
+
+    def _update_stock_data_table(self):
+        """주식 데이터 테이블 업데이트"""
+        stock_data_list = []
+        
+        # 스냅샷 복사로 안전성 확보
+        monitored_codes = list(self.trader.monistock_set.copy())
+        
+        for code in monitored_codes:
+            # 재확인 (제거되었을 수 있음)
+            if code not in self.trader.monistock_set:
+                continue
+            
+            tick_latest = self.trader.tickdata.get_latest_data(code)
+            current_price = tick_latest.get('C', 0.0) if tick_latest else 0.0
+            upward_prob = self.prediction_ema.get(code, 0.5)
+            buy_price = self.trader.buy_price.get(code, 0.0)
+            quantity = self.trader.buy_qty.get(code, 0)
+
+            stock_data_list.append({
+                'code': code,
+                'current_price': float(current_price),
+                'upward_probability': float(upward_prob),
+                'buy_price': float(buy_price),
+                'quantity': quantity
+            })
+        
+        self.stock_data_updated.emit(stock_data_list)
+
+    def _execute_trading_logic(self, t_now):
+        """거래 로직 실행"""
+        current_strategy = self.window.comboStg.currentText()
+        buy_strategies = [
+            stg for stg in self.window.strategies.get(current_strategy, []) 
+            if stg['key'].startswith('buy')
+        ]
+        sell_strategies = [
+            stg for stg in self.window.strategies.get(current_strategy, []) 
+            if stg['key'].startswith('sell')
+        ]
+        
+        if self.restart_after_training or not self.prediction_pipe_handle:
+            return
+        
+        # 스냅샷 복사로 안전성 확보
+        monitored_codes = list(self.trader.monistock_set.copy())
+        
+        for code in monitored_codes:
+            # 재확인
+            if code not in self.trader.monistock_set:
+                continue
+            
+            try:
+                # 매수 로직
+                if code not in self.trader.buyorder_set and code not in self.trader.bought_set:
+                    self._evaluate_buy_condition(code, t_now, current_strategy, buy_strategies)
+                
+                # 매도 로직
+                elif (code in self.trader.bought_set and 
+                      code not in self.trader.buyorder_set and 
+                      code not in self.trader.sellorder_set):
+                    self._evaluate_sell_condition(code, t_now, current_strategy, sell_strategies)
+                    
+            except Exception as ex:
+                logging.error(f"{code} 거래 로직 오류: {ex}")
+
+    def _handle_market_close(self):
+        """장 종료 처리"""
+        if self.trader.buyorder_set or self.trader.sellorder_set:
+            return
+        
+        if self.trader.bought_set:
+            logging.info("보유 주식 전부 매도")
+            self.sell_all_signal.emit()
+        
+        self.sell_all_emitted = True
+
+    # ==================== 매수 로직 ====================
+    
+    def _evaluate_buy_condition(self, code, t_now, strategy, buy_strategies):
+        """매수 조건 평가"""
+        # 데이터 로드
+        tick_latest = self.trader.tickdata.get_latest_data(code)
+        min_latest = self.trader.mindata.get_latest_data(code)
+        
+        if not tick_latest or not min_latest:
+            return
+        
+        # 지표 검증
+        if tick_latest.get('MAT5', 0) == 0:
+            logging.debug(f"{code}: 지표 준비 미완료")
+            return
+        
+        # 투자 대상 제거 조건 체크
+        if self._should_remove_from_monitor(code, tick_latest, min_latest, t_now):
+            return
+        
+        # CNN 예측
+        recommendation, ema = self.get_cnn_recommendation_cached(code)
+        
+        # 시간대별 임계값 조정
+        buy_threshold = self._get_adjusted_buy_threshold(t_now)
+        
+        # 매수 조건 평가
+        if self._check_buy_conditions(code, strategy, tick_latest, min_latest, 
+                                       recommendation, ema, buy_threshold, buy_strategies):
+            self.buy_signal.emit(code, f"매수 신호({(ema * 100):.1f}%)", "0", "03")
+
+    def _should_remove_from_monitor(self, code, tick_latest, min_latest, t_now):
+        """투자 대상에서 제거해야 하는지 확인"""
+        min_close = min_latest.get('C', 0)
+        MAM5 = min_latest.get('MAM5', 0)
+        MAM10 = min_latest.get('MAM10', 0)
+        
+        # starting_price 기준 하락 + MAM5 < MAM10
+        if code in self.trader.starting_price:
+            if min_close < self.trader.starting_price[code] * 0.99 and MAM5 < MAM10:
+                try:
+                    vi_time = datetime.strptime(
+                        f"{datetime.now().year}/{self.trader.starting_time[code]}", 
+                        '%Y/%m/%d %H:%M:%S'
+                    )
+                    if t_now - vi_time > timedelta(hours=1):
+                        logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 투자 대상 제거 (하락)")
+                        self.stock_removed_from_monitor.emit(code)
+                        return True
+                except Exception as ex:
+                    logging.error(f"{code} VI 시각 파싱 오류: {ex}")
+        
+        # 상한가 종목 제거
+        min_high_recent = min_latest.get('H_recent', [0, 0])
+        min_low_recent = min_latest.get('L_recent', [0, 0])
+        
+        if len(min_high_recent) >= 2 and len(min_low_recent) >= 2:
+            if all(h == l for h, l in zip(min_high_recent[-2:], min_low_recent[-2:])):
+                logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 투자 대상 제거 (상한가)")
+                self.stock_removed_from_monitor.emit(code)
+                return True
+        
+        return False
+
+    def _get_adjusted_buy_threshold(self, t_now):
+        """시간대별 매수 임계값 조정"""
+        time_factor = 1.0
+        
+        if t_now > t_now.replace(hour=10, minute=0, second=0):
+            time_factor = 1.1  # 10시 이후 10% 상향
+        if t_now > t_now.replace(hour=13, minute=0, second=0):
+            time_factor = 1.2  # 13시 이후 20% 상향
+        
+        return self.buy_threshold_base * time_factor
+
+    def _check_buy_conditions(self, code, strategy, tick_latest, min_latest, 
+                              recommendation, ema, buy_threshold, buy_strategies):
+        """매수 조건 종합 체크"""
+        # 기본 조건
+        if (recommendation != "BUY" or 
+            ema <= buy_threshold or
+            len(self.trader.bought_set) >= self.trader.target_buy_count):
+            return False
+        
+        # 최신값 추출
+        min_close = min_latest.get('C', 0)
+        MAM5 = min_latest.get('MAM5', 0)
+        MAM10 = min_latest.get('MAM10', 0)
+        MAT5 = tick_latest.get('MAT5', 0)
+        MAT20 = tick_latest.get('MAT20', 0)
+        MAT60 = tick_latest.get('MAT60', 0)
+        MAT120 = tick_latest.get('MAT120', 0)
+        
+        # 최근 데이터 (트렌드)
+        tick_recent = self.trader.tickdata.get_recent_data(code, 3)
+        MACDT_SIGNAL = tick_recent.get('MACDT_SIGNAL', [0, 0, 0])
+        OSCT = tick_recent.get('OSCT', [0, 0, 0])
+        
+        macdt_increasing = (len(MACDT_SIGNAL) >= 2 and 
+                           MACDT_SIGNAL[-1] > MACDT_SIGNAL[-2])
+        osct_positive = all(x > 0 for x in OSCT[-2:])
+        
+        # positive_candle
+        min_close_recent = min_latest.get('C_recent', [0, 0])
+        min_open_recent = min_latest.get('O_recent', [0, 0])
+        positive_candle = all(
+            min_close_recent[i] > min_open_recent[i] 
+            for i in range(min(2, len(min_close_recent), len(min_open_recent)))
+        )
+        
+        # VI 발동 전략 핵심 조건
+        if strategy == "VI 발동":
+            return (min_close > MAM5 > MAM10 and
+                    MAT5 > MAT20 and
+                    MAT60 > MAT120 and
+                    macdt_increasing and
+                    osct_positive and
+                    positive_candle)
+        
+        # 기타 전략 조건 평가
+        return self._evaluate_strategy_conditions(code, buy_strategies, tick_latest, min_latest)
+
+    def _evaluate_strategy_conditions(self, code, strategies, tick_latest, min_latest):
+        """전략별 조건 평가"""
+        if not strategies:
+            return False
+        
+        # 전체 데이터 로드 (전략 평가용)
+        tick_data_full = self.trader.tickdata.get_recent_data(code, 10)
+        min_data_full = self.trader.mindata.get_recent_data(code, 10)
+        
+        # 변수 설정
+        tick_close_price = tick_data_full.get('C', [0])
+        MAT5 = tick_data_full.get('MAT5', [0])
+        MAT20 = tick_data_full.get('MAT20', [0])
+        MAT60 = tick_data_full.get('MAT60', [0])
+        RSIT = tick_data_full.get('RSIT', [0])
+        OSCT = tick_data_full.get('OSCT', [0])
+        bb_upper = tick_data_full.get('BB_UPPER', [0])
+        
+        min_close_price = min_data_full.get('C', [0])
+        MAM5 = min_data_full.get('MAM5', [0])
+        MAM10 = min_data_full.get('MAM10', [0])
+        RSI = min_data_full.get('RSI', [0])
+        OSC = min_data_full.get('OSC', [0])
+        VWAP = min_data_full.get('VWAP', [0])
+        
+        # positive_candle
+        min_close_recent = min_data_full.get('C', [0, 0])[-2:]
+        min_open_recent = min_data_full.get('O', [0, 0])[-2:]
+        positive_candle = all(
+            min_close_recent[i] > min_open_recent[i] 
+            for i in range(min(2, len(min_close_recent), len(min_open_recent)))
+        )
+        
+        # 전략 평가
+        for strategy in strategies:
+            try:
+                condition = strategy.get('content', '')
+                if eval(condition):
+                    logging.debug(f"{code}: {strategy.get('name')} 조건 만족")
+                    return True
+            except Exception as ex:
+                logging.error(f"{code} 전략 평가 오류: {ex}")
+        
+        return False
+
+    # ==================== 매도 로직 ====================
+    
+    def _evaluate_sell_condition(self, code, t_now, strategy, sell_strategies):
+        """매도 조건 평가"""
+        # 데이터 로드
+        tick_latest = self.trader.tickdata.get_latest_data(code)
+        min_latest = self.trader.mindata.get_latest_data(code)
+        
+        if not tick_latest or not min_latest:
+            return
+        
+        tick_close = tick_latest.get('C', 0)
+        
+        # 최고가 업데이트
+        self.trader.update_highest_price(code, tick_close)
+        
+        # 수익률 계산
+        buy_price = self.trader.buy_price.get(code, 0)
+        if buy_price == 0:
+            return
+        
+        self.stock_rate = (tick_close / buy_price - 1) * 100
+        
+        # 손절매
+        if self.stock_rate < -0.5:
+            logging.info(f"{cpCodeMgr.CodeToName(code)}({code}): 손절매")
+            self.sell_signal.emit(code, "손절매")
+            return
+        
+        # 분할 매도
+        if self.stock_rate > 1.0 and code not in self.trader.sell_half_set:
+            logging.info(f"{cpCodeMgr.CodeToName(code)}({code}): 분할 매도")
+            self.sell_half_signal.emit(code, "1.0% 초과")
+            return
+        
+        # CNN 예측
+        recommendation, ema = self.get_cnn_recommendation_cached(code)
+        
+        # VI 발동 전략: CNN 매도 신호
+        if strategy == "VI 발동" and recommendation == "SELL":
+            self.sell_signal.emit(code, f"CNN 매도({(ema * 100):.1f}%)")
+            return
+        
+        # 전략별 매도 조건 평가
+        if self._evaluate_strategy_conditions(code, sell_strategies, tick_latest, min_latest):
+            self.sell_signal.emit(code, f"전략 매도({(ema * 100):.1f}%)")
+
+    # ==================== CNN 예측 시스템 ====================
+    
     def get_cnn_recommendation_cached(self, code):
-        """
-        CNN 예측 캐시 사용
-        - 3초 이내: 캐시된 값 반환
-        - 3초 경과: 새로 예측
-        """
+        """CNN 예측 (캐싱 적용)"""
         current_time = time.time()
         
         # 캐시 확인
         if code in self.prediction_cache:
-            cached_recommendation, cached_ema, cached_time = self.prediction_cache[code]
+            cached_rec, cached_ema, cached_time = self.prediction_cache[code]
             
             # 3초 이내면 캐시 사용
             if current_time - cached_time < self.prediction_update_interval:
-                return cached_recommendation, cached_ema
+                return cached_rec, cached_ema
         
-        # 3초 경과 또는 캐시 없음 -> 새로 예측
+        # 새로 예측
         recommendation, ema = self.get_cnn_recommendation(code)
         
         # 캐시 업데이트
@@ -3666,269 +4226,408 @@ class AutoTraderThread(QThread):
         return recommendation if recommendation is not None else "HOLD", ema if ema is not None else 0.5
 
     def get_cnn_recommendation(self, code):
-        today = datetime.now().strftime('%Y%m%d')
-        tick_features = ['C', 'V', 'MAT5', 'MAT20', 'MAT60', 'MAT120', 'RSIT', 'RSIT_SIGNAL',
-                        'MACDT', 'MACDT_SIGNAL', 'OSCT', 'STOCHK', 'STOCHD', 'ATR', 'CCI',
-                        'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER', 'BB_POSITION', 'BB_BANDWIDTH',
-                        'MAT5_MAT20_DIFF', 'MAT20_MAT60_DIFF', 'MAT60_MAT120_DIFF',
-                        'C_MAT5_DIFF', 'MAT5_CHANGE', 'MAT20_CHANGE', 'MAT60_CHANGE', 'MAT120_CHANGE',
-                        'VWAP']
-        min_features = ['MAM5', 'MAM10', 'MAM20', 'RSI', 'RSI_SIGNAL', 'MACD', 'MACD_SIGNAL',
-                        'OSC', 'STOCHK', 'STOCHD', 'CCI', 'MAM5_MAM10_DIFF', 'MAM10_MAM20_DIFF',
-                        'C_MAM5_DIFF', 'C_ABOVE_MAM5', 'VWAP']
-
+        """CNN 예측 메인"""
         try:
-            start_hhmm = '0900'
-            if code in self.trader.starting_time:
-                try:
-                    start_time_str = self.trader.starting_time[code]
-                    start_dt = datetime.strptime(f"{datetime.now().year}/{start_time_str}", '%Y/%m/%d %H:%M:%S')
-                    if start_dt.strftime('%Y%m%d') == today:
-                        start_hhmm = start_dt.strftime('%H%M')
-                except ValueError as ve:
-                    logging.error(f"{code}: starting_time 형식 오류 - {start_time_str}: {ve}")
+            # 1. 데이터 준비
+            tick_data, min_data = self._prepare_prediction_data(code)
+            if tick_data is None or min_data is None:
+                return None, 0.5
+            
+            # 2. 시퀀스 생성
+            combined_data = self._create_prediction_sequence(code, tick_data, min_data)
+            if combined_data is None:
+                return None, 0.5
+            
+            # 3. 예측 요청
+            prediction = self._request_prediction(code, combined_data)
+            if prediction is None:
+                return None, 0.5
+            
+            # 4. 예측값 후처리
+            recommendation, ema = self._post_process_prediction(code, prediction)
+            
+            # 5. 시그널 발송
+            self.prediction_signal.emit(code, ema)
+            
+            return recommendation, ema
+            
+        except Exception as ex:
+            logging.error(f"get_cnn_recommendation({code}) 오류: {ex}")
+            return None, 0.5
 
+    def _prepare_prediction_data(self, code):
+        """예측용 데이터 준비"""
+        today = datetime.now().strftime('%Y%m%d')
+        
+        # VI 발동 시각 추출
+        start_hhmm = self._get_vi_start_time(code, today)
+        
+        # Tick 데이터 추출
+        tick_data = self._extract_tick_data(code, today, start_hhmm)
+        if tick_data is None:
+            return None, None
+        
+        # Min 데이터 추출
+        min_data = self._extract_min_data(code, today, start_hhmm)
+        
+        return tick_data, min_data
+
+    def _get_vi_start_time(self, code, today):
+        """VI 발동 시각 추출"""
+        if code in self.trader.starting_time:
+            try:
+                start_dt = datetime.strptime(
+                    f"{datetime.now().year}/{self.trader.starting_time[code]}", 
+                    '%Y/%m/%d %H:%M:%S'
+                )
+                if start_dt.strftime('%Y%m%d') == today:
+                    return start_dt.strftime('%H%M')
+            except ValueError as ve:
+                logging.error(f"{code}: starting_time 형식 오류: {ve}")
+        
+        return '0900'  # 기본값
+
+    def _extract_tick_data(self, code, today, start_hhmm):
+        """Tick 데이터 추출"""
+        tick_features = [
+            'C', 'V', 'MAT5', 'MAT20', 'MAT60', 'MAT120', 'RSIT', 'RSIT_SIGNAL',
+            'MACDT', 'MACDT_SIGNAL', 'OSCT', 'STOCHK', 'STOCHD', 'ATR', 'CCI',
+            'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER', 'BB_POSITION', 'BB_BANDWIDTH',
+            'MAT5_MAT20_DIFF', 'MAT20_MAT60_DIFF', 'MAT60_MAT120_DIFF',
+            'C_MAT5_DIFF', 'MAT5_CHANGE', 'MAT20_CHANGE', 'MAT60_CHANGE', 
+            'MAT120_CHANGE', 'VWAP'
+        ]
+        
+        with self.trader.tickdata.stockdata_lock:
+            tick_data = self.trader.tickdata.stockdata.get(code, {})
+            
+            # 검증
+            if not self._validate_tick_data(tick_data, tick_features):
+                return None
+            
+            # 유효 인덱스 추출
+            valid_indices = self._get_valid_tick_indices(tick_data, today, start_hhmm, tick_features)
+            if len(valid_indices) < self.seq_length:
+                logging.debug(f"{code}: 유효 틱 데이터 부족 ({len(valid_indices)} < {self.seq_length})")
+                return None
+            
+            # 최신 seq_length개 선택
+            indices = self._select_latest_indices(tick_data, valid_indices)
+            
+            # 데이터 추출
+            return self._build_tick_array(tick_data, indices, tick_features)
+
+    def _validate_tick_data(self, tick_data, features):
+        """Tick 데이터 유효성 검증"""
+        if not tick_data or not any(tick_data.get(f) for f in ['C', 'V', 'D', 'T']):
+            return False
+        
+        dates = tick_data.get('D', [])
+        timestamps = tick_data.get('T', [])
+        
+        if not dates or not timestamps or len(dates) != len(timestamps):
+            return False
+        
+        # 누락 피처 보완
+        for f in features:
+            if f not in tick_data or len(tick_data[f]) < max(len(dates), self.seq_length):
+                tick_data[f] = [0] * max(len(dates), self.seq_length)
+        
+        return True
+
+    def _get_valid_tick_indices(self, tick_data, today, start_hhmm, features):
+        """유효 Tick 인덱스 추출"""
+        dates = tick_data['D']
+        timestamps = tick_data['T']
+        min_length = min(len(tick_data.get(f, [])) for f in ['C', 'V', 'D', 'T'])
+        
+        return [
+            i for i in range(min_length)
+            if str(dates[i]) == today 
+            and start_hhmm <= f"{timestamps[i]:04d}" <= '1515'
+            and all(
+                len(tick_data.get(f, [])) > i 
+                and tick_data.get(f, [0])[i] is not None 
+                and not np.isnan(float(tick_data.get(f, [0])[i]))
+                for f in ['C', 'V', 'MAT5', 'RSIT', 'OSCT']  # 핵심 피처만 체크
+            )
+        ]
+
+    def _select_latest_indices(self, tick_data, valid_indices):
+        """최신 seq_length개 인덱스 선택"""
+        dates = tick_data['D']
+        timestamps = tick_data['T']
+        
+        # (날짜, 시간, 인덱스) 튜플 생성 후 정렬
+        items = [(str(dates[i]), f"{timestamps[i]:04d}", i) for i in valid_indices]
+        sorted_items = sorted(items, key=lambda x: (x[0], x[1], -x[2]), reverse=True)
+        
+        return [item[2] for item in sorted_items[:self.seq_length]]
+
+    def _build_tick_array(self, tick_data, indices, features):
+        """Tick 배열 생성"""
+        result = np.zeros((self.seq_length, len(features)))
+        
+        for j, feature in enumerate(features):
+            data_list = tick_data.get(feature, [])
+            
+            # MAT 변화율 계산
+            if feature.endswith('_CHANGE'):
+                base_feature = feature.replace('_CHANGE', '')
+                base_data = tick_data.get(base_feature, [0] * len(indices))
+                values = np.array([base_data[i] for i in indices])
+                changes = [(values[k] - values[k-1]) if k > 0 else 0 for k in range(len(values))]
+                result[:, j] = changes
+            else:
+                result[:, j] = [data_list[i] for i in indices]
+        
+        return result
+
+    def _extract_min_data(self, code, today, start_hhmm):
+        """Min 데이터 추출"""
+        min_features = [
+            'MAM5', 'MAM10', 'MAM20', 'RSI', 'RSI_SIGNAL', 'MACD', 'MACD_SIGNAL',
+            'OSC', 'STOCHK', 'STOCHD', 'CCI', 'MAM5_MAM10_DIFF', 'MAM10_MAM20_DIFF',
+            'C_MAM5_DIFF', 'C_ABOVE_MAM5', 'VWAP'
+        ]
+        
+        with self.trader.mindata.stockdata_lock:
+            min_data = self.trader.mindata.stockdata.get(code, {})
+            
+            if not min_data or not any(min_data.get(f) for f in min_features + ['D', 'T']):
+                logging.debug(f"{code}: min_data 없음")
+                return np.zeros((self.seq_length, len(min_features)))
+            
+            dates = min_data.get('D', [])
+            timestamps = min_data.get('T', [])
+            
+            if not dates or not timestamps:
+                return np.zeros((self.seq_length, len(min_features)))
+            
+            # 유효 인덱스 딕셔너리 생성
+            min_data_dict = {
+                t: i for i, t in enumerate(timestamps) 
+                if str(dates[i]) == today and start_hhmm <= f"{t:04d}" <= '1515'
+            }
+            
+            return min_data_dict, min_data, min_features
+
+    def _create_prediction_sequence(self, code, tick_data, min_data_info):
+        """예측 시퀀스 생성"""
+        try:
+            min_data_dict, min_data, min_features = min_data_info
+            
+            # Tick 시간에 대응하는 Min 데이터 매핑
+            tick_times = self.trader.tickdata.stockdata[code]['T']
             with self.trader.tickdata.stockdata_lock:
-                tick_data = self.trader.tickdata.stockdata.get(code, {})
-                if not tick_data or not any(tick_data.get(f) for f in ['C', 'V', 'D', 'T']):
-                    logging.debug(f"{code}: tick_data가 비어 있거나 초기화되지 않음")
-                    return None, 0.5
-
-                dates = tick_data.get('D', [])
-                timestamps = tick_data.get('T', [])
-                if not dates or not timestamps or len(dates) != len(timestamps):
-                    logging.debug(f"{code}: dates({len(dates)}) 또는 timestamps({len(timestamps)}) 데이터 부족")
-                    return None, 0.5
-
-                for f in tick_features:
-                    if f not in tick_data or len(tick_data[f]) < max(len(dates), self.seq_length):
-                        logging.debug(f"{code}: 피처 {f} 데이터 부족, 0으로 채움")
-                        tick_data[f] = [0] * max(len(dates), self.seq_length)
-
-                min_length = min(len(tick_data.get(f, [])) for f in ['C', 'V', 'D', 'T'])
-                valid_indices = [
-                    i for i in range(min_length)
-                    if str(dates[i]) == today and start_hhmm <= f"{timestamps[i]:04d}" <= '1515'
-                    and all(
-                        len(tick_data.get(f, [])) > i 
-                        and tick_data.get(f, [0])[i] is not None 
-                        and not np.isnan(float(tick_data.get(f, [0])[i])) 
-                        for f in tick_features
+                tick_indices = self._select_latest_indices(
+                    self.trader.tickdata.stockdata[code],
+                    self._get_valid_tick_indices(
+                        self.trader.tickdata.stockdata[code],
+                        datetime.now().strftime('%Y%m%d'),
+                        self._get_vi_start_time(code, datetime.now().strftime('%Y%m%d')),
+                        ['C', 'V']
                     )
-                ]
-                if len(valid_indices) < self.seq_length:
-                    logging.debug(f"{code}: 유효한 tick_data 인덱스 부족 - 유효 인덱스 {len(valid_indices)}, 필요 {self.seq_length}")
-                    return None, 0.5
-
-                date_times_indices = [(str(dates[i]), f"{timestamps[i]:04d}", i) for i in valid_indices]
-                sorted_items = sorted(date_times_indices, key=lambda x: (x[0], x[1], -x[2]), reverse=True)
-                indices = [item[2] for item in sorted_items][:self.seq_length]
-
-                prices = np.array([tick_data['C'][i] for i in indices])
-                volumes = np.array([tick_data['V'][i] for i in indices])
-
-                recent_tick = np.zeros((self.seq_length, len(tick_features)))
-                for j, f in enumerate(tick_features):
-                    data_list = tick_data.get(f, [])
-                    if len(data_list) < max(indices) + 1:
-                        logging.warning(f"{code}: 피처 {f} 데이터 길이 부족 - 실제 {len(data_list)}, 필요 {max(indices) + 1}")
-                        data_list = data_list + [0] * (max(indices) + 1 - len(data_list))
-                    if f == 'MAT5_CHANGE':
-                        mat5 = np.array([data_list[i] for i in indices])
-                        recent_tick[:, j] = [(mat5[k] - mat5[k-1]) if k > 0 else 0 for k in range(len(mat5))]
-                    elif f == 'MAT20_CHANGE':
-                        mat20 = np.array([data_list[i] for i in indices])
-                        recent_tick[:, j] = [(mat20[k] - mat20[k-1]) if k > 0 else 0 for k in range(len(mat20))]
-                    elif f == 'MAT60_CHANGE':
-                        mat60 = np.array([data_list[i] for i in indices])
-                        recent_tick[:, j] = [(mat60[k] - mat60[k-1]) if k > 0 else 0 for k in range(len(mat60))]
-                    elif f == 'MAT120_CHANGE':
-                        mat120 = np.array([data_list[i] for i in indices])
-                        recent_tick[:, j] = [(mat120[k] - mat120[k-1]) if k > 0 else 0 for k in range(len(mat120))]
-                    else:
-                        values = np.array([data_list[i] for i in indices])
-                        if f == 'V':
-                            values = volumes
-                        elif f == 'C':
-                            values = prices
-                        recent_tick[:, j] = values
-                tick_times = [tick_data['T'][i] for i in indices]
-
-            with self.trader.mindata.stockdata_lock:
-                min_data = self.trader.mindata.stockdata.get(code, {})
-                if not min_data or not any(min_data.get(f) for f in min_features + ['D', 'T']):
-                    logging.debug(f"{code}: min_data가 비어 있거나 초기화되지 않음")
-                    recent_min = np.zeros((self.seq_length, len(min_features)))
+                )
+            
+            tick_times_selected = [tick_times[i] for i in tick_indices]
+            
+            # Min 데이터 매핑
+            min_array = np.zeros((self.seq_length, len(min_features)))
+            
+            for idx, tick_time in enumerate(tick_times_selected):
+                # 틱 시간을 분봉 시간으로 변환
+                hh, mm = divmod(int(tick_time), 100)
+                converted_mintime = hh * 60 + mm
+                a, _ = divmod(converted_mintime, 3)
+                interval_time = a * 3
+                chart_time = interval_time + 3
+                hour, minute = divmod(chart_time, 60)
+                min_time_mapped = hour * 100 + minute
+                
+                if min_time_mapped > 1515:
+                    min_time_mapped = 1515
+                
+                # 매핑된 시간 또는 이전 시간 데이터 찾기
+                if min_time_mapped in min_data_dict:
+                    min_idx = min_data_dict[min_time_mapped]
                 else:
-                    dates = min_data.get('D', [])
-                    timestamps = min_data.get('T', [])
-                    if not dates or not timestamps or len(dates) != len(timestamps):
-                        logging.debug(f"{code}: min_data dates({len(dates)}) 또는 timestamps({len(timestamps)}) 데이터 부족")
-                        recent_min = np.zeros((self.seq_length, len(min_features)))
+                    prev_times = [t for t in min_data_dict.keys() if t < min_time_mapped]
+                    if prev_times:
+                        min_time_mapped = max(prev_times)
+                        min_idx = min_data_dict[min_time_mapped]
                     else:
-                        prices = np.array([min_data['C'][i] for i in range(len(min_data['C'])) if i < len(dates) and str(dates[i]) == today])
-                        volumes = np.array([min_data['V'][i] for i in range(len(min_data['V'])) if i < len(dates) and str(dates[i]) == today])
-
-                        recent_min = np.zeros((self.seq_length, len(min_features)))
-                        min_data_dict = {t: i for i, t in enumerate(timestamps) if str(dates[i]) == today 
-                                        and start_hhmm <= f"{t:04d}" <= '1515'}
-                        used_min_times = []
-                        for idx, tick_time in enumerate(tick_times):
-                            hh, mm = divmod(int(tick_time), 100)
-                            converted_mintime = hh * 60 + mm
-                            a, _ = divmod(converted_mintime, 3)
-                            interval_time = a * 3
-                            chart_time = interval_time + 3
-                            hour, minute = divmod(chart_time, 60)
-                            min_time_mapped = hour * 100 + minute
-                            if min_time_mapped > 1515:
-                                min_time_mapped = 1515
-
-                            used_min_times.append(min_time_mapped)
-                            if min_time_mapped in min_data_dict:
-                                min_idx = min_data_dict[min_time_mapped]
-                                if all(len(min_data.get(f, [])) > min_idx and min_data.get(f, [0])[min_idx] is not None 
-                                    and not np.isnan(float(min_data.get(f, [0])[min_idx])) for f in ['C', 'V', 'MAM5', 'MAM10', 'MAM20']):
-                                    values = [min_data.get(f, [0])[min_idx] for f in min_features]
-                                    for j, f in enumerate(min_features):
-                                        recent_min[idx, j] = values[j]
-                                else:
-                                    prev_times = [t for t in min_data_dict.keys() if t < min_time_mapped]
-                                    if prev_times:
-                                        prev_time = max(prev_times)
-                                        min_idx = min_data_dict[prev_time]
-                                        values = [min_data.get(f, [0])[min_idx] for f in min_features]
-                                        for j, f in enumerate(min_features):
-                                            recent_min[idx, j] = values[j]
-                                        used_min_times[-1] = prev_time
-                                    else:
-                                        logging.debug(f"{code}: T={tick_time}에 매핑된 min_data T={min_time_mapped}에 유효 데이터 없음, 0으로 채움")
-                                        recent_min[idx] = np.zeros(len(min_features))
-                            else:
-                                prev_times = [t for t in min_data_dict.keys() if t < min_time_mapped]
-                                if prev_times:
-                                    prev_time = max(prev_times)
-                                    min_idx = min_data_dict[prev_time]
-                                    values = [min_data.get(f, [0])[min_idx] for f in min_features]
-                                    for j, f in enumerate(min_features):
-                                        recent_min[idx, j] = values[j]
-                                    used_min_times[-1] = prev_time
-                                else:
-                                    logging.debug(f"{code}: T={tick_time}에 매핑된 min_data T={min_time_mapped} 없음, 0으로 채움")
-                                    recent_min[idx] = np.zeros(len(min_features))
-
-            combined_data = np.hstack((recent_tick, recent_min)).flatten().reshape(1, -1)
-            expected_size = (1, self.seq_length * (len(tick_features) + len(min_features)))
+                        continue
+                
+                # 데이터 추출
+                for j, feature in enumerate(min_features):
+                    values = min_data.get(feature, [])
+                    if len(values) > min_idx:
+                        min_array[idx, j] = values[min_idx]
+            
+            # 결합
+            combined_data = np.hstack((tick_data, min_array)).flatten().reshape(1, -1)
+            
+            # 검증
+            expected_size = (1, self.seq_length * (len(tick_data[0]) + len(min_features)))
             if combined_data.shape != expected_size:
                 logging.error(f"{code}: 데이터 크기 불일치 - 예상 {expected_size}, 실제 {combined_data.shape}")
-                return None, 0.5
+                return None
+            
+            return combined_data
+            
+        except Exception as ex:
+            logging.error(f"_create_prediction_sequence({code}) 오류: {ex}")
+            return None
 
+    def _request_prediction(self, code, combined_data):
+        """예측 요청"""
+        try:
             request_id = str(uuid.uuid4())
-            # logging.debug(f"{code}: 생성된 request_id: {request_id}, 데이터 shape: {combined_data.shape}")
-            combined_data_with_id = {'request_id': request_id, 'data': combined_data}
+            combined_data_with_id = {
+                'request_id': request_id, 
+                'data': combined_data
+            }
+            
             with self.prediction_pipe_lock:
                 data_bytes = pickle.dumps(combined_data_with_id)
                 data_len = len(data_bytes)
-                try:
-                    win32file.WriteFile(self.prediction_pipe_handle, struct.pack('I', data_len))
-                    win32file.WriteFile(self.prediction_pipe_handle, b'PREDI')
-                    win32file.WriteFile(self.prediction_pipe_handle, data_bytes)
+                
+                # 전송
+                win32file.WriteFile(self.prediction_pipe_handle, struct.pack('I', data_len))
+                win32file.WriteFile(self.prediction_pipe_handle, b'PREDI')
+                win32file.WriteFile(self.prediction_pipe_handle, data_bytes)
 
-                    result = win32file.ReadFile(self.prediction_pipe_handle, 4)
-                    if result[0] != 0:
-                        logging.error(f"{code}: 예측 파이프 읽기 실패: {result}")
-                        return None, 0.5
-                    prediction_len = struct.unpack('I', result[1])[0]
-                    prediction_data = b''
-                    while len(prediction_data) < prediction_len:
-                        chunk = win32file.ReadFile(self.prediction_pipe_handle, prediction_len - len(prediction_data))[1]
-                        if not chunk:
-                            logging.error(f"{code}: 예측 데이터 수신 중 데이터 손실")
-                            break
-                        prediction_data += chunk
-                    if len(prediction_data) != prediction_len:
-                        logging.error(f"{code}: 수신 데이터 길이 불일치 - 예상 {prediction_len}, 실제 {len(prediction_data)}")
-                        return None, 0.5
-                    response = pickle.loads(prediction_data)
-                    # logging.debug(f"{code}: 수신 응답 - request_id: {response.get('request_id')}, prediction: {response.get('prediction')}")
-                    if isinstance(response, dict):
-                        if 'error' in response and response['error']:
-                            error_msg = response['error']
-                            logging.error(f"{code}: 서버 오류: {error_msg}")
-                            if 'Feature count mismatch' in error_msg:
-                                try:
-                                    expected = int(error_msg.split('expected')[1].split(',')[0].strip())
-                                    features_per_step = len(tick_features) + len(min_features)
-                                    new_seq = expected // features_per_step
-                                    if new_seq > 0 and new_seq != self.seq_length:
-                                        logging.warning(f"{code}: seq_length {self.seq_length} -> {new_seq} (서버 요구)")
-                                        self.seq_length = new_seq
-                                except Exception as parse_err:
-                                    logging.warning(f"{code}: seq_length 파싱 실패: {parse_err}")
-                            return None, 0.5
-                        if response.get('request_id') == request_id:
-                            prediction = response['prediction']
-                        else:
-                            logging.error(f"{code}: 요청 ID 불일치 또는 잘못된 응답: {response}")
-                            return None, 0.5
+                # 수신
+                result = win32file.ReadFile(self.prediction_pipe_handle, 4)
+                if result[0] != 0:
+                    logging.error(f"{code}: 예측 파이프 읽기 실패")
+                    return None
+                
+                prediction_len = struct.unpack('I', result[1])[0]
+                prediction_data = b''
+                
+                while len(prediction_data) < prediction_len:
+                    chunk = win32file.ReadFile(
+                        self.prediction_pipe_handle, 
+                        prediction_len - len(prediction_data)
+                    )[1]
+                    if not chunk:
+                        logging.error(f"{code}: 예측 데이터 수신 중 손실")
+                        break
+                    prediction_data += chunk
+                
+                if len(prediction_data) != prediction_len:
+                    logging.error(f"{code}: 수신 데이터 길이 불일치")
+                    return None
+                
+                response = pickle.loads(prediction_data)
+                
+                # 응답 검증
+                if isinstance(response, dict):
+                    if 'error' in response and response['error']:
+                        error_msg = response['error']
+                        logging.error(f"{code}: 서버 오류: {error_msg}")
+                        
+                        # Feature count mismatch 처리
+                        if 'Feature count mismatch' in error_msg:
+                            self._handle_feature_mismatch(error_msg)
+                        
+                        return None
+                    
+                    if response.get('request_id') == request_id:
+                        return response['prediction']
                     else:
-                        logging.error(f"{code}: 응답 형식 오류: {response}")
-                        return None, 0.5
-                except pywintypes.error as e:
-                    if e.winerror == 109:
-                        logging.error(f"{code}: 예측 파이프 연결 끊김")
-                        return None, 0.5
-                    raise
-                except Exception as e:
-                    logging.error(f"{code}: 예측 요청 오류: {e}")
-                    return None, 0.5
+                        logging.error(f"{code}: 요청 ID 불일치")
+                        return None
+                else:
+                    logging.error(f"{code}: 응답 형식 오류")
+                    return None
+                    
+        except pywintypes.error as e:
+            if e.winerror == 109:  # ERROR_BROKEN_PIPE
+                logging.error(f"{code}: 예측 파이프 연결 끊김")
+            else:
+                logging.error(f"{code}: 예측 파이프 오류: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"{code}: 예측 요청 오류: {e}")
+            return None
 
-            if code not in self.prediction_history:
-                self.prediction_history[code] = []
+    def _handle_feature_mismatch(self, error_msg):
+        """Feature count mismatch 처리"""
+        try:
+            # "expected 145, got 130" 형식에서 숫자 추출
+            expected = int(error_msg.split('expected')[1].split(',')[0].strip())
+            tick_features_count = 29
+            min_features_count = 16
+            features_per_step = tick_features_count + min_features_count
+            
+            new_seq = expected // features_per_step
+            
+            if new_seq > 0 and new_seq != self.seq_length:
+                logging.warning(f"seq_length {self.seq_length} -> {new_seq} (서버 요구)")
+                self.seq_length = new_seq
+        except Exception as parse_err:
+            logging.warning(f"seq_length 파싱 실패: {parse_err}")
 
-            try:
-                prediction = float(prediction)
-                if not 0 <= prediction <= 1:
-                    logging.warning(f"{code}: 비정상 예측값 {prediction}, 기본값 0.5 사용")
-                    prediction = 0.5
-            except (ValueError, TypeError) as e:
-                logging.error(f"{code}: 예측값 변환 실패 - {prediction}: {e}")
+    def _post_process_prediction(self, code, prediction):
+        """예측값 후처리"""
+        try:
+            # 예측값 검증
+            prediction = float(prediction)
+            if not 0 <= prediction <= 1:
+                logging.warning(f"{code}: 비정상 예측값 {prediction}, 기본값 0.5 사용")
                 prediction = 0.5
-
-            ema_window = 3
-            self.prediction_history[code].append(prediction)
-            self.prediction_history[code] = self.prediction_history[code][-ema_window*2:]
-            if len(self.prediction_history[code]) >= ema_window:
-                ema_array = talib.EMA(np.array(self.prediction_history[code], dtype=np.float64), timeperiod=ema_window)
-                ema = ema_array[-1]
-            else:
-                ema = np.mean(self.prediction_history[code])
-            self.prediction_ema[code] = ema
-
-            atr_values = self.trader.tickdata.stockdata[code].get('ATR', [0])[-ema_window:]
-            atr_normalized = (atr_values[-1] - min(atr_values)) / (max(atr_values) - min(atr_values) + 1e-6) if atr_values else 0.0
-
-            from scipy.stats import entropy
-            hist, _ = np.histogram(self.prediction_history[code], bins=10, range=(0, 1), density=True)
-            pred_entropy = entropy(hist + 1e-6) / np.log(10)
-
-            buy_threshold = self.buy_threshold_base + self.threshold_weight * (atr_normalized + pred_entropy)
-            sell_threshold = self.sell_threshold_base - self.threshold_weight * (atr_normalized + pred_entropy)
-
-            if ema > buy_threshold:
-                recommendation = "BUY"
-            elif ema < sell_threshold:
-                recommendation = "SELL"
-            else:
-                recommendation = "HOLD"
-
-            self.prediction_signal.emit(code, ema)
-            return recommendation, ema
-
-        except Exception as ex:
-            logging.error(f"get_cnn_recommendation -> {ex}\n{traceback.format_exc()}")
-            return None, 0.5
-
+        except (ValueError, TypeError) as e:
+            logging.error(f"{code}: 예측값 변환 실패: {e}")
+            prediction = 0.5
+        
+        # 예측 이력 저장
+        if code not in self.prediction_history:
+            self.prediction_history[code] = []
+        
+        ema_window = 3
+        self.prediction_history[code].append(prediction)
+        self.prediction_history[code] = self.prediction_history[code][-ema_window*2:]
+        
+        # EMA 계산
+        if len(self.prediction_history[code]) >= ema_window:
+            ema_array = talib.EMA(
+                np.array(self.prediction_history[code], dtype=np.float64), 
+                timeperiod=ema_window
+            )
+            ema = ema_array[-1]
+        else:
+            ema = np.mean(self.prediction_history[code])
+        
+        self.prediction_ema[code] = ema
+        
+        # ATR 정규화
+        atr_values = self.trader.tickdata.stockdata.get(code, {}).get('ATR', [0])[-ema_window:]
+        if atr_values and max(atr_values) > min(atr_values):
+            atr_normalized = (atr_values[-1] - min(atr_values)) / (max(atr_values) - min(atr_values))
+        else:
+            atr_normalized = 0.0
+        
+        # 엔트로피 계산
+        hist, _ = np.histogram(self.prediction_history[code], bins=10, range=(0, 1), density=True)
+        pred_entropy = entropy(hist + 1e-6) / np.log(10)
+        
+        # 동적 임계값 계산
+        buy_threshold = self.buy_threshold_base + self.threshold_weight * (atr_normalized + pred_entropy)
+        sell_threshold = self.sell_threshold_base - self.threshold_weight * (atr_normalized + pred_entropy)
+        
+        # 추천 결정
+        if ema > buy_threshold:
+            recommendation = "BUY"
+        elif ema < sell_threshold:
+            recommendation = "SELL"
+        else:
+            recommendation = "HOLD"
+        
+        return recommendation, ema
+    
 class LoginHandler:
     def __init__(self, parent_window):
         self.parent = parent_window
