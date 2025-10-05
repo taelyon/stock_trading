@@ -2214,26 +2214,31 @@ class CTrader(QObject):
         self.save_data_timer.start(600000)
 
     def init_database(self):
+        """데이터베이스 초기화"""
         try:
             if os.path.exists(self.db_name):
                 os.remove(self.db_name)
                 logging.debug(f"{self.db_name} 삭제 완료")
-            else:
-                logging.debug(f"{self.db_name} 파일이 이미 존재하지 않음")
 
             conn = sqlite3.connect(self.db_name)
             cursor = conn.cursor()
+            
+            # ==================== 차트 데이터 테이블 ====================
+            
+            # 틱 데이터
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS tick_data (
                     code TEXT, date TEXT, time TEXT, sequence INTEGER, C REAL, V INTEGER,
                     MAT5 REAL, MAT20 REAL, MAT60 REAL, MAT120 REAL, RSIT REAL, RSIT_SIGNAL REAL,
                     MACDT REAL, MACDT_SIGNAL REAL, OSCT REAL, STOCHK REAL, STOCHD REAL, 
-                    ATR REAL, CCI REAL, BB_UPPER REAL, BB_MIDDLE REAL, BB_LOWER REAL, BB_POSITION REAL, BB_BANDWIDTH REAL,
-                    MAT5_MAT20_DIFF REAL, MAT20_MAT60_DIFF REAL, MAT60_MAT120_DIFF REAL,
-                    C_MAT5_DIFF REAL, VWAP REAL,
+                    ATR REAL, CCI REAL, BB_UPPER REAL, BB_MIDDLE REAL, BB_LOWER REAL, 
+                    BB_POSITION REAL, BB_BANDWIDTH REAL, MAT5_MAT20_DIFF REAL, 
+                    MAT20_MAT60_DIFF REAL, MAT60_MAT120_DIFF REAL, C_MAT5_DIFF REAL, VWAP REAL,
                     PRIMARY KEY (code, date, time, sequence)
                 )
             ''')
+            
+            # 분봉 데이터
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS min_data (
                     code TEXT, date TEXT, time TEXT, sequence INTEGER, C REAL, V INTEGER,
@@ -2244,6 +2249,87 @@ class CTrader(QObject):
                     PRIMARY KEY (code, date, time, sequence)
                 )
             ''')
+            
+            # ==================== 거래/분석 테이블 ====================
+            
+            # 실거래 기록
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT NOT NULL,
+                    stock_name TEXT,
+                    date TEXT NOT NULL,
+                    time TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    strategy TEXT,
+                    buy_reason TEXT,
+                    sell_reason TEXT,
+                    buy_price REAL,
+                    profit REAL,
+                    profit_pct REAL,
+                    hold_minutes REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_code ON trades(code)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_action ON trades(action)')
+            
+            # 일별 요약
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS daily_summary (
+                    date TEXT PRIMARY KEY,
+                    strategy TEXT,
+                    total_trades INTEGER DEFAULT 0,
+                    win_trades INTEGER DEFAULT 0,
+                    lose_trades INTEGER DEFAULT 0,
+                    win_rate REAL DEFAULT 0,
+                    total_profit REAL DEFAULT 0,
+                    avg_profit_pct REAL DEFAULT 0,
+                    max_profit_pct REAL DEFAULT 0,
+                    max_loss_pct REAL DEFAULT 0,
+                    total_buy_amount REAL DEFAULT 0,
+                    final_cash REAL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # 백테스팅 결과
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS backtest_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    strategy TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    initial_cash REAL NOT NULL,
+                    final_cash REAL NOT NULL,
+                    total_profit REAL NOT NULL,
+                    total_return_pct REAL NOT NULL,
+                    total_trades INTEGER NOT NULL,
+                    win_trades INTEGER NOT NULL,
+                    lose_trades INTEGER NOT NULL,
+                    win_rate REAL NOT NULL,
+                    avg_profit_pct REAL NOT NULL,
+                    max_profit_pct REAL NOT NULL,
+                    max_loss_pct REAL NOT NULL,
+                    mdd REAL NOT NULL,
+                    sharpe_ratio REAL,
+                    avg_hold_minutes REAL,
+                    parameters TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_backtest_strategy ON backtest_results(strategy)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_backtest_date ON backtest_results(start_date, end_date)')
+            
+            # ==================== 데이터 정리 ====================
+            
+            # 중복 제거
             cursor.execute('''
                 DELETE FROM tick_data
                 WHERE rowid NOT IN (
@@ -2252,6 +2338,7 @@ class CTrader(QObject):
                     GROUP BY code, date, time, sequence
                 )
             ''')
+            
             cursor.execute('''
                 DELETE FROM min_data
                 WHERE rowid NOT IN (
@@ -2260,11 +2347,122 @@ class CTrader(QObject):
                     GROUP BY code, date, time
                 )
             ''')
+            
             conn.commit()
             conn.close()
+            
+            logging.info("데이터베이스 초기화 완료")
+            
         except Exception as ex:
-            logging.error(f"init_database -> {ex}")
+            logging.error(f"init_database -> {ex}\n{traceback.format_exc()}")
             raise
+
+    def save_trade_record(self, code, action, price, quantity, **kwargs):
+        """실거래 기록 저장"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            
+            now = datetime.now()
+            date = now.strftime('%Y%m%d')
+            time_str = now.strftime('%H%M%S')
+            
+            stock_name = cpCodeMgr.CodeToName(code)
+            amount = price * quantity
+            
+            # 전략 이름
+            strategy = kwargs.get('strategy', '')
+            if not strategy and hasattr(self, 'window'):
+                strategy = self.window.comboStg.currentText()
+            
+            cursor.execute('''
+                INSERT INTO trades (
+                    code, stock_name, date, time, action, price, quantity, amount,
+                    strategy, buy_reason, sell_reason, buy_price, profit, profit_pct, hold_minutes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                code, 
+                stock_name, 
+                date, 
+                time_str, 
+                action, 
+                price, 
+                quantity, 
+                amount,
+                strategy,
+                kwargs.get('buy_reason', ''),
+                kwargs.get('sell_reason', ''),
+                kwargs.get('buy_price', None),
+                kwargs.get('profit', None),
+                kwargs.get('profit_pct', None),
+                kwargs.get('hold_minutes', None)
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            logging.debug(f"거래 기록 저장: {stock_name}({code}) {action} {quantity}주 @{price:,}원")
+            
+        except Exception as ex:
+            logging.error(f"save_trade_record -> {ex}\n{traceback.format_exc()}")
+
+    def update_daily_summary(self):
+        """일별 요약 업데이트"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            
+            today = datetime.now().strftime('%Y%m%d')
+            strategy = self.window.comboStg.currentText() if hasattr(self, 'window') else ''
+            
+            # 오늘의 매도 거래만 집계
+            cursor.execute('''
+                SELECT 
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) as win_trades,
+                    SUM(CASE WHEN profit <= 0 THEN 1 ELSE 0 END) as lose_trades,
+                    AVG(profit_pct) as avg_profit_pct,
+                    MAX(profit_pct) as max_profit_pct,
+                    MIN(profit_pct) as max_loss_pct,
+                    SUM(profit) as total_profit
+                FROM trades
+                WHERE date = ? AND action = 'SELL'
+            ''', (today,))
+            
+            row = cursor.fetchone()
+            
+            if row and row[0] > 0:
+                total_trades, win_trades, lose_trades, avg_profit_pct, max_profit_pct, max_loss_pct, total_profit = row
+                win_rate = (win_trades / total_trades * 100) if total_trades > 0 else 0
+                
+                # 매수 금액 합계
+                cursor.execute('''
+                    SELECT SUM(amount) FROM trades
+                    WHERE date = ? AND action = 'BUY'
+                ''', (today,))
+                
+                total_buy_amount = cursor.fetchone()[0] or 0
+                
+                cursor.execute('''
+                    INSERT OR REPLACE INTO daily_summary (
+                        date, strategy, total_trades, win_trades, lose_trades, win_rate,
+                        total_profit, avg_profit_pct, max_profit_pct, max_loss_pct, total_buy_amount
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    today, strategy, total_trades, win_trades, lose_trades, win_rate,
+                    total_profit or 0, avg_profit_pct or 0, max_profit_pct or 0, max_loss_pct or 0,
+                    total_buy_amount
+                ))
+                
+                conn.commit()
+                
+                logging.debug(f"일별 요약 업데이트: {today} - 거래 {total_trades}회, 승률 {win_rate:.1f}%")
+            
+            conn.close()
+            
+        except Exception as ex:
+            logging.error(f"update_daily_summary -> {ex}\n{traceback.format_exc()}")
+
 
     def save_vi_data(self, code):
         try:
@@ -2930,9 +3128,11 @@ class CTrader(QObject):
             return False
 
     def monitorOrderStatus(self, code, ordernum, conflags, price, qty, bs, balance, buyprice):
+        """주문 체결 모니터링 (거래 기록 저장 추가)"""
         try:
             stock_name = self.cpCodeMgr.CodeToName(code)
 
+            # ===== 매도 체결 =====
             if bs == '1' and conflags == "체결":
                 logging.debug(f"{stock_name}({code}), {price}원, {qty}주 매도, 잔고: {balance}주")
                 self.balance_qty[code] = balance
@@ -2941,41 +3141,79 @@ class CTrader(QObject):
                     self.sell_amount[code] = 0
                 self.sell_amount[code] += price * qty
 
+                # 분할 매도 완료
                 if code in self.sell_half_qty and balance == self.sell_half_qty[code]:
                     logging.info(f"{stock_name}({code}), 분할 매도 완료")                  
                     
                     stock_profit = self.sell_amount[code] * 0.99835 - self.buy_price[code] * (self.buy_qty[code] - balance) * 1.00015
                     stock_rate = (stock_profit / (self.buy_price[code] * (self.buy_qty[code] - balance))) * 100
+                    
                     if stock_profit > 0:
                         logging.info(f"{stock_name}({code}), 매매이익({int(stock_profit)}원, {stock_rate:.2f}%)")
                         send_slack_message(self.window.login_handler, "#stock", f"{stock_name}({code}), 매매이익({int(stock_profit)}원, {stock_rate:.2f}%)")
                     else:
                         logging.info(f"{stock_name}({code}), 매매손실({int(stock_profit)}원, {stock_rate:.2f}%)")
                         send_slack_message(self.window.login_handler, "#stock", f"{stock_name}({code}), 매매손실({int(stock_profit)}원, {stock_rate:.2f}%)")
+                    
                     self.get_trade_profit()
+                    
                     if code in self.sellorder_set:
                         self.sellorder_set.remove(code)
                     if code not in self.sell_half_set:
                         self.sell_half_set.add(code)
+                    
                     self.buy_qty[code] = balance
                     self.sell_amount[code] = 0
+                    
                     if code in self.sell_half_qty:
                         del self.sell_half_qty[code]
 
+                # 전량 매도 완료
                 if balance == 0:
                     logging.info(f"{stock_name}({code}), 매도 완료")
 
                     stock_profit = self.sell_amount[code] * 0.99835 - self.buy_price[code] * self.buy_qty[code] * 1.00015
-                    stock_rate = (stock_profit / (self.buy_price[code] * self.buy_qty[code] - balance)) * 100
+                    stock_rate = (stock_profit / (self.buy_price[code] * self.buy_qty[code])) * 100
+                    
+                    # 보유 시간 계산
+                    hold_minutes = 0
+                    if code in self.starting_time:
+                        try:
+                            buy_time = datetime.strptime(
+                                f"{datetime.now().year}/{self.starting_time[code]}", 
+                                '%Y/%m/%d %H:%M:%S'
+                            )
+                            hold_minutes = (datetime.now() - buy_time).total_seconds() / 60
+                        except:
+                            pass
+                    
+                    # ✅ 매도 거래 기록 저장
+                    self.save_trade_record(
+                        code=code,
+                        action='SELL',
+                        price=price,
+                        quantity=self.buy_qty[code],
+                        buy_price=self.buy_price[code],
+                        profit=stock_profit,
+                        profit_pct=stock_rate,
+                        hold_minutes=hold_minutes,
+                        sell_reason='매도 완료'
+                    )
+                    
+                    # 일별 요약 업데이트
+                    self.update_daily_summary()
+                    
                     if stock_profit > 0:
                         logging.info(f"{stock_name}({code}), 매매이익({int(stock_profit)}원, {stock_rate:.2f}%)")
                         send_slack_message(self.window.login_handler, "#stock", f"{stock_name}({code}), 매매이익({int(stock_profit)}원, {stock_rate:.2f}%)")
                     else:
                         logging.info(f"{stock_name}({code}), 매매손실({int(stock_profit)}원, {stock_rate:.2f}%)")
                         send_slack_message(self.window.login_handler, "#stock", f"{stock_name}({code}), 매매손실({int(stock_profit)}원, {stock_rate:.2f}%)")
+                    
                     self.get_trade_profit()                    
                                         
                     self.stock_sold.emit(code)                    
+                    
                     if code in self.bought_set:
                         self.bought_set.remove(code) 
                     if code in self.sell_half_set:
@@ -2989,7 +3227,7 @@ class CTrader(QObject):
                     if code in self.sell_amount:
                         del self.sell_amount[code]
 
-
+            # ===== 매수 체결 =====
             elif bs == '2' and conflags == "체결":
                 logging.debug(f"{stock_name}({code}), {qty}주 매수, 잔고: {balance}주")
                 self.balance_qty[code] = balance
@@ -2998,6 +3236,15 @@ class CTrader(QObject):
                     self.buy_qty[code] = balance
                     self.buy_price[code] = buyprice
                     logging.info(f"{stock_name}({code}), {self.buy_qty[code]}주, 매수 완료({int(self.buy_price[code])}원)")
+                    
+                    # ✅ 매수 거래 기록 저장
+                    self.save_trade_record(
+                        code=code,
+                        action='BUY',
+                        price=buyprice,
+                        quantity=self.buy_qty[code],
+                        buy_reason='매수 완료'
+                    )
                     
                     if code not in self.bought_set:
                         self.bought_set.add(code)
@@ -3009,7 +3256,7 @@ class CTrader(QObject):
                     return
 
         except Exception as ex:
-            logging.error(f"monitorOrderStatus -> {ex}")
+            logging.error(f"monitorOrderStatus -> {ex}\n{traceback.format_exc()}")
 
 # ==================== AutoTraderThread (통합 전략 적용) ====================
 class AutoTraderThread(QThread):
@@ -4635,9 +4882,32 @@ class MyWindow(QWidget):
                     logging.warning(f"Killed  {proc.info['name']} (PID: {proc.info['pid']})")
 
     def init_ui(self):
-        self.setWindowTitle("초단타 매매 프로그램 v3.0 - 통합전략")
+        """UI 초기화 (탭 구조)"""
+        self.setWindowTitle("초단타 매매 프로그램 v3.0 - 백테스팅")
         self.setGeometry(0, 0, 1900, 980)
 
+        # ===== 메인 탭 위젯 생성 =====
+        self.tab_widget = QTabWidget()
+        
+        # 탭 1: 실시간 매매
+        self.trading_tab = QWidget()
+        self.init_trading_tab()
+        self.tab_widget.addTab(self.trading_tab, "실시간 매매")
+        
+        # 탭 2: 백테스팅
+        self.backtest_tab = QWidget()
+        self.init_backtest_tab()
+        self.tab_widget.addTab(self.backtest_tab, "백테스팅")
+        
+        # 메인 레이아웃
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(self.tab_widget)
+        self.setLayout(main_layout)
+
+    def init_trading_tab(self):
+        """실시간 매매 탭 초기화"""
+        
+        # ===== 로그인 영역 =====
         loginLayout = QVBoxLayout()
 
         loginLabelLayout = QHBoxLayout()
@@ -4676,6 +4946,7 @@ class MyWindow(QWidget):
         loginLayout.addLayout(certpasswordLabelLayout)
         loginLayout.addLayout(loginButtonLayout)
 
+        # ===== 투자 설정 =====
         buycountLayout = QHBoxLayout()
         buycountLabel = QLabel("최대투자 종목수 :")
         buycountLayout.addWidget(buycountLabel)
@@ -4685,6 +4956,7 @@ class MyWindow(QWidget):
         self.buycountButton.setFixedWidth(70)
         buycountLayout.addWidget(self.buycountButton)
 
+        # ===== 투자 대상 종목 리스트 =====
         firstListBoxLayout = QVBoxLayout()
         listBoxLabel = QLabel("투자 대상 종목 :")
         firstListBoxLayout.addWidget(listBoxLabel)
@@ -4697,6 +4969,7 @@ class MyWindow(QWidget):
         firstButtonLayout.addWidget(self.deleteFirstButton)        
         firstListBoxLayout.addLayout(firstButtonLayout)
 
+        # ===== 투자 종목 리스트 =====
         secondListBoxLayout = QVBoxLayout()
         secondListBoxLabel = QLabel("투자 종목 :")
         secondListBoxLayout.addWidget(secondListBoxLabel)
@@ -4709,12 +4982,14 @@ class MyWindow(QWidget):
         secondButtonLayout.addWidget(self.sellAllButton)     
         secondListBoxLayout.addLayout(secondButtonLayout)
 
+        # ===== 출력 버튼 =====
         printLayout = QHBoxLayout()
         self.printChartButton = QPushButton("차트 출력")
         printLayout.addWidget(self.printChartButton)
         self.dataOutputButton2 = QPushButton("차트데이터 저장")
         printLayout.addWidget(self.dataOutputButton2)
 
+        # ===== 왼쪽 영역 통합 =====
         listBoxesLayout = QVBoxLayout()
         listBoxesLayout.addLayout(loginLayout)
         listBoxesLayout.addLayout(buycountLayout)
@@ -4722,17 +4997,21 @@ class MyWindow(QWidget):
         listBoxesLayout.addLayout(secondListBoxLayout, 4)
         listBoxesLayout.addLayout(printLayout)
 
+        # ===== 차트 영역 =====
         chartLayout = QVBoxLayout()
         self.fig = Figure(figsize=(12, 8))
         self.canvas = FigureCanvas(self.fig)
         chartLayout.addWidget(self.canvas)
 
+        # ===== 차트와 리스트 통합 =====
         chartAndListLayout = QHBoxLayout()
         chartAndListLayout.addLayout(listBoxesLayout, 1)
         chartAndListLayout.addLayout(chartLayout, 4)
 
+        # ===== 전략 및 거래 정보 영역 =====
         strategyAndTradeLayout = QVBoxLayout()
 
+        # 투자 전략
         strategyLayout = QHBoxLayout()
         strategyLabel = QLabel("투자전략:")
         strategyLabel.setFixedWidth(label_width)
@@ -4749,6 +5028,7 @@ class MyWindow(QWidget):
         self.chart_status_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         strategyLayout.addWidget(self.chart_status_label)
 
+        # 매수 전략
         buyStrategyLayout = QHBoxLayout()
         buyStgLabel = QLabel("매수전략:")
         buyStgLabel.setFixedWidth(label_width)
@@ -4764,6 +5044,7 @@ class MyWindow(QWidget):
         self.buystgInputWidget.setPlaceholderText("매수전략의 내용을 입력하세요...")
         self.buystgInputWidget.setFixedHeight(80)
 
+        # 매도 전략
         sellStrategyLayout = QHBoxLayout()
         sellStgLabel = QLabel("매도전략:")
         sellStgLabel.setFixedWidth(label_width)
@@ -4779,6 +5060,7 @@ class MyWindow(QWidget):
         self.sellstgInputWidget.setPlaceholderText("매도전략의 내용을 입력하세요...")
         self.sellstgInputWidget.setFixedHeight(63)
 
+        # 주식 현황 테이블
         self.stock_table = QTableWidget()
         self.stock_table.setRowCount(0)
         self.stock_table.setColumnCount(6)
@@ -4795,19 +5077,21 @@ class MyWindow(QWidget):
         strategyAndTradeLayout.addWidget(self.sellstgInputWidget)
         strategyAndTradeLayout.addWidget(self.stock_table)
 
+        # ===== 터미널 출력 =====
         self.terminalOutput = QTextEdit()
         self.terminalOutput.setReadOnly(True)
 
         counterAndterminalLayout = QVBoxLayout()
-        
         counterAndterminalLayout.addLayout(strategyAndTradeLayout)
         counterAndterminalLayout.addWidget(self.terminalOutput)
 
+        # ===== 메인 레이아웃 =====
         mainLayout = QHBoxLayout()
         mainLayout.addLayout(chartAndListLayout, 70)
         mainLayout.addLayout(counterAndterminalLayout, 30)
-        self.setLayout(mainLayout)
+        self.trading_tab.setLayout(mainLayout)
 
+        # ===== 이벤트 연결 =====
         self.loginButton.clicked.connect(self.login_handler.handle_login)
         self.buycountButton.clicked.connect(self.login_handler.buycount_setting)
 
@@ -4829,6 +5113,159 @@ class MyWindow(QWidget):
         self.comboSellStg.currentIndexChanged.connect(self.sellStgChanged)
         self.saveBuyStgButton.clicked.connect(self.save_buystrategy)
         self.saveSellStgButton.clicked.connect(self.save_sellstrategy)
+
+    def init_backtest_tab(self):
+        """백테스팅 탭 초기화"""
+        
+        layout = QVBoxLayout()
+        
+        # ===== 설정 영역 =====
+        settings_group = QGroupBox("백테스팅 설정")
+        settings_layout = QGridLayout()
+        
+        # 기간 선택
+        settings_layout.addWidget(QLabel("시작일:"), 0, 0)
+        self.bt_start_date = QLineEdit()
+        self.bt_start_date.setPlaceholderText("YYYYMMDD (예: 20250101)")
+        self.bt_start_date.setFixedWidth(150)
+        settings_layout.addWidget(self.bt_start_date, 0, 1)
+        
+        settings_layout.addWidget(QLabel("종료일:"), 0, 2)
+        self.bt_end_date = QLineEdit()
+        self.bt_end_date.setPlaceholderText("YYYYMMDD (예: 20250131)")
+        self.bt_end_date.setFixedWidth(150)
+        settings_layout.addWidget(self.bt_end_date, 0, 3)
+        
+        # 초기 자금
+        settings_layout.addWidget(QLabel("초기 자금:"), 1, 0)
+        self.bt_initial_cash = QLineEdit("10000000")
+        self.bt_initial_cash.setFixedWidth(150)
+        settings_layout.addWidget(self.bt_initial_cash, 1, 1)
+        
+        # 실행 버튼
+        self.bt_run_button = QPushButton("백테스팅 실행")
+        self.bt_run_button.setFixedWidth(150)
+        self.bt_run_button.clicked.connect(self.run_backtest)
+        settings_layout.addWidget(self.bt_run_button, 1, 2)
+        
+        settings_group.setLayout(settings_layout)
+        layout.addWidget(settings_group)
+        
+        # ===== 결과 영역 =====
+        results_splitter = QSplitter(Qt.Horizontal)
+        
+        # 왼쪽: 결과 요약
+        left_widget = QWidget()
+        left_layout = QVBoxLayout()
+        
+        left_layout.addWidget(QLabel("백테스팅 결과:"))
+        self.bt_results_text = QTextEdit()
+        self.bt_results_text.setReadOnly(True)
+        self.bt_results_text.setMaximumWidth(450)
+        left_layout.addWidget(self.bt_results_text)
+        
+        left_widget.setLayout(left_layout)
+        results_splitter.addWidget(left_widget)
+        
+        # 오른쪽: 차트
+        right_widget = QWidget()
+        right_layout = QVBoxLayout()
+        
+        self.bt_fig = Figure(figsize=(10, 8))
+        self.bt_canvas = FigureCanvas(self.bt_fig)
+        right_layout.addWidget(self.bt_canvas)
+        
+        right_widget.setLayout(right_layout)
+        results_splitter.addWidget(right_widget)
+        
+        results_splitter.setStretchFactor(0, 1)
+        results_splitter.setStretchFactor(1, 2)
+        
+        layout.addWidget(results_splitter)
+        
+        self.backtest_tab.setLayout(layout)
+
+    def run_backtest(self):
+        """백테스팅 실행"""
+        
+        try:
+            from backtester import Backtester
+            
+            start_date = self.bt_start_date.text()
+            end_date = self.bt_end_date.text()
+            initial_cash = int(self.bt_initial_cash.text())
+            
+            # 입력 검증
+            if len(start_date) != 8 or len(end_date) != 8:
+                QMessageBox.warning(self, "입력 오류", "날짜 형식: YYYYMMDD (예: 20250101)")
+                return
+            
+            if not hasattr(self, 'trader'):
+                QMessageBox.warning(self, "오류", "먼저 로그인해주세요.")
+                return
+            
+            self.bt_results_text.clear()
+            self.bt_results_text.append(f"백테스팅 시작: {start_date} ~ {end_date}")
+            self.bt_results_text.append(f"초기 자금: {initial_cash:,}원\n")
+            self.bt_results_text.append("처리 중...\n")
+            
+            QApplication.processEvents()
+            
+            # 백테스팅 실행
+            bt = Backtester(
+                db_path=self.trader.db_name,
+                initial_cash=initial_cash
+            )
+            
+            strategy_name = self.comboStg.currentText() if hasattr(self, 'comboStg') else '통합 전략'
+            results = bt.run(start_date, end_date, strategy_name=strategy_name)
+            
+            # 결과 표시
+            result_text = f"""
+=== 백테스팅 결과 ===
+
+【 기본 정보 】
+전략: {results['strategy']}
+기간: {results['start_date']} ~ {results['end_date']}
+
+【 수익 성과 】
+초기 자금: {results['initial_cash']:,}원
+최종 자금: {results['final_cash']:,}원
+총 수익: {results['total_profit']:,.0f}원
+수익률: {results['total_return_pct']:.2f}%
+
+【 거래 통계 】
+총 거래: {results['total_trades']}회
+승리: {results['win_trades']}회
+패배: {results['lose_trades']}회
+승률: {results['win_rate']:.1f}%
+
+【 손익 분석 】
+평균 수익률: {results['avg_profit_pct']:.2f}%
+최대 수익: {results['max_profit_pct']:.2f}%
+최대 손실: {results['max_loss_pct']:.2f}%
+MDD (최대 낙폭): {results['mdd']:.2f}%
+
+【 기타 지표 】
+샤프 비율: {results['sharpe_ratio']:.2f}
+평균 보유 시간: {results['avg_hold_minutes']:.0f}분
+
+※ 백테스팅 결과는 참고용이며, 실제 매매 결과와 다를 수 있습니다.
+"""
+            
+            self.bt_results_text.setPlainText(result_text)
+            
+            # 차트 그리기
+            bt.plot_results(self.bt_fig)
+            self.bt_canvas.draw()
+            
+            QMessageBox.information(self, "완료", "백테스팅이 완료되었습니다!")
+            
+        except FileNotFoundError:
+            QMessageBox.critical(self, "오류", "backtester.py 파일을 찾을 수 없습니다.\n같은 폴더에 backtester.py가 있는지 확인하세요.")
+        except Exception as ex:
+            logging.error(f"run_backtest -> {ex}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "오류", f"백테스팅 실패:\n{str(ex)}")
 
 # ==================== QTextEditLogger ====================
 class QTextEditLogger(QObject, logging.Handler):
