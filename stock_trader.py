@@ -115,27 +115,29 @@ class APILimiter:
         self.lock = threading.Lock()
         
     def wait_if_needed(self):
-        """필요시 대기"""
+        wait_time = 0
+        
         with self.lock:
             now = time.time()
-            
-            # 1분 내 15개 요청 체크
             while len(self.request_times) >= 15:
                 oldest = self.request_times[0]
                 if now - oldest < 60:
                     wait_time = 60 - (now - oldest) + 0.1
-                    logging.debug(f"API 제한: {wait_time:.1f}초 대기")
-                    time.sleep(wait_time)
-                    now = time.time()
-                else:
                     break
+                else:
+                    self.request_times.popleft()
             
-            # 초당 1회 체크
-            if len(self.request_times) > 0:
+            if wait_time == 0 and len(self.request_times) > 0:
                 last_request = self.request_times[-1]
                 if now - last_request < 1.0:
-                    time.sleep(1.0 - (now - last_request))
-            
+                    wait_time = 1.0 - (now - last_request)
+        
+        # 락 밖에서 sleep
+        if wait_time > 0:
+            logging.debug(f"API 제한: {wait_time:.1f}초 대기")
+            time.sleep(wait_time)
+        
+        with self.lock:
             self.request_times.append(time.time())
 
 # 전역 API 제한자
@@ -2020,234 +2022,10 @@ class CpData(QObject):
         except Exception as ex:
             logging.error(f"updateCurData -> {ex}")
 
-# ==================== DatabaseWorker (유지) ====================
-class DatabaseWorker(QObject):
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
-
-    def __init__(self, db_name, queue, tickdata, mindata, parent=None):
-        super().__init__(parent)
-        self.db_name = db_name
-        self.queue = queue
-        self.tickdata = tickdata
-        self.mindata = mindata
-        self.running = True
-        
-        # 마지막 저장 인덱스
-        self.last_saved_indices = {}  # {code: {'tick': idx, 'min': idx}}
-        
-        # ✅ 설정: 안전 마진 (마지막 N개 봉 재저장)
-        self.overlap_count = 2  # 마지막 2개 봉 재저장
-
-    def run(self):
-        while self.running:
-            try:
-                item = self.queue.get(timeout=1)
-                if item is None:
-                    self.queue.task_done()
-                    break
-                
-                code, tick_data_copy, min_data_copy, start_date, start_hhmm, incremental = item
-                
-                try:
-                    self.save_vi_data(code, tick_data_copy, min_data_copy, start_date, start_hhmm, incremental)
-                except Exception as ex:
-                    error_msg = f"DB Worker 오류 ({code}): {ex}"
-                    logging.error(error_msg)
-                    self.error.emit(error_msg)
-                finally:
-                    self.queue.task_done()
-            except queue.Empty:
-                continue
-            except Exception as ex:
-                logging.error(f"Queue processing error: {ex}")
-        self.finished.emit()
-
-    def stop(self):
-        self.running = False
-        self.queue.put(None)
-
-    def save_vi_data(self, code, tick_data, min_data, start_date, start_hhmm, incremental=True):
-        """VI 데이터 저장 (오버랩 저장 지원)"""
-        try:
-            with sqlite3.connect(self.db_name, timeout=10) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
-                c = conn.cursor()
-                c.execute("BEGIN TRANSACTION")
-
-                # 인덱스 초기화
-                if code not in self.last_saved_indices:
-                    self.last_saved_indices[code] = {'tick': 0, 'min': 0}
-                
-                last_tick_idx = self.last_saved_indices[code]['tick']
-                last_min_idx = self.last_saved_indices[code]['min']
-
-                # ===== 틱 데이터 저장 =====
-                if tick_data and tick_data["T"]:
-                    dates, times = tick_data["D"], tick_data["T"]
-                    values = [tick_data[key] for key in ["C", "V", "MAT5", "MAT20", "MAT60", "MAT120", "RSIT",
-                            "RSIT_SIGNAL", "MACDT", "MACDT_SIGNAL", "OSCT", "STOCHK", "STOCHD", "ATR",
-                            "CCI", "BB_UPPER", "BB_MIDDLE", "BB_LOWER", "BB_POSITION", "BB_BANDWIDTH",
-                            "MAT5_MAT20_DIFF", "MAT20_MAT60_DIFF", "MAT60_MAT120_DIFF",
-                            "C_MAT5_DIFF", "VWAP"]]
-                    
-                    # ✅ 증분 저장: 안전 마진 적용
-                    if incremental:
-                        # 마지막 N개 봉 뒤로 돌아가기
-                        start_idx = max(0, last_tick_idx - self.overlap_count)
-                        
-                        new_data = [
-                            (i, str(date), f"{int(time_val):04d}")
-                            for i, (date, time_val) in enumerate(zip(dates, times))
-                            if i >= start_idx  # ✅ 오버랩 적용
-                            and len(str(date)) == 8 
-                            and len(f"{int(time_val):04d}") == 4
-                            and str(date) == start_date 
-                            and start_hhmm <= f"{int(time_val):04d}" <= "1515"
-                        ]
-                        
-                        overlap_info = f", 오버랩={self.overlap_count}" if start_idx < last_tick_idx else ""
-                    else:
-                        # 전체 저장
-                        new_data = [
-                            (i, str(date), f"{int(time_val):04d}")
-                            for i, (date, time_val) in enumerate(zip(dates, times))
-                            if len(str(date)) == 8 
-                            and len(f"{int(time_val):04d}") == 4
-                            and str(date) == start_date 
-                            and start_hhmm <= f"{int(time_val):04d}" <= "1515"
-                        ]
-                        overlap_info = ""
-
-                    if new_data:
-                        unique_date_times = set((date, time) for _, date, time in new_data)
-                        
-                        # ✅ 기존 데이터 삭제 (재저장을 위해)
-                        for date, time in unique_date_times:
-                            c.execute("DELETE FROM tick_data WHERE code = ? AND date = ? AND time = ?", 
-                                     (code, date, time))
-                        
-                        inserted_count = 0
-                        updated_count = 0
-                        
-                        for date, time in unique_date_times:
-                            sorted_data = sorted(
-                                [(i, d, t) for i, d, t in new_data if d == date and t == time], 
-                                key=lambda x: x[2]
-                            )
-                            
-                            for seq, (i, _, _) in enumerate(sorted_data):
-                                c.execute("""INSERT INTO tick_data
-                                            (code, date, time, sequence, C, V, MAT5, MAT20, MAT60, MAT120, RSIT,
-                                            RSIT_SIGNAL, MACDT, MACDT_SIGNAL, OSCT, STOCHK, STOCHD, ATR, CCI,
-                                            BB_UPPER, BB_MIDDLE, BB_LOWER, BB_POSITION, BB_BANDWIDTH, MAT5_MAT20_DIFF,
-                                            MAT20_MAT60_DIFF, MAT60_MAT120_DIFF, C_MAT5_DIFF, VWAP)
-                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                        (code, date, time, seq, *[val[i] for val in values]))
-                                
-                                # ✅ 신규 vs 업데이트 구분
-                                if i < last_tick_idx:
-                                    updated_count += 1
-                                else:
-                                    inserted_count += 1
-
-                        if inserted_count or updated_count:
-                            # ✅ 마지막 인덱스 업데이트 (가장 큰 인덱스 + 1)
-                            max_idx = max(i for i, _, _ in new_data)
-                            self.last_saved_indices[code]['tick'] = max_idx + 1
-                            
-                            mode = "증분" if incremental else "전체"
-                            logging.debug(
-                                f"{code}: 틱 데이터 저장 ({mode}) - "
-                                f"신규 {inserted_count}개, 업데이트 {updated_count}개{overlap_info}"
-                            )
-
-                # ===== 분봉 데이터 저장 (동일한 방식) =====
-                if min_data and min_data["T"]:
-                    dates, times = min_data["D"], min_data["T"]
-                    values = [min_data[key] for key in ["C", "V", "MAM5", "MAM10", "MAM20", "RSI", "RSI_SIGNAL",
-                            "MACD", "MACD_SIGNAL", "OSC", "STOCHK", "STOCHD", "CCI",
-                            "MAM5_MAM10_DIFF", "MAM10_MAM20_DIFF", "C_MAM5_DIFF", "C_ABOVE_MAM5", "VWAP"]]
-                    
-                    # ✅ 증분 저장: 안전 마진 적용
-                    if incremental:
-                        # 마지막 N개 봉 뒤로 돌아가기
-                        start_idx = max(0, last_min_idx - self.overlap_count)
-                        
-                        new_indices = [
-                            (i, str(date), f"{int(time_val):04d}")
-                            for i, (date, time_val) in enumerate(zip(dates, times))
-                            if i >= start_idx  # ✅ 오버랩 적용
-                            and len(str(date)) == 8 
-                            and f"{int(time_val):04d}"[2:4].isdigit() 
-                            and int(f"{int(time_val):04d}"[2:4]) % 3 == 0
-                            and str(date) == start_date 
-                            and start_hhmm <= f"{int(time_val):04d}" <= "1515"
-                        ]
-                        
-                        overlap_info = f", 오버랩={self.overlap_count}" if start_idx < last_min_idx else ""
-                    else:
-                        # 전체 저장
-                        new_indices = [
-                            (i, str(date), f"{int(time_val):04d}")
-                            for i, (date, time_val) in enumerate(zip(dates, times))
-                            if len(str(date)) == 8 
-                            and f"{int(time_val):04d}"[2:4].isdigit() 
-                            and int(f"{int(time_val):04d}"[2:4]) % 3 == 0
-                            and str(date) == start_date 
-                            and start_hhmm <= f"{int(time_val):04d}" <= "1515"
-                        ]
-                        overlap_info = ""
-
-                    if new_indices:
-                        unique_date_times = set((date, time) for _, date, time in new_indices)
-                        
-                        # ✅ 기존 데이터 삭제 (재저장을 위해)
-                        for date, time in unique_date_times:
-                            c.execute("DELETE FROM min_data WHERE code = ? AND date = ? AND time = ?", 
-                                     (code, date, time))
-                        
-                        inserted_count = 0
-                        updated_count = 0
-                        
-                        for i, date, time in new_indices:
-                            c.execute("""INSERT INTO min_data
-                                        (code, date, time, sequence, C, V, MAM5, MAM10, MAM20, RSI, RSI_SIGNAL,
-                                        MACD, MACD_SIGNAL, OSC, STOCHK, STOCHD, CCI, MAM5_MAM10_DIFF,
-                                        MAM10_MAM20_DIFF, C_MAM5_DIFF, C_ABOVE_MAM5, VWAP)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                                    (code, date, time, 0, *[val[i] for val in values]))
-                            
-                            # ✅ 신규 vs 업데이트 구분
-                            if i < last_min_idx:
-                                updated_count += 1
-                            else:
-                                inserted_count += 1
-
-                        if inserted_count or updated_count:
-                            # ✅ 마지막 인덱스 업데이트
-                            max_idx = max(i for i, _, _ in new_indices)
-                            self.last_saved_indices[code]['min'] = max_idx + 1
-                            
-                            mode = "증분" if incremental else "전체"
-                            logging.debug(
-                                f"{code}: 분 데이터 저장 ({mode}) - "
-                                f"신규 {inserted_count}개, 업데이트 {updated_count}개{overlap_info}"
-                            )
-
-                conn.commit()
-
-        except sqlite3.OperationalError as e:
-            logging.error(f"{code}: DB 저장 오류 (OperationalError) - {e}")
-            if conn:
-                conn.rollback()
-        except Exception as ex:
-            logging.error(f"{code}: VI 데이터 저장 오류 - {ex}\n{traceback.format_exc()}")
-            if conn:
-                conn.rollback()
-
 # ==================== CTrader (계속) ====================
 class CTrader(QObject):
+    """트레이더 클래스 (DatabaseWorker 제거, combined_tick_data 단일 사용)"""
+    
     stock_added_to_monitor = pyqtSignal(str)
     stock_bought = pyqtSignal(str)
     stock_sold = pyqtSignal(str)
@@ -2291,48 +2069,25 @@ class CTrader(QObject):
         self.mindata = CpData(3, 'm', 150, self)
         self.tickdata = CpData(60, 'T', 400, self)
 
-        self.last_saved_timestamp = {}
         self.db_name = 'vi_stock_data.db'
 
-        # ✅ 설정 파일에서 저장 옵션 읽기
+        # ===== 설정 파일 읽기 (간소화) =====
         config = configparser.ConfigParser(interpolation=None)
         if os.path.exists('settings.ini'):
             config.read('settings.ini', encoding='utf-8')
         
-        self.save_interval = config.getint('DATA_SAVING', 'interval_seconds', fallback=300)
-        self.force_save_on_close = config.getboolean('DATA_SAVING', 'force_save_on_close', fallback=True)
-        self.incremental_save = config.getboolean('DATA_SAVING', 'incremental_save', fallback=True)
-        overlap_count = config.getint('DATA_SAVING', 'overlap_count', fallback=2)
+        # combined_tick_data 저장 주기만 사용
+        self.combined_save_interval = config.getint('DATA_SAVING', 'interval_seconds', fallback=5)
         
-        logging.info(
-            f"데이터 저장 설정: 간격={self.save_interval}초, "
-            f"증분={self.incremental_save}, 오버랩={overlap_count}, "
-            f"장마감저장={self.force_save_on_close}"
-        )
-
-        # DatabaseWorker 초기화
-        self.db_queue = queue.Queue()
-        self.db_thread = QThread()
-        self.db_worker = DatabaseWorker(self.db_name, self.db_queue, self.tickdata, self.mindata)
-        self.db_worker.overlap_count = overlap_count
-        self.db_worker.moveToThread(self.db_thread)
-        self.db_thread.started.connect(self.db_worker.run)
-        self.db_worker.finished.connect(self.db_thread.quit)
-        self.db_worker.error.connect(lambda msg: logging.error(msg))
-        self.db_thread.start()
-
-        # ✅ 저장 타이머 (설정값 사용)
-        self.save_data_timer = QTimer()
-        self.save_data_timer.timeout.connect(self.periodic_save_vi_data)
-        self.save_data_timer.start(self.save_interval * 1000)
+        logging.info(f"데이터 저장 설정: combined_tick_data 간격={self.combined_save_interval}초")
 
     def init_database(self):
-        """데이터베이스 초기화"""
+        """데이터베이스 초기화 (combined_tick_data 단일 테이블)"""
         try:
             conn = sqlite3.connect(self.db_name)
             cursor = conn.cursor()
             
-            # ✅ 결합 틱 데이터 (모든 평가 시점마다 저장)
+            # ===== combined_tick_data (백테스팅용 메인 테이블) =====
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS combined_tick_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2364,7 +2119,7 @@ class CTrader(QObject):
                     strength REAL,
                     buy_price REAL,
                     position_type TEXT,
-                    save_reason TEXT,  -- ✅ 저장 이유 추가
+                    save_reason TEXT,
                     
                     UNIQUE(code, timestamp)
                 )
@@ -2374,7 +2129,29 @@ class CTrader(QObject):
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_combined_date ON combined_tick_data(date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_combined_timestamp ON combined_tick_data(timestamp)')
             
-            # 일별 요약
+            # ===== trades 테이블 (실거래 기록) =====
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS trades (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    code TEXT,
+                    stock_name TEXT,
+                    date TEXT,
+                    time TEXT,
+                    action TEXT,
+                    price REAL,
+                    quantity INTEGER,
+                    amount REAL,
+                    strategy TEXT,
+                    buy_reason TEXT,
+                    sell_reason TEXT,
+                    buy_price REAL,
+                    profit REAL,
+                    profit_pct REAL,
+                    hold_minutes REAL
+                )
+            ''')
+            
+            # ===== daily_summary 테이블 (일별 요약) =====
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS daily_summary (
                     date TEXT PRIMARY KEY,
@@ -2393,7 +2170,7 @@ class CTrader(QObject):
                 )
             ''')
             
-            # 백테스팅 결과
+            # ===== backtest_results 테이블 (백테스팅 결과) =====
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS backtest_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2422,29 +2199,10 @@ class CTrader(QObject):
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_backtest_strategy ON backtest_results(strategy)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_backtest_date ON backtest_results(start_date, end_date)')
             
-            # ==================== 데이터 정리 ====================
-            
-            # 중복 제거
-            cursor.execute('''
-                DELETE FROM tick_data
-                WHERE rowid NOT IN (
-                    SELECT MAX(rowid)
-                    FROM tick_data
-                    GROUP BY code, date, time, sequence
-                )
-            ''')
-            
-            cursor.execute('''
-                DELETE FROM min_data
-                WHERE rowid NOT IN (
-                    SELECT MAX(rowid)
-                    FROM min_data
-                    GROUP BY code, date, time
-                )
-            ''')
-            
             conn.commit()
-            conn.close()            
+            conn.close()
+            
+            logging.info("데이터베이스 초기화 완료 (combined_tick_data 단일 테이블)")
             
         except Exception as ex:
             logging.error(f"init_database -> {ex}\n{traceback.format_exc()}")
@@ -2556,74 +2314,8 @@ class CTrader(QObject):
         except Exception as ex:
             logging.error(f"update_daily_summary -> {ex}\n{traceback.format_exc()}")
 
-    def save_vi_data(self, code, force_full_save=False):
-        """VI 데이터 저장 (증분/전체 선택 가능)"""
-        try:
-            start_date, start_hhmm = None, None
-            try:
-                if code in self.starting_time:
-                    current_year = datetime.now().year
-                    time_str = self.starting_time[code]
-                    start_dt = datetime.strptime(f"{current_year}/{time_str}", '%Y/%m/%d %H:%M:%S')
-                    start_date = start_dt.strftime('%Y%m%d')
-                    start_hhmm = start_dt.strftime('%H%M')
-                else:
-                    start_date = datetime.now().strftime('%Y%m%d')
-                    start_hhmm = '0900'
-            except ValueError as ve:
-                logging.error(f"{code}: starting_time 형식 오류 - {self.starting_time.get(code, '없음')}: {ve}")
-                start_date = datetime.now().strftime('%Y%m%d')
-                start_hhmm = '0900'
-
-            with self.tickdata.stockdata_lock:
-                tick_data_copy = copy.deepcopy(self.tickdata.stockdata.get(code, {}))
-            with self.mindata.stockdata_lock:
-                min_data_copy = copy.deepcopy(self.mindata.stockdata.get(code, {}))
-
-            # ✅ 증분 저장 여부 결정
-            incremental = self.incremental_save and not force_full_save
-            
-            self.db_queue.put((code, tick_data_copy, min_data_copy, start_date, start_hhmm, incremental))
-            
-        except Exception as ex:
-            logging.error(f"save_vi_data -> {code}, {ex}\n{traceback.format_exc()}")
-
-    def periodic_save_vi_data(self):
-        """주기적 데이터 저장"""
-        try:
-            with self.tickdata.stockdata_lock:
-                codes = list(self.tickdata.stockdata.keys())
-            
-            for code in codes:
-                self.save_vi_data(code, force_full_save=False)  # 증분 저장
-                
-        except Exception as ex:
-            logging.error(f"periodic_save_vi_data -> {ex}\n{traceback.format_exc()}")
-
-    def force_save_all_data(self):
-        """강제 전체 저장 (장마감 시)"""
-        try:
-            logging.info("=== 장마감 데이터 강제 저장 시작 ===")
-            
-            with self.tickdata.stockdata_lock:
-                codes = list(self.tickdata.stockdata.keys())
-            
-            for code in codes:
-                self.save_vi_data(code, force_full_save=True)  # 전체 저장
-            
-            # 큐가 비워질 때까지 대기 (최대 30초)
-            max_wait = 30
-            wait_time = 0
-            while not self.db_queue.empty() and wait_time < max_wait:
-                time.sleep(0.5)
-                wait_time += 0.5
-            
-            logging.info(f"=== 장마감 데이터 저장 완료 ({len(codes)}개 종목) ===")
-            
-        except Exception as ex:
-            logging.error(f"force_save_all_data -> {ex}\n{traceback.format_exc()}")
-
     def get_stock_balance(self, code, func):
+        """계좌 잔고 조회"""
         try:
             stock_name = self.cpCodeMgr.CodeToName(code)
             acc = self.cpTrade.AccountNumber[0]
@@ -2666,6 +2358,7 @@ class CTrader(QObject):
             return False
 
     def init_stock_balance(self):
+        """시작 시 계좌 잔고 초기화"""
         try:
             stocks = self.get_stock_balance('ALL', 'init_stock_balance')
 
@@ -2694,6 +2387,7 @@ class CTrader(QObject):
             logging.error(f"init_stock_balance -> {ex}")
 
     def get_current_cash(self):
+        """현재 주문 가능 금액 조회"""
         try:
             acc = self.cpTrade.AccountNumber[0]
             accFlag = self.cpTrade.GoodsList(acc, 1)
@@ -2714,6 +2408,7 @@ class CTrader(QObject):
             return False
 
     def get_current_price(self, code):
+        """현재가 조회"""
         try:
             self.cpStock.SetInputValue(0, code)
             ret = self.cpStock.BlockRequest2(1)
@@ -2735,6 +2430,7 @@ class CTrader(QObject):
             return False
     
     def get_trade_profit(self):
+        """매매실현손익 조회"""
         try:
             acc = self.cpTrade.AccountNumber[0]
             accFlag = self.cpTrade.GoodsList(acc, 1)
@@ -2761,13 +2457,14 @@ class CTrader(QObject):
             logging.error(f"get_trade_profit -> {ex}")
     
     def update_highest_price(self, code, current_price):
+        """최고가 업데이트"""
         if code not in self.highest_price:
             self.highest_price[code] = current_price
         elif current_price > self.highest_price[code]:
             self.highest_price[code] = current_price    
 
     def monitor_vi(self, time, code, event2):
-        """VI 발동 모니터링 (VI 전략 전용)"""
+        """VI 발동 모니터링"""
         try:
             if code in self.monistock_set or len(self.monistock_set) >= 10 or code in self.bought_set:
                 return
@@ -2884,7 +2581,6 @@ class CTrader(QObject):
             )
             
             self.save_list_db(code, self.starting_time[code], self.starting_price[code], 1)
-            self.save_vi_data(code)
 
         except Exception as ex:
             logging.error(f"monitor_vi -> {code}, {ex}\n{traceback.format_exc()}")
@@ -2970,6 +2666,7 @@ class CTrader(QObject):
             logging.error(f"download_vi -> {ex}")
 
     def save_list_db(self, code, starting_time, starting_price, is_moni=0, db_file='mylist.db'):
+        """종목 리스트 DB 저장"""
         conn = sqlite3.connect(db_file)
         c = conn.cursor()
         c.execute('''
@@ -2980,11 +2677,13 @@ class CTrader(QObject):
                 is_moni INTEGER
             )
         ''')
-        c.execute('INSERT OR REPLACE INTO items (codes, starting_time, starting_price, is_moni) VALUES (?, ?, ?, ?)', (code, starting_time, starting_price, is_moni))
+        c.execute('INSERT OR REPLACE INTO items (codes, starting_time, starting_price, is_moni) VALUES (?, ?, ?, ?)', 
+                  (code, starting_time, starting_price, is_moni))
         conn.commit()
         conn.close()
 
     def delete_list_db(self, code, db_file='mylist.db'):
+        """종목 리스트 DB 삭제"""
         conn = sqlite3.connect(db_file)
         c = conn.cursor()
         c.execute('''
@@ -2995,12 +2694,12 @@ class CTrader(QObject):
                 is_moni INTEGER
             )
         ''')
-
         c.execute("DELETE FROM items WHERE codes = ?", (code,))
         conn.commit()
         conn.close()
 
     def clear_list_db(self, db_file='mylist.db'):
+        """종목 리스트 DB 전체 삭제"""
         try:
             if os.path.exists(db_file):
                 os.remove(db_file)
@@ -3013,6 +2712,7 @@ class CTrader(QObject):
         self.starting_price = {}
 
     def load_from_list_db(self, db_file='mylist.db'):
+        """종목 리스트 DB 로드"""
         if not os.path.exists(db_file):
             self.monistock_set = set()
             self.vistock_set = set()
@@ -3043,6 +2743,7 @@ class CTrader(QObject):
 
     @pyqtSlot(str, str, str, str)
     def buy_stock(self, code, buy_message, order_condition, order_style):
+        """매수 주문"""
         try:
             if code in self.bought_set or code in self.buyorder_set or code in self.buyordering_set:
                 return
@@ -3111,6 +2812,7 @@ class CTrader(QObject):
 
     @pyqtSlot(str, str)
     def sell_stock(self, code, message):
+        """매도 주문"""
         try:
             if code in self.sellorder_set:
                 return
@@ -3161,6 +2863,7 @@ class CTrader(QObject):
 
     @pyqtSlot(str, str)
     def sell_half_stock(self, code, message):
+        """분할 매도 주문"""
         try:
             if code in self.sellorder_set:
                 return
@@ -3212,6 +2915,7 @@ class CTrader(QObject):
 
     @pyqtSlot()
     def sell_all(self):
+        """전량 매도"""
         try:
             stocks = self.get_stock_balance('ALL', 'sell_all')
             acc = self.cpTrade.AccountNumber[0]
@@ -3250,7 +2954,7 @@ class CTrader(QObject):
             return False
 
     def monitorOrderStatus(self, code, ordernum, conflags, price, qty, bs, balance, buyprice):
-        """주문 체결 모니터링 (거래 기록 저장 추가)"""
+        """주문 체결 모니터링"""
         try:
             stock_name = self.cpCodeMgr.CodeToName(code)
 
@@ -3309,7 +3013,7 @@ class CTrader(QObject):
                         except:
                             pass
                     
-                    # ✅ 매도 거래 기록 저장
+                    # 매도 거래 기록 저장
                     self.save_trade_record(
                         code=code,
                         action='SELL',
@@ -3359,7 +3063,7 @@ class CTrader(QObject):
                     self.buy_price[code] = buyprice
                     logging.info(f"{stock_name}({code}), {self.buy_qty[code]}주, 매수 완료({int(self.buy_price[code])}원)")
                     
-                    # ✅ 매수 거래 기록 저장
+                    # 매수 거래 기록 저장
                     self.save_trade_record(
                         code=code,
                         action='BUY',
@@ -3382,7 +3086,7 @@ class CTrader(QObject):
 
 # ==================== AutoTraderThread (통합 전략 적용) ====================
 class AutoTraderThread(QThread):
-    """자동매매 스레드 - 통합 전략"""
+    """자동매매 스레드 - 통합 전략 (DatabaseWorker 제거 반영)"""
     
     buy_signal = pyqtSignal(str, str, str, str)
     sell_signal = pyqtSignal(str, str)
@@ -3410,8 +3114,8 @@ class AutoTraderThread(QThread):
         self.last_evaluation_time = {}
         self.evaluation_lock = threading.Lock()
         
-        # ✅ DB 저장용
-        self.last_save_time = {}  # 종목별 마지막 저장 시각
+        # DB 저장용
+        self.last_save_time = {}
         self.save_lock = threading.Lock()
 
     def load_trading_settings(self):
@@ -3510,36 +3214,42 @@ class AutoTraderThread(QThread):
             logging.error(f"{code} 이벤트 기반 평가 오류: {ex}")
 
     def save_to_db_if_needed(self, code, timestamp, tick_data, min_data, trigger_reason):
-        """조건부 DB 저장 (중복 방지)"""
+        """조건부 DB 저장 (중복 방지 + 동시성 안전)"""
         
+        should_save = False
+        save_reason = ""
+        last_save_backup = 0
+        
+        # ===== 1. 저장 필요 여부 판단 (락 안에서) =====
         with self.save_lock:
             now = time.time()
             last_save = self.last_save_time.get(code, 0)
+            last_save_backup = last_save  # 롤백용 백업
             
-            # ✅ 저장 조건
-            save_needed = False
-            
-            # 1. 5초 이상 경과 (주기적 저장)
+            # 저장 조건 체크
             if now - last_save >= 5.0:
-                save_needed = True
+                # 주기적 저장 (5초)
+                should_save = True
                 save_reason = "주기적 저장"
-            
-            # 2. 틱/분봉 완성 이벤트 (즉시 저장)
-            elif "완성" in trigger_reason:
-                save_needed = True
+                self.last_save_time[code] = now  # ✅ 미리 업데이트하여 중복 방지
+                
+            elif "완성" in trigger_reason and now - last_save >= 1.0:
+                # 틱/분봉 완성 이벤트 (최소 1초 간격)
+                should_save = True
                 save_reason = trigger_reason
-            
-            # 3. 매매 발생 시 (즉시 저장)
-            elif code in self.trader.buyorder_set or code in self.trader.sellorder_set:
-                save_needed = True
+                self.last_save_time[code] = now
+                
+            elif (code in self.trader.buyorder_set or code in self.trader.sellorder_set):
+                # 매매 발생 시 (즉시 저장)
+                should_save = True
                 save_reason = "매매 발생"
-            
-            if not save_needed:
-                return
-            
-            self.last_save_time[code] = now
+                self.last_save_time[code] = now
         
-        # ✅ 실제 저장 (락 밖에서 수행)
+        # ===== 2. 저장 불필요 시 조기 리턴 =====
+        if not should_save:
+            return
+        
+        # ===== 3. 실제 DB 저장 (락 밖에서) =====
         try:
             conn = sqlite3.connect(self.trader.db_name, timeout=5)
             cursor = conn.cursor()
@@ -3561,6 +3271,7 @@ class AutoTraderThread(QThread):
                 position_type = 'NONE'
                 buy_price = None
             
+            # INSERT OR REPLACE
             cursor.execute('''
                 INSERT OR REPLACE INTO combined_tick_data (
                     code, timestamp, date, time,
@@ -3635,16 +3346,33 @@ class AutoTraderThread(QThread):
             conn.commit()
             conn.close()
             
-            logging.debug(f"{code}: DB 저장 ({save_reason})")
+            logging.debug(f"{code}: DB 저장 완료 ({save_reason})")
+            
+        except sqlite3.IntegrityError as ex:
+            # 중복 키 오류 (이미 저장됨)
+            logging.debug(f"{code}: DB 중복 데이터 스킵 - {ex}")
+            
+        except sqlite3.OperationalError as ex:
+            # DB 락, 테이블 없음 등
+            logging.error(f"{code}: DB 저장 실패 (OperationalError) - {ex}")
+            
+            # ✅ 실패 시 시간 롤백
+            with self.save_lock:
+                self.last_save_time[code] = last_save_backup
             
         except Exception as ex:
-            logging.error(f"save_to_db_if_needed -> {code}, {ex}")
+            # 기타 예외
+            logging.error(f"{code}: DB 저장 실패 (예상치 못한 오류) - {ex}\n{traceback.format_exc()}")
+            
+            # ✅ 실패 시 시간 롤백
+            with self.save_lock:
+                self.last_save_time[code] = last_save_backup
 
     def run(self):
         """메인 루프"""
         while self.running:
             self.autotrade()
-            # ✅ 5초 주기로 변경
+            # 5초 주기
             self.msleep(self.evaluation_interval * 1000)
 
     def stop(self):
@@ -3667,7 +3395,7 @@ class AutoTraderThread(QThread):
             self._update_stock_data_table()
             
             if self._is_trading_hours(t_now):
-                # ✅ 주기적 평가 + 저장
+                # 주기적 평가 + 저장
                 self._execute_trading_logic(t_now)
             elif self._is_market_close_time(t_now):
                 self._handle_market_close()
@@ -3722,21 +3450,17 @@ class AutoTraderThread(QThread):
                 continue
             
             try:
-                # ✅ 5초마다 평가 + 저장
-                self._evaluate_code_if_ready(code, t_now, "주기적 평가")
+                # 5초마다 평가 + 저장
+                self._evaluate_code_if_ready(code, "주기적 평가")
                     
             except Exception as ex:
                 logging.error(f"{code} 거래 로직 오류: {ex}")
 
     def _handle_market_close(self):
-        """장 종료 처리 (강제 저장 추가)"""
+        """장 종료 처리 (간소화)"""
         
         if self.trader.buyorder_set or self.trader.sellorder_set:
             return
-        
-        # ✅ 장마감 강제 저장
-        if self.trader.force_save_on_close:
-            self.trader.force_save_all_data()
         
         # 보유 주식 전부 매도
         if self.trader.bought_set:
@@ -3745,7 +3469,7 @@ class AutoTraderThread(QThread):
         
         self.sell_all_emitted = True
 
-    # ===== 헬퍼 함수들 =====
+    # ===== 헬퍼 함수들 (변경 없음) =====
     
     def get_threshold_by_hour(self):
         """시간대별 임계값 반환"""
@@ -3791,7 +3515,17 @@ class AutoTraderThread(QThread):
             self.buy_signal.emit(code, "사용자 전략", "0", "03")
 
     def _evaluate_integrated_buy(self, code, buy_strategies, tick_latest, min_latest):
-        """통합 전략 매수 평가 (텍스트 기반)"""
+        """통합 전략 매수 평가 (안전한 eval)"""
+        
+        # ===== 안전한 실행 환경 구성 =====
+        safe_globals = {
+            '__builtins__': {
+                'min': min, 'max': max, 'abs': abs, 'round': round,
+                'int': int, 'float': float, 'bool': bool, 'str': str,
+                'len': len, 'sum': sum, 'all': all, 'any': any,
+                'True': True, 'False': False, 'None': None
+            }
+        }
         
         # ===== 기본 변수들 =====
         MAT5 = tick_latest.get('MAT5', 0)
@@ -3806,9 +3540,8 @@ class AutoTraderThread(QThread):
         MAM10 = min_latest.get('MAM10', 0)
         MAM20 = min_latest.get('MAM20', 0)
         
-        # ===== 계산된 값들 (기존 클래스 재사용) =====
+        # ===== 계산된 값들 =====
         strength = self.trader.tickdata.get_strength(code)
-        
         momentum_score = 0
         if self.window.momentum_scanner:
             momentum_score = self.window.momentum_scanner._calculate_momentum_score(code)
@@ -3823,13 +3556,24 @@ class AutoTraderThread(QThread):
         if hasattr(self.window, 'gap_scanner'):
             gap_hold = self.window.gap_scanner.check_gap_hold(code)
         
+        # ===== 허용된 변수만 포함 =====
+        safe_locals = {
+            'MAT5': MAT5, 'MAT20': MAT20, 'MAT60': MAT60, 'MAT120': MAT120,
+            'C': C, 'VWAP': VWAP, 'RSIT': RSIT,
+            'MAM5': MAM5, 'MAM10': MAM10, 'MAM20': MAM20,
+            'strength': strength, 'momentum_score': momentum_score,
+            'threshold': threshold, 'volatility_breakout': volatility_breakout,
+            'gap_hold': gap_hold,
+            'code': code  # 디버깅용
+        }
+        
         # ===== 전략 평가 =====
         for strategy in buy_strategies:
             try:
                 condition = strategy.get('content', '')
                 
-                # eval()로 조건 평가
-                if eval(condition):
+                # ✅ 안전한 eval 실행
+                if eval(condition, safe_globals, safe_locals):
                     buy_reason = strategy.get('name', '통합 전략')
                     logging.info(
                         f"{cpCodeMgr.CodeToName(code)}({code}): {buy_reason} 매수 "
@@ -3838,8 +3582,15 @@ class AutoTraderThread(QThread):
                     self.buy_signal.emit(code, buy_reason, "0", "03")
                     return True
                     
+            except NameError as ex:
+                # 정의되지 않은 변수
+                logging.error(f"{code} 매수 전략 '{strategy.get('name')}' 오류 - 변수 미정의: {ex}")
+            except SyntaxError as ex:
+                # 문법 오류
+                logging.error(f"{code} 매수 전략 '{strategy.get('name')}' 오류 - 문법: {ex}")
             except Exception as ex:
-                logging.error(f"{code} 통합 전략 매수 평가 오류: {ex}\n{traceback.format_exc()}")
+                # 기타 오류
+                logging.error(f"{code} 매수 전략 '{strategy.get('name')}' 오류: {ex}\n{traceback.format_exc()}")
         
         return False
 
@@ -4052,7 +3803,17 @@ class AutoTraderThread(QThread):
 
     def _evaluate_integrated_sell(self, code, sell_strategies, tick_latest, min_latest,
                                   current_profit_pct, from_peak_pct, hold_minutes):
-        """통합 전략 매도 평가 (텍스트 기반)"""
+        """통합 전략 매도 평가 (안전한 eval)"""
+        
+        # ===== 안전한 실행 환경 =====
+        safe_globals = {
+            '__builtins__': {
+                'min': min, 'max': max, 'abs': abs, 'round': round,
+                'int': int, 'float': float, 'bool': bool, 'str': str,
+                'len': len, 'sum': sum, 'all': all, 'any': any,
+                'True': True, 'False': False, 'None': None
+            }
+        }
         
         # ===== 기본 변수들 =====
         min_close = min_latest.get('C', 0)
@@ -4068,13 +3829,25 @@ class AutoTraderThread(QThread):
         
         after_market_close = self.is_after_time(14, 45)
         
+        # ===== 허용된 변수만 포함 =====
+        safe_locals = {
+            'min_close': min_close, 'MAM5': MAM5, 'MAM10': MAM10,
+            'current_profit_pct': current_profit_pct,
+            'from_peak_pct': from_peak_pct,
+            'hold_minutes': hold_minutes,
+            'osct_negative': osct_negative,
+            'after_market_close': after_market_close,
+            'code': code,  # trader 접근용
+            'self': self  # self.trader 접근 허용
+        }
+        
         # ===== 전략 평가 =====
         for strategy in sell_strategies:
             try:
                 condition = strategy.get('content', '')
                 
-                # eval()로 조건 평가
-                if eval(condition):
+                # ✅ 안전한 eval 실행
+                if eval(condition, safe_globals, safe_locals):
                     sell_reason = strategy.get('name', '통합 전략')
                     logging.info(f"{cpCodeMgr.CodeToName(code)}({code}): {sell_reason} ({current_profit_pct:.2f}%)")
                     
@@ -4085,8 +3858,12 @@ class AutoTraderThread(QThread):
                         self.sell_signal.emit(code, sell_reason)
                     return True
                     
+            except NameError as ex:
+                logging.error(f"{code} 매도 전략 '{strategy.get('name')}' 오류 - 변수 미정의: {ex}")
+            except SyntaxError as ex:
+                logging.error(f"{code} 매도 전략 '{strategy.get('name')}' 오류 - 문법: {ex}")
             except Exception as ex:
-                logging.error(f"{code} 통합 전략 매도 평가 오류: {ex}\n{traceback.format_exc()}")
+                logging.error(f"{code} 매도 전략 '{strategy.get('name')}' 오류: {ex}\n{traceback.format_exc()}")
         
         return False
     
@@ -4513,7 +4290,7 @@ class MyWindow(QWidget):
         self.trader_thread.start()
 
     def start_timers(self):
-        """타이머 시작 (장마감 처리 개선)"""
+        """타이머 시작 (간소화)"""
         now = datetime.now()
         start_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
         end_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
@@ -4540,14 +4317,9 @@ class MyWindow(QWidget):
             QTimer.singleShot(int((end_time - now).total_seconds() * 1000) + 1000, self.start_timers)
             
         elif end_time <= now and not self.market_close_emitted:
-            # ✅ 타이머 정지 전에 먼저 데이터 저장
+            # ===== 타이머 정리 (간소화) =====
             logging.info("=== 장 종료 처리 시작 ===")
-            
-            # 데이터 저장 타이머 정지
-            if self.trader.save_data_timer is not None:
-                self.trader.save_data_timer.stop()
-                logging.info("데이터 저장 타이머 정지")
-            
+                       
             # 차트 업데이트 타이머 정지
             if self.trader.tickdata is not None:
                 self.trader.tickdata.update_data_timer.stop()
@@ -4557,9 +4329,6 @@ class MyWindow(QWidget):
                 self.trader.daydata.update_data_timer.stop()
             if self.update_chart_status_timer is not None:
                 self.update_chart_status_timer.stop()
-            
-            # ✅ 장마감 강제 저장은 AutoTraderThread에서 처리
-            # (매도 주문 완료 후 실행되도록)
             
             # 미보유 종목 정리
             for code in list(self.trader.monistock_set):
@@ -4687,12 +4456,110 @@ class MyWindow(QWidget):
         with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
             self.login_handler.config.write(configfile)
 
+    def validate_strategy_condition(self, condition, strategy_type='buy'):
+        """전략 조건식 검증
+        
+        Args:
+            condition: 검증할 조건식 문자열
+            strategy_type: 'buy' 또는 'sell'
+        
+        Returns:
+            (is_valid, message): (True/False, 메시지)
+        """
+        try:
+            import ast
+            
+            # 빈 문자열 체크
+            if not condition or not condition.strip():
+                return False, "조건식이 비어있습니다"
+            
+            # 문법 검증
+            try:
+                tree = ast.parse(condition, mode='eval')
+            except SyntaxError as e:
+                return False, f"문법 오류: {e.msg} (라인 {e.lineno})"
+            
+            # 사용 가능한 변수 정의
+            if strategy_type == 'buy':
+                available_vars = {
+                    # 틱 데이터
+                    'MAT5', 'MAT20', 'MAT60', 'MAT120', 'C', 'VWAP', 
+                    'RSIT', 'RSIT_SIGNAL', 'MACDT', 'MACDT_SIGNAL', 'OSCT',
+                    'STOCHK', 'STOCHD', 'ATR', 'CCI',
+                    'BB_UPPER', 'BB_MIDDLE', 'BB_LOWER', 'BB_POSITION', 'BB_BANDWIDTH',
+                    
+                    # 분봉 데이터
+                    'MAM5', 'MAM10', 'MAM20', 'min_close',
+                    'RSI', 'RSI_SIGNAL', 'MACD', 'MACD_SIGNAL', 'OSC',
+                    
+                    # 계산 변수
+                    'strength', 'momentum_score', 'threshold',
+                    'volatility_breakout', 'gap_hold',
+                    
+                    # 기타
+                    'positive_candle', 'tick_close_price', 'min_close_price'
+                }
+            else:  # sell
+                available_vars = {
+                    # 기본 변수
+                    'min_close', 'MAM5', 'MAM10',
+                    'current_profit_pct', 'from_peak_pct', 'hold_minutes',
+                    'code', 'osct_negative', 'after_market_close',
+                    
+                    # trader 객체 접근 (self.trader)
+                    'self'
+                }
+            
+            # 사용된 변수명 추출
+            used_vars = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    used_vars.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    # self.trader.sell_half_set 같은 경우
+                    if isinstance(node.value, ast.Name):
+                        used_vars.add(node.value.id)
+            
+            # 정의되지 않은 변수 체크
+            undefined = used_vars - available_vars - {
+                # Python 내장 함수 허용
+                'True', 'False', 'None', 
+                'min', 'max', 'abs', 'round', 'int', 'float', 'len', 'sum', 'all', 'any'
+            }
+            
+            if undefined:
+                return False, f"정의되지 않은 변수: {', '.join(sorted(undefined))}"
+            
+            # 위험한 함수 호출 체크
+            dangerous_calls = {'eval', 'exec', 'compile', '__import__', 'open', 'file'}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name):
+                        if node.func.id in dangerous_calls:
+                            return False, f"위험한 함수 사용 금지: {node.func.id}"
+            
+            return True, "검증 성공"
+            
+        except Exception as ex:
+            return False, f"검증 중 오류: {str(ex)}"
+
     def save_buystrategy(self):
+        """매수 전략 저장 (검증 추가)"""
         try:
             investment_strategy = self.comboStg.currentText()
             buy_strategy = self.comboBuyStg.currentText()
             buy_key = self.comboBuyStg.currentData()
             strategy_content = self.buystgInputWidget.toPlainText()
+
+            # ===== 여기에서 검증 =====
+            is_valid, message = self.validate_strategy_condition(strategy_content, 'buy')
+            if not is_valid:
+                QMessageBox.warning(
+                    self, 
+                    "전략 검증 실패", 
+                    f"매수 전략 '{buy_strategy}'의 조건식이 올바르지 않습니다.\n\n{message}"
+                )
+                return
 
             if not self.login_handler.config.has_section('STRATEGIES'):
                 self.login_handler.config.add_section('STRATEGIES')
@@ -4718,7 +4585,7 @@ class MyWindow(QWidget):
             QMessageBox.information(self, "수정 완료", f"매수전략 '{buy_strategy}'이 수정되었습니다.")
 
         except Exception as ex:
-            logging.error(f"save_strategy -> {ex}")
+            logging.error(f"save_buystrategy -> {ex}")
             QMessageBox.critical(self, "수정 실패", f"전략 수정 중 오류가 발생했습니다:\n{str(ex)}")
 
     def save_sellstrategy(self):
@@ -4727,6 +4594,16 @@ class MyWindow(QWidget):
             sell_strategy = self.comboSellStg.currentText()
             sell_key = self.comboSellStg.currentData()
             strategy_content = self.sellstgInputWidget.toPlainText()
+
+            # ===== 여기에서 검증 =====
+            is_valid, message = self.validate_strategy_condition(strategy_content, 'sell')
+            if not is_valid:
+                QMessageBox.warning(
+                    self, 
+                    "전략 검증 실패", 
+                    f"매도 전략 '{sell_strategy}'의 조건식이 올바르지 않습니다.\n\n{message}"
+                )
+                return
 
             if not self.login_handler.config.has_section('STRATEGIES'):
                 self.login_handler.config.add_section('STRATEGIES')
@@ -5185,29 +5062,25 @@ class MyWindow(QWidget):
             self.terminalOutput.print_(printer)
 
     def closeEvent(self, event):
-        reply = QMessageBox.question(self, 'Message', "Are you sure you want to quit?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        """프로그램 종료 처리"""
+        reply = QMessageBox.question(self, 'Message', "Are you sure you want to quit?", 
+                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.save_last_stg()
 
             # 전략 객체 정리
             if self.momentum_scanner:
-                self.momentum_scanner.stop_screening()
+                self.momentum_scanner.stop_screening()            
             
-            if hasattr(self.trader, 'db_worker'):
-                self.trader.db_worker.stop()
-                self.trader.db_thread.quit()
-                self.trader.db_thread.wait()
-
-            if getattr(self.trader, 'save_data_timer', None):
-                self.trader.save_data_timer.stop()
-            if getattr(self, 'update_chart_status_timer', None):
-                self.update_chart_status_timer.stop()
+            # 차트 업데이트 타이머 정지
             if getattr(self.trader, 'tickdata', None):
                 self.trader.tickdata.update_data_timer.stop()
             if getattr(self.trader, 'mindata', None):
                 self.trader.mindata.update_data_timer.stop()
             if getattr(self.trader, 'daydata', None):
                 self.trader.daydata.update_data_timer.stop()
+            if getattr(self, 'update_chart_status_timer', None):
+                self.update_chart_status_timer.stop()
 
             if self.chartdrawer.chart_thread:
                 self.chartdrawer.chart_thread.stop()

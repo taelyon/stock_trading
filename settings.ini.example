@@ -27,16 +27,8 @@ event_based_evaluation = True
 # 최소 평가 간격 (초, 과도한 평가 방지)
 min_evaluation_gap = 3
 
-# ===== 데이터 저장 설정 =====
 [DATA_SAVING]
-# 저장 간격 (초 단위, 기본값: 300초 = 5분)
-interval_seconds = 300
-# 장마감 시 강제 저장 여부
-force_save_on_close = True
-# 증분 저장 활성화 (True: 새 데이터만, False: 전체)
-incremental_save = True
-# 오버랩 개수 (마지막 N개 봉 재저장, 안전 마진)
-overlap_count = 2
+interval_seconds = 5
 
 [BUYCOUNT]
 target_buy_count = 3

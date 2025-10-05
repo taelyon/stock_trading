@@ -11,9 +11,8 @@ import copy
 plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
 
-
 class Backtester:
-    """백테스팅 엔진"""
+    """백테스팅 엔진 (combined_tick_data 사용)"""
     
     def __init__(self, db_path, initial_cash=10000000):
         self.db_path = db_path
@@ -21,14 +20,14 @@ class Backtester:
         
         # 포트폴리오
         self.cash = initial_cash
-        self.holdings = {}  # {code: qty}
+        self.holdings = {}
         self.buy_prices = {}
         self.buy_times = {}
         self.highest_prices = {}
         
         # 매매 설정
         self.max_holdings = 3
-        self.position_size = 0.3  # 종목당 30%
+        self.position_size = 0.3
         
         # 거래 기록
         self.trades = []
@@ -36,14 +35,14 @@ class Backtester:
         
         # 전략 설정
         self.strategy_params = {}
-        
+    
     def load_codes(self, start_date, end_date):
         """기간 내 거래된 종목 목록"""
         conn = sqlite3.connect(self.db_path)
         
         query = f"""
             SELECT DISTINCT code 
-            FROM tick_data 
+            FROM combined_tick_data 
             WHERE date >= '{start_date}' AND date <= '{end_date}'
             ORDER BY code
         """
@@ -53,63 +52,28 @@ class Backtester:
         
         return df['code'].tolist()
     
-    def load_tick_data(self, code, start_date, end_date):
-        """틱 데이터 로드"""
+    def load_combined_data(self, code, start_date, end_date):
+        """결합 데이터 로드 (combined_tick_data)"""
         conn = sqlite3.connect(self.db_path)
         
         query = f"""
-            SELECT * FROM tick_data 
+            SELECT * FROM combined_tick_data 
             WHERE code = '{code}' 
             AND date >= '{start_date}' 
             AND date <= '{end_date}'
-            ORDER BY date, time, sequence
+            ORDER BY timestamp
         """
         
         df = pd.read_sql(query, conn)
         conn.close()
         
         if len(df) > 0:
-            df['timestamp'] = pd.to_datetime(
-                df['date'].astype(str) + df['time'].astype(str).str.zfill(4),
-                format='%Y%m%d%H%M'
-            )
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
         
         return df
     
-    def load_min_data(self, code, start_date, end_date):
-        """분봉 데이터 로드"""
-        conn = sqlite3.connect(self.db_path)
-        
-        query = f"""
-            SELECT * FROM min_data 
-            WHERE code = '{code}' 
-            AND date >= '{start_date}' 
-            AND date <= '{end_date}'
-            ORDER BY date, time
-        """
-        
-        df = pd.read_sql(query, conn)
-        conn.close()
-        
-        if len(df) > 0:
-            df['timestamp'] = pd.to_datetime(
-                df['date'].astype(str) + df['time'].astype(str).str.zfill(4),
-                format='%Y%m%d%H%M'
-            )
-        
-        return df
-    
-    def check_buy_condition(self, code, tick_df, min_df, idx):
-        """매수 조건 확인 (통합 전략)"""
-        
-        # 현재까지의 데이터만 사용 (미래 정보 누출 방지)
-        tick_now = tick_df.iloc[idx]
-        min_latest = min_df[min_df['timestamp'] <= tick_now['timestamp']]
-        
-        if len(min_latest) == 0:
-            return False
-        
-        min_now = min_latest.iloc[-1]
+    def check_buy_condition(self, code, row, previous_rows):
+        """매수 조건 확인 (실시간과 동일한 로직)"""
         
         # 최대 보유 종목 수 체크
         if len(self.holdings) >= self.max_holdings:
@@ -119,13 +83,15 @@ class Backtester:
         if self.cash < self.initial_cash * self.position_size:
             return False
         
-        # ===== 간단한 통합 전략 조건 =====
+        # ===== 통합 전략 조건 (실시간과 동일) =====
         
         # 1. 이평선 정배열
-        MAT5 = tick_now['MAT5']
-        MAT20 = tick_now['MAT20']
-        C = tick_now['C']
-        VWAP = tick_now['VWAP']
+        MAT5 = row['tick_MAT5']
+        MAT20 = row['tick_MAT20']
+        MAT60 = row['tick_MAT60']
+        MAT120 = row['tick_MAT120']
+        C = row['tick_C']
+        VWAP = row['tick_VWAP']
         
         if not (MAT5 > MAT20 and C > MAT5):
             return False
@@ -135,34 +101,31 @@ class Backtester:
             return False
         
         # 3. 분봉 이평선 정배열
-        MAM5 = min_now['MAM5']
-        MAM10 = min_now['MAM10']
+        MAM5 = row['min_MAM5']
+        MAM10 = row['min_MAM10']
         
         if not (MAM5 > MAM10):
             return False
         
         # 4. RSI 조건
-        RSIT = tick_now['RSIT']
+        RSIT = row['tick_RSIT']
         if not (40 < RSIT < 80):
+            return False
+        
+        # 5. 체결강도 조건 ✅ DB에서 바로 가져옴
+        strength = row['strength']
+        if not (strength >= 120):
             return False
         
         return True
     
-    def check_sell_condition(self, code, tick_df, min_df, idx):
+    def check_sell_condition(self, code, row, previous_rows):
         """매도 조건 확인"""
         
         if code not in self.holdings:
             return False, None
         
-        tick_now = tick_df.iloc[idx]
-        min_latest = min_df[min_df['timestamp'] <= tick_now['timestamp']]
-        
-        if len(min_latest) == 0:
-            return False, None
-        
-        min_now = min_latest.iloc[-1]
-        
-        current_price = tick_now['C']
+        current_price = row['tick_C']
         buy_price = self.buy_prices[code]
         
         # 최고가 업데이트
@@ -175,7 +138,7 @@ class Backtester:
         from_peak_pct = (current_price / self.highest_prices[code] - 1) * 100
         
         # 보유 시간
-        hold_minutes = (tick_now['timestamp'] - self.buy_times[code]).total_seconds() / 60
+        hold_minutes = (row['timestamp'] - self.buy_times[code]).total_seconds() / 60
         
         # ===== 매도 조건 =====
         
@@ -188,8 +151,8 @@ class Backtester:
             return True, "시간 손절"
         
         # 3. 장마감 청산 (14:45 이후)
-        hour = tick_now['timestamp'].hour
-        minute = tick_now['timestamp'].minute
+        hour = row['timestamp'].hour
+        minute = row['timestamp'].minute
         if hour >= 14 and minute >= 45:
             return True, "장마감 청산"
         
@@ -202,8 +165,8 @@ class Backtester:
             return True, "추적 손절"
         
         # 6. 데드크로스
-        MAM5 = min_now['MAM5']
-        MAM10 = min_now['MAM10']
+        MAM5 = row['min_MAM5']
+        MAM10 = row['min_MAM10']
         if MAM5 < MAM10:
             return True, "데드크로스"
         
@@ -218,7 +181,7 @@ class Backtester:
         if qty <= 0:
             return
         
-        cost = price * qty * 1.00015  # 수수료 0.015%
+        cost = price * qty * 1.00015
         
         if cost > self.cash:
             return
@@ -247,7 +210,7 @@ class Backtester:
             return
         
         qty = self.holdings[code]
-        revenue = price * qty * 0.99835  # 세금+수수료 0.165%
+        revenue = price * qty * 0.99835
         
         buy_price = self.buy_prices[code]
         buy_cost = buy_price * qty * 1.00015
@@ -289,7 +252,7 @@ class Backtester:
         return self.cash + holdings_value
     
     def run(self, start_date, end_date, strategy_name='통합 전략'):
-        """백테스팅 실행"""
+        """백테스팅 실행 (combined_tick_data 사용)"""
         
         logging.info(f"=== 백테스팅 시작: {start_date} ~ {end_date} ===")
         
@@ -306,73 +269,82 @@ class Backtester:
         codes = self.load_codes(start_date, end_date)
         logging.info(f"대상 종목 수: {len(codes)}개")
         
-        # 날짜별로 처리
-        start_dt = datetime.strptime(start_date, '%Y%m%d')
-        end_dt = datetime.strptime(end_date, '%Y%m%d')
+        if len(codes) == 0:
+            logging.warning("백테스팅 데이터 없음!")
+            return self.calculate_results(strategy_name, start_date, end_date)
         
-        current_dt = start_dt
-        while current_dt <= end_dt:
-            date_str = current_dt.strftime('%Y%m%d')
+        # 모든 종목의 데이터 로드
+        all_data = {}
+        for code in codes:
+            df = self.load_combined_data(code, start_date, end_date)
+            if len(df) > 0:
+                all_data[code] = df
+                logging.info(f"{code}: {len(df)}개 데이터 로드")
+        
+        # 시간순으로 모든 이벤트 정렬
+        all_events = []
+        for code, df in all_data.items():
+            for idx, row in df.iterrows():
+                all_events.append((row['timestamp'], code, idx, row))
+        
+        all_events.sort(key=lambda x: x[0])
+        
+        logging.info(f"총 {len(all_events)}개 이벤트 처리 시작")
+        
+        # 이벤트 처리
+        processed = 0
+        for timestamp, code, idx, row in all_events:
+            processed += 1
             
-            # 주말 스킵
-            if current_dt.weekday() >= 5:
-                current_dt += timedelta(days=1)
-                continue
+            if processed % 10000 == 0:
+                logging.info(f"처리 중: {processed}/{len(all_events)} ({processed/len(all_events)*100:.1f}%)")
             
-            logging.info(f"처리 중: {date_str}")
+            current_price = row['tick_C']
             
-            # 해당 날짜 데이터 로드
-            daily_data = {}
-            for code in codes:
-                tick_df = self.load_tick_data(code, date_str, date_str)
-                min_df = self.load_min_data(code, date_str, date_str)
+            # 현재 가격 정보
+            current_prices = {code: current_price}
+            
+            # 매도 조건 확인 (우선)
+            if code in self.holdings:
+                # 이전 데이터 (필요시)
+                previous_rows = all_data[code].iloc[max(0, idx-10):idx]
                 
-                if len(tick_df) > 0:
-                    daily_data[code] = (tick_df, min_df)
+                should_sell, reason = self.check_sell_condition(code, row, previous_rows)
+                if should_sell:
+                    self.execute_sell(code, current_price, timestamp, reason)
             
-            # 시간순으로 처리
-            all_timestamps = []
-            for code, (tick_df, min_df) in daily_data.items():
-                all_timestamps.extend(tick_df['timestamp'].tolist())
-            
-            all_timestamps = sorted(set(all_timestamps))
-            
-            for ts in all_timestamps:
-                current_prices = {}
+            # 매수 조건 확인
+            else:
+                previous_rows = all_data[code].iloc[max(0, idx-10):idx]
                 
-                # 각 종목별 처리
-                for code, (tick_df, min_df) in daily_data.items():
-                    # 해당 시각의 데이터
-                    tick_at_ts = tick_df[tick_df['timestamp'] == ts]
-                    
-                    if len(tick_at_ts) == 0:
-                        continue
-                    
-                    idx = tick_df[tick_df['timestamp'] == ts].index[0]
-                    current_price = tick_at_ts.iloc[0]['C']
-                    current_prices[code] = current_price
-                    
-                    # 매도 조건 확인 (우선)
-                    if code in self.holdings:
-                        should_sell, reason = self.check_sell_condition(code, tick_df, min_df, idx)
-                        if should_sell:
-                            self.execute_sell(code, current_price, ts, reason)
-                    
-                    # 매수 조건 확인
-                    else:
-                        if self.check_buy_condition(code, tick_df, min_df, idx):
-                            self.execute_buy(code, current_price, ts)
+                if self.check_buy_condition(code, row, previous_rows):
+                    self.execute_buy(code, current_price, timestamp)
+            
+            # 포트폴리오 가치 기록 (매 100개 이벤트마다)
+            if processed % 100 == 0:
+                # 모든 보유 종목의 현재가 업데이트
+                for held_code in self.holdings.keys():
+                    if held_code in all_data:
+                        # 현재 시점 이전 최신 데이터
+                        code_data = all_data[held_code]
+                        recent = code_data[code_data['timestamp'] <= timestamp]
+                        if len(recent) > 0:
+                            current_prices[held_code] = recent.iloc[-1]['tick_C']
                 
-                # 포트폴리오 가치 기록
                 portfolio_value = self.calculate_portfolio_value(current_prices)
                 self.equity_curve.append({
-                    'timestamp': ts,
+                    'timestamp': timestamp,
                     'value': portfolio_value,
                     'cash': self.cash,
                     'holdings_value': portfolio_value - self.cash
                 })
-            
-            current_dt += timedelta(days=1)
+        
+        # 최종 청산
+        final_timestamp = all_events[-1][0] if all_events else pd.Timestamp.now()
+        for code in list(self.holdings.keys()):
+            code_data = all_data[code]
+            final_price = code_data.iloc[-1]['tick_C']
+            self.execute_sell(code, final_price, final_timestamp, "백테스팅 종료")
         
         # 결과 계산
         results = self.calculate_results(strategy_name, start_date, end_date)
@@ -383,7 +355,7 @@ class Backtester:
         logging.info("=== 백테스팅 완료 ===")
         
         return results
-    
+       
     def calculate_results(self, strategy_name, start_date, end_date):
         """결과 계산"""
         
