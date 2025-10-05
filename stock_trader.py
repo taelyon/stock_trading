@@ -2019,7 +2019,12 @@ class DatabaseWorker(QObject):
         self.tickdata = tickdata
         self.mindata = mindata
         self.running = True
-        self.last_saved_timestamp = {}
+        
+        # 마지막 저장 인덱스
+        self.last_saved_indices = {}  # {code: {'tick': idx, 'min': idx}}
+        
+        # ✅ 설정: 안전 마진 (마지막 N개 봉 재저장)
+        self.overlap_count = 2  # 마지막 2개 봉 재저장
 
     def run(self):
         while self.running:
@@ -2028,9 +2033,11 @@ class DatabaseWorker(QObject):
                 if item is None:
                     self.queue.task_done()
                     break
-                code, tick_data_copy, min_data_copy, start_date, start_hhmm = item
+                
+                code, tick_data_copy, min_data_copy, start_date, start_hhmm, incremental = item
+                
                 try:
-                    self.save_vi_data(code, tick_data_copy, min_data_copy, start_date, start_hhmm)
+                    self.save_vi_data(code, tick_data_copy, min_data_copy, start_date, start_hhmm, incremental)
                 except Exception as ex:
                     error_msg = f"DB Worker 오류 ({code}): {ex}"
                     logging.error(error_msg)
@@ -2047,24 +2054,22 @@ class DatabaseWorker(QObject):
         self.running = False
         self.queue.put(None)
 
-    def save_vi_data(self, code, tick_data, min_data, start_date, start_hhmm):
+    def save_vi_data(self, code, tick_data, min_data, start_date, start_hhmm, incremental=True):
+        """VI 데이터 저장 (오버랩 저장 지원)"""
         try:
             with sqlite3.connect(self.db_name, timeout=10) as conn:
                 conn.execute("PRAGMA journal_mode=WAL")
                 c = conn.cursor()
                 c.execute("BEGIN TRANSACTION")
 
-                if code not in self.last_saved_timestamp:
-                    c.execute("SELECT MAX(date), MAX(time) FROM tick_data WHERE code = ?", (code,))
-                    result = c.fetchone()
-                    self.last_saved_timestamp[code] = result if result[0] else ("00000000", "0000")
-                    logging.debug(f"{code}: last_saved_timestamp 초기화 - {self.last_saved_timestamp[code]}")
-
-                last_date, last_time = self.last_saved_timestamp.get(code, ("00000000", "0000"))
+                # 인덱스 초기화
+                if code not in self.last_saved_indices:
+                    self.last_saved_indices[code] = {'tick': 0, 'min': 0}
                 
-                start_hhmm = "0900"
-                end_hhmm = "1515"
+                last_tick_idx = self.last_saved_indices[code]['tick']
+                last_min_idx = self.last_saved_indices[code]['min']
 
+                # ===== 틱 데이터 저장 =====
                 if tick_data and tick_data["T"]:
                     dates, times = tick_data["D"], tick_data["T"]
                     values = [tick_data[key] for key in ["C", "V", "MAT5", "MAT20", "MAT60", "MAT120", "RSIT",
@@ -2073,22 +2078,52 @@ class DatabaseWorker(QObject):
                             "MAT5_MAT20_DIFF", "MAT20_MAT60_DIFF", "MAT60_MAT120_DIFF",
                             "C_MAT5_DIFF", "VWAP"]]
                     
-                    new_data = [
-                        (i, str(date), f"{int(time_val):04d}")
-                        for i, (date, time_val) in enumerate(zip(dates, times))
-                        if len(str(date)) == 8 and len(f"{int(time_val):04d}") == 4
-                        and str(date) == start_date and start_hhmm <= f"{int(time_val):04d}" <= end_hhmm
-                        and (str(date) > last_date or (str(date) == last_date and f"{int(time_val):04d}" >= last_time))
-                    ]
+                    # ✅ 증분 저장: 안전 마진 적용
+                    if incremental:
+                        # 마지막 N개 봉 뒤로 돌아가기
+                        start_idx = max(0, last_tick_idx - self.overlap_count)
+                        
+                        new_data = [
+                            (i, str(date), f"{int(time_val):04d}")
+                            for i, (date, time_val) in enumerate(zip(dates, times))
+                            if i >= start_idx  # ✅ 오버랩 적용
+                            and len(str(date)) == 8 
+                            and len(f"{int(time_val):04d}") == 4
+                            and str(date) == start_date 
+                            and start_hhmm <= f"{int(time_val):04d}" <= "1515"
+                        ]
+                        
+                        overlap_info = f", 오버랩={self.overlap_count}" if start_idx < last_tick_idx else ""
+                    else:
+                        # 전체 저장
+                        new_data = [
+                            (i, str(date), f"{int(time_val):04d}")
+                            for i, (date, time_val) in enumerate(zip(dates, times))
+                            if len(str(date)) == 8 
+                            and len(f"{int(time_val):04d}") == 4
+                            and str(date) == start_date 
+                            and start_hhmm <= f"{int(time_val):04d}" <= "1515"
+                        ]
+                        overlap_info = ""
 
                     if new_data:
                         unique_date_times = set((date, time) for _, date, time in new_data)
+                        
+                        # ✅ 기존 데이터 삭제 (재저장을 위해)
                         for date, time in unique_date_times:
-                            c.execute("DELETE FROM tick_data WHERE code = ? AND date = ? AND time = ?", (code, date, time))
+                            c.execute("DELETE FROM tick_data WHERE code = ? AND date = ? AND time = ?", 
+                                     (code, date, time))
                         
                         inserted_count = 0
+                        updated_count = 0
+                        
                         for date, time in unique_date_times:
-                            for seq, (i, _, _) in enumerate(sorted([(i, d, t) for i, d, t in new_data if d == date and t == time], key=lambda x: x[2])):
+                            sorted_data = sorted(
+                                [(i, d, t) for i, d, t in new_data if d == date and t == time], 
+                                key=lambda x: x[2]
+                            )
+                            
+                            for seq, (i, _, _) in enumerate(sorted_data):
                                 c.execute("""INSERT INTO tick_data
                                             (code, date, time, sequence, C, V, MAT5, MAT20, MAT60, MAT120, RSIT,
                                             RSIT_SIGNAL, MACDT, MACDT_SIGNAL, OSCT, STOCHK, STOCHD, ATR, CCI,
@@ -2096,38 +2131,72 @@ class DatabaseWorker(QObject):
                                             MAT20_MAT60_DIFF, MAT60_MAT120_DIFF, C_MAT5_DIFF, VWAP)
                                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                         (code, date, time, seq, *[val[i] for val in values]))
-                                inserted_count += 1
+                                
+                                # ✅ 신규 vs 업데이트 구분
+                                if i < last_tick_idx:
+                                    updated_count += 1
+                                else:
+                                    inserted_count += 1
 
-                        if inserted_count:
-                            latest_date = max(date for _, date, _ in new_data)
-                            latest_time = max(time for _, date, time in new_data if date == latest_date)
-                            self.last_saved_timestamp[code] = (latest_date, latest_time)
-                            logging.debug(f"{code}: {inserted_count}개 틱 데이터 저장 (장시작부터)")
+                        if inserted_count or updated_count:
+                            # ✅ 마지막 인덱스 업데이트 (가장 큰 인덱스 + 1)
+                            max_idx = max(i for i, _, _ in new_data)
+                            self.last_saved_indices[code]['tick'] = max_idx + 1
+                            
+                            mode = "증분" if incremental else "전체"
+                            logging.debug(
+                                f"{code}: 틱 데이터 저장 ({mode}) - "
+                                f"신규 {inserted_count}개, 업데이트 {updated_count}개{overlap_info}"
+                            )
 
+                # ===== 분봉 데이터 저장 (동일한 방식) =====
                 if min_data and min_data["T"]:
-                    c.execute("SELECT MAX(date), MAX(time) FROM min_data WHERE code = ?", (code,))
-                    result = c.fetchone()
-                    last_min_date, last_min_time = result if result[0] else ("00000000", "0000")
-
                     dates, times = min_data["D"], min_data["T"]
                     values = [min_data[key] for key in ["C", "V", "MAM5", "MAM10", "MAM20", "RSI", "RSI_SIGNAL",
                             "MACD", "MACD_SIGNAL", "OSC", "STOCHK", "STOCHD", "CCI",
                             "MAM5_MAM10_DIFF", "MAM10_MAM20_DIFF", "C_MAM5_DIFF", "C_ABOVE_MAM5", "VWAP"]]
                     
-                    new_indices = [
-                        (i, str(date), f"{int(time_val):04d}")
-                        for i, (date, time_val) in enumerate(zip(dates, times))
-                        if len(str(date)) == 8 and f"{int(time_val):04d}"[2:4].isdigit() and int(f"{int(time_val):04d}"[2:4]) % 3 == 0
-                        and str(date) == start_date and start_hhmm <= f"{int(time_val):04d}" <= end_hhmm
-                        and (str(date) > last_min_date or (str(date) == last_min_date and f"{int(time_val):04d}" >= last_min_time))
-                    ]
+                    # ✅ 증분 저장: 안전 마진 적용
+                    if incremental:
+                        # 마지막 N개 봉 뒤로 돌아가기
+                        start_idx = max(0, last_min_idx - self.overlap_count)
+                        
+                        new_indices = [
+                            (i, str(date), f"{int(time_val):04d}")
+                            for i, (date, time_val) in enumerate(zip(dates, times))
+                            if i >= start_idx  # ✅ 오버랩 적용
+                            and len(str(date)) == 8 
+                            and f"{int(time_val):04d}"[2:4].isdigit() 
+                            and int(f"{int(time_val):04d}"[2:4]) % 3 == 0
+                            and str(date) == start_date 
+                            and start_hhmm <= f"{int(time_val):04d}" <= "1515"
+                        ]
+                        
+                        overlap_info = f", 오버랩={self.overlap_count}" if start_idx < last_min_idx else ""
+                    else:
+                        # 전체 저장
+                        new_indices = [
+                            (i, str(date), f"{int(time_val):04d}")
+                            for i, (date, time_val) in enumerate(zip(dates, times))
+                            if len(str(date)) == 8 
+                            and f"{int(time_val):04d}"[2:4].isdigit() 
+                            and int(f"{int(time_val):04d}"[2:4]) % 3 == 0
+                            and str(date) == start_date 
+                            and start_hhmm <= f"{int(time_val):04d}" <= "1515"
+                        ]
+                        overlap_info = ""
 
                     if new_indices:
                         unique_date_times = set((date, time) for _, date, time in new_indices)
+                        
+                        # ✅ 기존 데이터 삭제 (재저장을 위해)
                         for date, time in unique_date_times:
-                            c.execute("DELETE FROM min_data WHERE code = ? AND date = ? AND time = ?", (code, date, time))
+                            c.execute("DELETE FROM min_data WHERE code = ? AND date = ? AND time = ?", 
+                                     (code, date, time))
                         
                         inserted_count = 0
+                        updated_count = 0
+                        
                         for i, date, time in new_indices:
                             c.execute("""INSERT INTO min_data
                                         (code, date, time, sequence, C, V, MAM5, MAM10, MAM20, RSI, RSI_SIGNAL,
@@ -2135,22 +2204,34 @@ class DatabaseWorker(QObject):
                                         MAM10_MAM20_DIFF, C_MAM5_DIFF, C_ABOVE_MAM5, VWAP)
                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                     (code, date, time, 0, *[val[i] for val in values]))
-                            inserted_count += 1
+                            
+                            # ✅ 신규 vs 업데이트 구분
+                            if i < last_min_idx:
+                                updated_count += 1
+                            else:
+                                inserted_count += 1
 
-                        if inserted_count:
-                            latest_date = max(date for _, date, _ in new_indices)
-                            latest_time = max(time for _, date, time in new_indices if date == latest_date)
-                            self.last_saved_timestamp[code] = (latest_date, latest_time)
-                            logging.debug(f"{code}: {inserted_count}개 분 데이터 저장 (장시작부터)")
+                        if inserted_count or updated_count:
+                            # ✅ 마지막 인덱스 업데이트
+                            max_idx = max(i for i, _, _ in new_indices)
+                            self.last_saved_indices[code]['min'] = max_idx + 1
+                            
+                            mode = "증분" if incremental else "전체"
+                            logging.debug(
+                                f"{code}: 분 데이터 저장 ({mode}) - "
+                                f"신규 {inserted_count}개, 업데이트 {updated_count}개{overlap_info}"
+                            )
 
                 conn.commit()
 
         except sqlite3.OperationalError as e:
             logging.error(f"{code}: DB 저장 오류 (OperationalError) - {e}")
-            conn.rollback()
+            if conn:
+                conn.rollback()
         except Exception as ex:
-            logging.error(f"{code}: VI 데이터 저장 오류 - {ex}")
-            conn.rollback()
+            logging.error(f"{code}: VI 데이터 저장 오류 - {ex}\n{traceback.format_exc()}")
+            if conn:
+                conn.rollback()
 
 # ==================== CTrader (계속) ====================
 class CTrader(QObject):
@@ -2200,18 +2281,37 @@ class CTrader(QObject):
         self.last_saved_timestamp = {}
         self.db_name = 'vi_stock_data.db'
 
+        # ✅ 설정 파일에서 저장 옵션 읽기
+        config = configparser.ConfigParser(interpolation=None)
+        if os.path.exists('settings.ini'):
+            config.read('settings.ini', encoding='utf-8')
+        
+        self.save_interval = config.getint('DATA_SAVING', 'interval_seconds', fallback=300)
+        self.force_save_on_close = config.getboolean('DATA_SAVING', 'force_save_on_close', fallback=True)
+        self.incremental_save = config.getboolean('DATA_SAVING', 'incremental_save', fallback=True)
+        overlap_count = config.getint('DATA_SAVING', 'overlap_count', fallback=2)
+        
+        logging.info(
+            f"데이터 저장 설정: 간격={self.save_interval}초, "
+            f"증분={self.incremental_save}, 오버랩={overlap_count}, "
+            f"장마감저장={self.force_save_on_close}"
+        )
+
+        # DatabaseWorker 초기화
         self.db_queue = queue.Queue()
         self.db_thread = QThread()
         self.db_worker = DatabaseWorker(self.db_name, self.db_queue, self.tickdata, self.mindata)
+        self.db_worker.overlap_count = overlap_count
         self.db_worker.moveToThread(self.db_thread)
         self.db_thread.started.connect(self.db_worker.run)
         self.db_worker.finished.connect(self.db_thread.quit)
         self.db_worker.error.connect(lambda msg: logging.error(msg))
         self.db_thread.start()
 
+        # ✅ 저장 타이머 (설정값 사용)
         self.save_data_timer = QTimer()
         self.save_data_timer.timeout.connect(self.periodic_save_vi_data)
-        self.save_data_timer.start(600000)
+        self.save_data_timer.start(self.save_interval * 1000)
 
     def init_database(self):
         """데이터베이스 초기화"""
@@ -2463,8 +2563,8 @@ class CTrader(QObject):
         except Exception as ex:
             logging.error(f"update_daily_summary -> {ex}\n{traceback.format_exc()}")
 
-
-    def save_vi_data(self, code):
+    def save_vi_data(self, code, force_full_save=False):
+        """VI 데이터 저장 (증분/전체 선택 가능)"""
         try:
             start_date, start_hhmm = None, None
             try:
@@ -2475,7 +2575,6 @@ class CTrader(QObject):
                     start_date = start_dt.strftime('%Y%m%d')
                     start_hhmm = start_dt.strftime('%H%M')
                 else:
-                    logging.warning(f"{code}: starting_time 없음, 기본값 0900 사용")
                     start_date = datetime.now().strftime('%Y%m%d')
                     start_hhmm = '0900'
             except ValueError as ve:
@@ -2488,18 +2587,48 @@ class CTrader(QObject):
             with self.mindata.stockdata_lock:
                 min_data_copy = copy.deepcopy(self.mindata.stockdata.get(code, {}))
 
-            self.db_queue.put((code, tick_data_copy, min_data_copy, start_date, start_hhmm))
+            # ✅ 증분 저장 여부 결정
+            incremental = self.incremental_save and not force_full_save
+            
+            self.db_queue.put((code, tick_data_copy, min_data_copy, start_date, start_hhmm, incremental))
+            
         except Exception as ex:
-            logging.error(f"save_vi_data -> {code}, {ex}")
+            logging.error(f"save_vi_data -> {code}, {ex}\n{traceback.format_exc()}")
 
     def periodic_save_vi_data(self):
+        """주기적 데이터 저장"""
         try:
             with self.tickdata.stockdata_lock:
                 codes = list(self.tickdata.stockdata.keys())
+            
             for code in codes:
-                self.save_vi_data(code)
+                self.save_vi_data(code, force_full_save=False)  # 증분 저장
+                
         except Exception as ex:
-            logging.error(f"periodic_save_vi_data -> {ex}")
+            logging.error(f"periodic_save_vi_data -> {ex}\n{traceback.format_exc()}")
+
+    def force_save_all_data(self):
+        """강제 전체 저장 (장마감 시)"""
+        try:
+            logging.info("=== 장마감 데이터 강제 저장 시작 ===")
+            
+            with self.tickdata.stockdata_lock:
+                codes = list(self.tickdata.stockdata.keys())
+            
+            for code in codes:
+                self.save_vi_data(code, force_full_save=True)  # 전체 저장
+            
+            # 큐가 비워질 때까지 대기 (최대 30초)
+            max_wait = 30
+            wait_time = 0
+            while not self.db_queue.empty() and wait_time < max_wait:
+                time.sleep(0.5)
+                wait_time += 0.5
+            
+            logging.info(f"=== 장마감 데이터 저장 완료 ({len(codes)}개 종목) ===")
+            
+        except Exception as ex:
+            logging.error(f"force_save_all_data -> {ex}\n{traceback.format_exc()}")
 
     def get_stock_balance(self, code, func):
         try:
@@ -3389,10 +3518,16 @@ class AutoTraderThread(QThread):
                 logging.error(f"{code} 거래 로직 오류: {ex}")
 
     def _handle_market_close(self):
-        """장 종료 처리"""
+        """장 종료 처리 (강제 저장 추가)"""
+        
         if self.trader.buyorder_set or self.trader.sellorder_set:
             return
         
+        # ✅ 장마감 강제 저장
+        if self.trader.force_save_on_close:
+            self.trader.force_save_all_data()
+        
+        # 보유 주식 전부 매도
         if self.trader.bought_set:
             logging.info("보유 주식 전부 매도")
             self.sell_all_signal.emit()
@@ -4163,6 +4298,7 @@ class MyWindow(QWidget):
         self.trader_thread.start()
 
     def start_timers(self):
+        """타이머 시작 (장마감 처리 개선)"""
         now = datetime.now()
         start_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
         end_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
@@ -4189,8 +4325,15 @@ class MyWindow(QWidget):
             QTimer.singleShot(int((end_time - now).total_seconds() * 1000) + 1000, self.start_timers)
             
         elif end_time <= now and not self.market_close_emitted:
+            # ✅ 타이머 정지 전에 먼저 데이터 저장
+            logging.info("=== 장 종료 처리 시작 ===")
+            
+            # 데이터 저장 타이머 정지
             if self.trader.save_data_timer is not None:
                 self.trader.save_data_timer.stop()
+                logging.info("데이터 저장 타이머 정지")
+            
+            # 차트 업데이트 타이머 정지
             if self.trader.tickdata is not None:
                 self.trader.tickdata.update_data_timer.stop()
             if self.trader.mindata is not None:
@@ -4199,11 +4342,16 @@ class MyWindow(QWidget):
                 self.trader.daydata.update_data_timer.stop()
             if self.update_chart_status_timer is not None:
                 self.update_chart_status_timer.stop()
-                
+            
+            # ✅ 장마감 강제 저장은 AutoTraderThread에서 처리
+            # (매도 주문 완료 후 실행되도록)
+            
+            # 미보유 종목 정리
             for code in list(self.trader.monistock_set):
                 if code not in self.trader.bought_set:
                     self.on_stock_removed(code)
                     self.trader.delete_list_db(code)
+            
             for code in list(self.trader.vistock_set):
                 if code not in self.trader.monistock_set and code not in self.trader.bought_set:
                     self.trader.delete_list_db(code)

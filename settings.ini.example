@@ -18,6 +18,29 @@ stg_3 = 전일상한가
 stg_4 = 급등주
 stg_integrated = 통합 전략
 
+# ===== 매매 평가 설정 =====
+[TRADING]
+# 매매 판단 주기 (초 단위, 기본값: 5초)
+evaluation_interval = 5
+# 이벤트 기반 평가 활성화 (틱 체결 시 즉시 평가)
+event_based_evaluation = True
+# 최소 평가 간격 (초, 과도한 평가 방지)
+min_evaluation_gap = 3
+
+# ===== 데이터 저장 설정 =====
+[DATA_SAVING]
+# 저장 간격 (초 단위, 기본값: 300초 = 5분)
+interval_seconds = 300
+# 장마감 시 강제 저장 여부
+force_save_on_close = True
+# 증분 저장 활성화 (True: 새 데이터만, False: 전체)
+incremental_save = True
+# 오버랩 개수 (마지막 N개 봉 재저장, 안전 마진)
+overlap_count = 2
+
+[BUYCOUNT]
+target_buy_count = 3
+
 [VI 발동]
 buy_stg_1 = {"name": "골든크로스", "content": "(MAT5[-1] > MAT20[-1] > MAT60[-1]) and (min_close_price[-1] > MAM5[-1] > MAM10[-1]) and (OSCT[-1] > 0) and RSIT[-1] > 60 and (OSC[-1] > 0) and RSI[-1] > 60 and (tick_close_price[-1] > bb_upper[-1] * 1.02) and positive_candle and (min_close_price[-1] > VWAP[-1])"}
 sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip(tick_high_price[-3:], tick_low_price[-3:])) and (tick_high_price[-1] == tick_high_price[-2] == tick_high_price[-3])"}
@@ -52,7 +75,3 @@ sell_stg_4 = {"name": "분할 익절", "content": "current_profit_pct >= 1.5 and
 sell_stg_5 = {"name": "추적 손절", "content": "(code in self.trader.sell_half_set and from_peak_pct < -0.5) or (current_profit_pct > 0.5 and from_peak_pct < -1.0)"}
 sell_stg_6 = {"name": "데드크로스", "content": "min_close < MAM5 or MAM5 < MAM10"}
 sell_stg_7 = {"name": "OSCT 음전환", "content": "osct_negative"}
-
-[BUYCOUNT]
-target_buy_count = 3
-
