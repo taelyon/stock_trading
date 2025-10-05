@@ -1298,19 +1298,23 @@ class CpIndicators:
                 result['BB_LOWER'] = self._fill_nan(lower)
                 
                 bandwidth = upper - lower
-                bb_position = np.where(
-                    bandwidth > 1e-6,
-                    (closes - middle) / bandwidth,
-                    0.5
-                )
+                # ✅ 경고 억제하여 안전하게 나누기
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    bb_position = np.where(
+                        bandwidth > 1e-6,
+                        (closes - middle) / bandwidth,
+                        0.5
+                    )
                 bb_position = np.clip(bb_position, -2, 2)
                 result['BB_POSITION'] = bb_position.tolist()
                 
-                bb_bandwidth = np.where(
-                    middle > 1e-6,
-                    bandwidth / middle,
-                    0
-                )
+                # ✅ 경고 억제하여 안전하게 나누기
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    bb_bandwidth = np.where(
+                        middle > 1e-6,
+                        bandwidth / middle,
+                        0
+                    )
                 result['BB_BANDWIDTH'] = bb_bandwidth.tolist()
 
             elif indicator_type == 'VWAP':
@@ -3148,8 +3152,29 @@ class AutoTraderThread(QThread):
         
         self.sell_all_emitted = True
 
+    # ===== 헬퍼 함수들 =====
+    
+    def get_threshold_by_hour(self):
+        """시간대별 임계값 반환"""
+        now = datetime.now()
+        hour = now.hour
+        
+        if hour == 9:
+            return 65
+        elif hour >= 14:
+            return 85
+        else:
+            return 75
+    
+    def is_after_time(self, hour, minute):
+        """특정 시각 이후인지 확인"""
+        now = datetime.now()
+        return now >= now.replace(hour=hour, minute=minute, second=0)
+
+    # ===== 매수 조건 평가 =====
+
     def _evaluate_buy_condition(self, code, t_now, strategy, buy_strategies):
-        """매수 조건 평가 - 통합 전략"""
+        """매수 조건 평가"""
         tick_latest = self.trader.tickdata.get_latest_data(code)
         min_latest = self.trader.mindata.get_latest_data(code)
         
@@ -3163,37 +3188,70 @@ class AutoTraderThread(QThread):
         if self._should_remove_from_monitor(code, tick_latest, min_latest, t_now):
             return
         
-        # ===== 통합 전략: 여러 조건 체크 =====
-        buy_signal = False
-        buy_reason = ""
+        # ===== 통합 전략: 텍스트 기반 평가 =====
+        if strategy == "통합 전략" and buy_strategies:
+            if self._evaluate_integrated_buy(code, buy_strategies, tick_latest, min_latest):
+                return  # 매수 신호 발생
         
-        # 1. 급등주 모멘텀 조건
-        if self._check_momentum_buy(code, tick_latest, min_latest):
-            buy_signal = True
-            buy_reason = "급등 모멘텀"
-        
-        # 2. 변동성 돌파 조건
-        elif self.volatility_strategy and self.volatility_strategy.check_breakout(code):
-            buy_signal = True
-            buy_reason = "변동성 돌파"
-        
-        # 3. 갭 상승 조건 (갭 스캐너에서 추가된 종목)
-        elif hasattr(self.window, 'gap_scanner') and code in [s['code'] for s in self.window.gap_scanner.gap_stocks]:
-            if self.window.gap_scanner.check_gap_hold(code):
-                if self._check_momentum_buy(code, tick_latest, min_latest):
-                    buy_signal = True
-                    buy_reason = "갭 상승 유지"
-        
-        # 4. 사용자 정의 전략
+        # ===== 기타 전략 =====
         elif self._evaluate_strategy_conditions(code, buy_strategies, tick_latest, min_latest):
-            buy_signal = True
-            buy_reason = "사용자 전략"
+            self.buy_signal.emit(code, "사용자 전략", "0", "03")
+
+    def _evaluate_integrated_buy(self, code, buy_strategies, tick_latest, min_latest):
+        """통합 전략 매수 평가 (텍스트 기반)"""
         
-        if buy_signal:
-            self.buy_signal.emit(code, buy_reason, "0", "03")
+        # ===== 기본 변수들 =====
+        MAT5 = tick_latest.get('MAT5', 0)
+        MAT20 = tick_latest.get('MAT20', 0)
+        MAT60 = tick_latest.get('MAT60', 0)
+        MAT120 = tick_latest.get('MAT120', 0)
+        C = tick_latest.get('C', 0)
+        VWAP = tick_latest.get('VWAP', 0)
+        RSIT = tick_latest.get('RSIT', 50)
+        
+        MAM5 = min_latest.get('MAM5', 0)
+        MAM10 = min_latest.get('MAM10', 0)
+        MAM20 = min_latest.get('MAM20', 0)
+        
+        # ===== 계산된 값들 (기존 클래스 재사용) =====
+        strength = self.trader.tickdata.get_strength(code)
+        
+        momentum_score = 0
+        if self.window.momentum_scanner:
+            momentum_score = self.window.momentum_scanner._calculate_momentum_score(code)
+        
+        threshold = self.get_threshold_by_hour()
+        
+        volatility_breakout = False
+        if self.volatility_strategy:
+            volatility_breakout = self.volatility_strategy.check_breakout(code)
+        
+        gap_hold = False
+        if hasattr(self.window, 'gap_scanner'):
+            gap_hold = self.window.gap_scanner.check_gap_hold(code)
+        
+        # ===== 전략 평가 =====
+        for strategy in buy_strategies:
+            try:
+                condition = strategy.get('content', '')
+                
+                # eval()로 조건 평가
+                if eval(condition):
+                    buy_reason = strategy.get('name', '통합 전략')
+                    logging.info(
+                        f"{cpCodeMgr.CodeToName(code)}({code}): {buy_reason} 매수 "
+                        f"(체결강도: {strength:.0f}, 점수: {momentum_score})"
+                    )
+                    self.buy_signal.emit(code, buy_reason, "0", "03")
+                    return True
+                    
+            except Exception as ex:
+                logging.error(f"{code} 통합 전략 매수 평가 오류: {ex}\n{traceback.format_exc()}")
+        
+        return False
 
     def _check_momentum_buy(self, code, tick_latest, min_latest):
-        """급등주 모멘텀 매수 조건"""
+        """급등주 모멘텀 매수 조건 (기존 전략용)"""
         
         if len(self.trader.bought_set) >= self.trader.target_buy_count:
             return False
@@ -3262,11 +3320,11 @@ class AutoTraderThread(QThread):
         hour = now.hour
         
         if hour == 9:
-            threshold = 65  # 장 초반: 낮춤
+            threshold = 65
         elif hour >= 14:
-            threshold = 85  # 장 후반: 높임
+            threshold = 85
         else:
-            threshold = 75  # 평상시
+            threshold = 75
         
         logging.debug(
             f"{code}: 매수점수 {score}/{threshold} "
@@ -3312,7 +3370,7 @@ class AutoTraderThread(QThread):
         return False
 
     def _evaluate_strategy_conditions(self, code, strategies, tick_latest, min_latest):
-        """전략별 조건 평가"""
+        """전략별 조건 평가 (기존 전략용)"""
         if not strategies:
             return False
         
@@ -3352,8 +3410,10 @@ class AutoTraderThread(QThread):
         
         return False
 
+    # ===== 매도 조건 평가 =====
+
     def _evaluate_sell_condition(self, code, t_now, strategy, sell_strategies):
-        """매도 조건 평가 - 개선된 버전"""
+        """매도 조건 평가"""
         tick_latest = self.trader.tickdata.get_latest_data(code)
         min_latest = self.trader.mindata.get_latest_data(code)
         
@@ -3387,73 +3447,56 @@ class AutoTraderThread(QThread):
         else:
             hold_minutes = 0
         
-        # ===== 매도 결정 트리 =====
-        
-        # 1️⃣ 손절매 (-0.7% 고정)
-        if current_profit_pct < -0.7:
-            logging.info(f"{cpCodeMgr.CodeToName(code)}: 손절매 ({current_profit_pct:.2f}%)")
-            self.sell_signal.emit(code, f"손절매 ({current_profit_pct:.2f}%)")
-            return
-        
-        # 2️⃣ 시간 기반 손절 (60분 이상 보유 + 손실)
-        if hold_minutes > 60 and current_profit_pct < 0:
-            logging.info(f"{cpCodeMgr.CodeToName(code)}: 시간 손절 ({hold_minutes:.0f}분)")
-            self.sell_signal.emit(code, "시간 손절")
-            return
-        
-        # 3️⃣ 장 마감 30분 전 (14:45 이후)
-        if t_now >= t_now.replace(hour=14, minute=45, second=0):
-            if current_profit_pct > 0:
-                logging.info(f"{cpCodeMgr.CodeToName(code)}: 장마감 익절 ({current_profit_pct:.2f}%)")
-                self.sell_signal.emit(code, "장마감 익절")
-            else:
-                logging.info(f"{cpCodeMgr.CodeToName(code)}: 장마감 손절 ({current_profit_pct:.2f}%)")
-                self.sell_signal.emit(code, "장마감 손절")
-            return
-        
-        # 4️⃣ 분할 매도 (+1.5% 이상)
-        if current_profit_pct >= 1.5 and code not in self.trader.sell_half_set:
-            logging.info(f"{cpCodeMgr.CodeToName(code)}: 분할 매도 ({current_profit_pct:.2f}%)")
-            self.sell_half_signal.emit(code, f"1.5% 익절")
-            return
-        
-        # 5️⃣ 분할 매도 후 trailing stop (-0.5% 하락)
-        if code in self.trader.sell_half_set:
-            if from_peak_pct < -0.5:
-                logging.info(f"{cpCodeMgr.CodeToName(code)}: 추적 손절 (고점 대비 {from_peak_pct:.2f}%)")
-                self.sell_signal.emit(code, "추적 손절")
+        # ===== 통합 전략: 텍스트 기반 평가 =====
+        if strategy == "통합 전략" and sell_strategies:
+            if self._evaluate_integrated_sell(code, sell_strategies, tick_latest, min_latest,
+                                             current_profit_pct, from_peak_pct, hold_minutes):
                 return
         
-        # 6️⃣ 고점 대비 trailing stop (-1.0% 하락)
-        if current_profit_pct > 0.5 and from_peak_pct < -1.0:
-            logging.info(f"{cpCodeMgr.CodeToName(code)}: 추적 손절 ({from_peak_pct:.2f}%)")
-            self.sell_signal.emit(code, "추적 손절")
-            return
+        # ===== 기타 전략 =====
+        elif self._evaluate_strategy_conditions(code, sell_strategies, tick_latest, min_latest):
+            self.sell_signal.emit(code, "전략 매도")
+
+    def _evaluate_integrated_sell(self, code, sell_strategies, tick_latest, min_latest,
+                                  current_profit_pct, from_peak_pct, hold_minutes):
+        """통합 전략 매도 평가 (텍스트 기반)"""
         
-        # 7️⃣ 기술적 지표 매도 신호
+        # ===== 기본 변수들 =====
+        min_close = min_latest.get('C', 0)
         MAM5 = min_latest.get('MAM5', 0)
         MAM10 = min_latest.get('MAM10', 0)
-        min_close = min_latest.get('C', 0)
         
-        # 데드크로스
-        if min_close < MAM5 or MAM5 < MAM10:
-            logging.info(f"{cpCodeMgr.CodeToName(code)}: 데드크로스")
-            self.sell_signal.emit(code, "데드크로스")
-            return
-        
-        # OSCT 음전환 (2틱 연속)
+        # ===== 계산된 값들 =====
+        osct_negative = False
         tick_recent = self.trader.tickdata.get_recent_data(code, 3)
         OSCT_recent = tick_recent.get('OSCT', [0, 0, 0])
         if len(OSCT_recent) >= 2:
-            if OSCT_recent[-2] < 0 and OSCT_recent[-1] < 0:
-                logging.info(f"{cpCodeMgr.CodeToName(code)}: OSCT 음전환")
-                self.sell_signal.emit(code, "OSCT 음전환")
-                return
+            osct_negative = OSCT_recent[-2] < 0 and OSCT_recent[-1] < 0
         
-        # 8️⃣ 전략별 매도 조건
-        if self._evaluate_strategy_conditions(code, sell_strategies, tick_latest, min_latest):
-            self.sell_signal.emit(code, "전략 매도")
-
+        after_market_close = self.is_after_time(14, 45)
+        
+        # ===== 전략 평가 =====
+        for strategy in sell_strategies:
+            try:
+                condition = strategy.get('content', '')
+                
+                # eval()로 조건 평가
+                if eval(condition):
+                    sell_reason = strategy.get('name', '통합 전략')
+                    logging.info(f"{cpCodeMgr.CodeToName(code)}({code}): {sell_reason} ({current_profit_pct:.2f}%)")
+                    
+                    # 분할 매도 vs 전량 매도
+                    if '분할' in sell_reason:
+                        self.sell_half_signal.emit(code, sell_reason)
+                    else:
+                        self.sell_signal.emit(code, sell_reason)
+                    return True
+                    
+            except Exception as ex:
+                logging.error(f"{code} 통합 전략 매도 평가 오류: {ex}\n{traceback.format_exc()}")
+        
+        return False
+    
 # ==================== ChartDrawer 관련 클래스 (유지) ====================
 class ChartDrawerThread(QThread):
     data_ready = pyqtSignal(dict)
@@ -4346,6 +4389,8 @@ class MyWindow(QWidget):
                 selected_strategy = next((stg for stg in self.strategies[investment_strategy] if stg['name'] == buy_strategy), None)
                 if selected_strategy:
                     strategy_content = selected_strategy.get('content', '')
+                    # ✅ 이스케이프된 \n을 실제 줄바꿈으로 변환
+                    strategy_content = strategy_content.replace('\\n', '\n')
                     self.buystgInputWidget.setPlainText(strategy_content)
                 else:
                     self.buystgInputWidget.clear()
@@ -4367,6 +4412,8 @@ class MyWindow(QWidget):
                 selected_strategy = next((stg for stg in self.strategies[investment_strategy] if stg['name'] == sell_strategy), None)
                 if selected_strategy:
                     strategy_content = selected_strategy.get('content', '')
+                    # ✅ 이스케이프된 \n을 실제 줄바꿈으로 변환
+                    strategy_content = strategy_content.replace('\\n', '\n')
                     self.sellstgInputWidget.setPlainText(strategy_content)
                 else:
                     self.sellstgInputWidget.clear()

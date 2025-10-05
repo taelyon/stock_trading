@@ -42,12 +42,16 @@ sell_stg_3 = {"name": "OSCT 음수 전환", "content": "(OSCT[-2] < OSCT[-1] < 0
 sell_stg_4 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.993 and self.stock_rate > 0.3"}
 
 [통합 전략]
-buy_stg_1 = {"name": "급등주 모멘텀", "content": "# 급등주 모멘텀 매수 조건\\n# 체결강도 120 이상\\n# 가격 모멘텀 양수\\n# MAT5 > MAT20\\n# RSI 50~70\\n# 자동으로 점수 계산하여 임계값 이상시 매수"}
-buy_stg_2 = {"name": "변동성 돌파", "content": "# 변동성 돌파 매수 조건\\n# 목표가 = 시가 + (전일 고가-저가) * 0.5\\n# 현재가 >= 목표가\\n# 거래량 >= 전일 대비 1.5배\\n# 자동으로 감지하여 매수"}
-buy_stg_3 = {"name": "갭 상승", "content": "# 갭 상승 매수 조건\\n# 갭 상승률 1.5% ~ 4%\\n# 시가 대비 -0.3% 이내 유지\\n# 급등주 모멘텀 조건 만족\\n# 자동으로 09:00 스캔하여 매수"}
-sell_stg_1 = {"name": "손익 기반 매도", "content": "# 손익 기반 매도 조건\\n# 손절: -0.7%\\n# 분할 익절: +1.5% (절반 매도)\\n# 추적 손절: 고점 대비 -1.0% (수익 0.5% 이상시)\\n# 분할 후 추적: 고점 대비 -0.5%"}
-sell_stg_2 = {"name": "시간 기반 매도", "content": "# 시간 기반 매도 조건\\n# 60분 이상 보유 + 손실 상태: 매도\\n# 14:45 이후: 무조건 청산\\n# 장마감 대비 안전 청산"}
-sell_stg_3 = {"name": "기술적 지표 매도", "content": "# 기술적 지표 매도 조건\\n# 데드크로스: 현재가 < MAM5 또는 MAM5 < MAM10\\n# OSCT 음전환: 2틱 연속 음수\\n# 모멘텀 소진시 매도"}
+buy_stg_1 = {"name": "급등주 모멘텀", "content": "strength >= 120 and momentum_score >= threshold and MAT5 > MAT20 and C > VWAP"}
+buy_stg_2 = {"name": "변동성 돌파", "content": "volatility_breakout"}
+buy_stg_3 = {"name": "갭 상승", "content": "gap_hold and strength >= 120 and MAT5 > MAT20"}
+sell_stg_1 = {"name": "손절매", "content": "current_profit_pct < -0.7"}
+sell_stg_2 = {"name": "시간 손절", "content": "hold_minutes > 60 and current_profit_pct < 0"}
+sell_stg_3 = {"name": "장마감 청산", "content": "after_market_close"}
+sell_stg_4 = {"name": "분할 익절", "content": "current_profit_pct >= 1.5 and code not in self.trader.sell_half_set"}
+sell_stg_5 = {"name": "추적 손절", "content": "(code in self.trader.sell_half_set and from_peak_pct < -0.5) or (current_profit_pct > 0.5 and from_peak_pct < -1.0)"}
+sell_stg_6 = {"name": "데드크로스", "content": "min_close < MAM5 or MAM5 < MAM10"}
+sell_stg_7 = {"name": "OSCT 음전환", "content": "osct_negative"}
 
 [BUYCOUNT]
 target_buy_count = 3
