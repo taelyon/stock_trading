@@ -9,8 +9,10 @@ stock_trader_deepseek.spec
 test.py
 venv64/
 log
-
-xgboost_model.pkl
+__pycache__/
+*.pyc
+.venv/
+gboost_model.pkl
 scaler.pkl
 vi_stock_data.db
 mylist.db

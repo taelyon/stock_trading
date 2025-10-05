@@ -57,13 +57,44 @@ sell_stg_3 = {"name": "OSCT 음수 전환", "content": "(OSCT[-2] < OSCT[-1] < 0
 sell_stg_4 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.993 and self.stock_rate > 0.3"}
 
 [통합 전략]
-buy_stg_1 = {"name": "급등주 모멘텀", "content": "strength >= 120 and momentum_score >= threshold and MAT5 > MAT20 and C > VWAP"}
-buy_stg_2 = {"name": "변동성 돌파", "content": "volatility_breakout"}
-buy_stg_3 = {"name": "갭 상승", "content": "gap_hold and strength >= 120 and MAT5 > MAT20"}
-sell_stg_1 = {"name": "손절매", "content": "current_profit_pct < -0.7"}
-sell_stg_2 = {"name": "시간 손절", "content": "hold_minutes > 60 and current_profit_pct < 0"}
-sell_stg_3 = {"name": "장마감 청산", "content": "after_market_close"}
-sell_stg_4 = {"name": "분할 익절", "content": "current_profit_pct >= 1.5 and code not in self.trader.sell_half_set"}
-sell_stg_5 = {"name": "추적 손절", "content": "(code in self.trader.sell_half_set and from_peak_pct < -0.5) or (current_profit_pct > 0.5 and from_peak_pct < -1.0)"}
-sell_stg_6 = {"name": "데드크로스", "content": "min_close < MAM5 or MAM5 < MAM10"}
-sell_stg_7 = {"name": "OSCT 음전환", "content": "osct_negative"}
+buy_stg_1 = {"name": "1단계: 급등주 + 이평 정배열", "content": "strength >= 130 and MAT5 > MAT20 > MAT60 and C > MAT5 and MAM5 > MAM10 > MAM20 and min_close > MAM5"}
+buy_stg_2 = {"name": "2단계: RSI 건전성 체크", "content": "40 < RSIT < 75 and 35 < min_RSI < 70 and RSIT > RSIT_SIGNAL"}
+buy_stg_3 = {"name": "3단계: Stochastic 골든존", "content": "20 < STOCHK < 80 and STOCHK > STOCHD and min_STOCHK > min_STOCHD"}
+buy_stg_4 = {"name": "4단계: MACD 상승 추세", "content": "OSCT > 0 and MACDT > MACDT_SIGNAL and min_OSC > 0"}
+buy_stg_5 = {"name": "5단계: 볼린저 돌파 초기", "content": "C > BB_MIDDLE and BB_POSITION > 0.3 and BB_POSITION < 1.2 and BB_BANDWIDTH > 0.02"}
+buy_stg_6 = {"name": "6단계: ATR 변동성 체크", "content": "ATR > C * 0.01 and ATR < C * 0.05"}
+buy_stg_7 = {"name": "7단계: 체결강도 + VWAP", "content": "strength >= 140 and C > tick_VWAP and min_close > min_VWAP"}
+buy_stg_8 = {"name": "8단계: 상승 모멘텀 확인", "content": "len(tick_C_recent) >= 3 and tick_C_recent[-1] > tick_C_recent[-2] > tick_C_recent[-3]"}
+buy_stg_9 = {"name": "변동성 돌파 전략", "content": "volatility_breakout and strength >= 150 and MAT5 > MAT20"}
+buy_stg_10 = {"name": "갭 상승 전략", "content": "gap_hold and strength >= 150 and MAT5 > MAT20 > MAT60 and RSIT < 70"}
+buy_stg_11 = {"name": "Williams %R 반등 + 강세", "content": "WILLIAMS_R > -80 and WILLIAMS_R < -40 and min_WILLIAMS_R > -70 and MAT5 > MAT20 and strength >= 130"}
+buy_stg_12 = {"name": "ROC 가속 + OBV 상승", "content": "ROC > 1.5 and len(ROC_recent) >= 3 and ROC_recent[-1] > ROC_recent[-2] and OBV > OBV_MA20"}
+buy_stg_13 = {"name": "Volume Profile 돌파", "content": "volume_profile_breakout and VP_POSITION > 0.02 and strength >= 140 and MAT5 > MAT20"}
+buy_stg_14 = {"name": "복합 모멘텀 (Williams + ROC + OBV)", "content": "WILLIAMS_R > -70 and ROC > 1.0 and OBV > OBV_MA20 and MAT5 > MAT20 > MAT60 and RSIT > 50"}
+buy_stg_15 = {"name": "과매도 반등 (Williams + Stochastic)", "content": "WILLIAMS_R < -70 and min_WILLIAMS_R < -70 and STOCHK < 30 and STOCHK > STOCHD and strength >= 140"}
+sell_stg_1 = {"name": "긴급 손절 (-0.5%)", "content": "current_profit_pct < -0.5 and (STOCHK < 20 or min_STOCHK < 20)"}
+sell_stg_2 = {"name": "일반 손절 (-0.7%)", "content": "current_profit_pct < -0.7"}
+sell_stg_3 = {"name": "ATR 기반 손절", "content": "tick_close < buy_price - ATR * 2"}
+sell_stg_4 = {"name": "시간 손절", "content": "hold_minutes > 90 and current_profit_pct < 0"}
+sell_stg_5 = {"name": "1차 익절 (+2.0%)", "content": "current_profit_pct >= 2.0 and code not in self.trader.sell_half_set"}
+sell_stg_6 = {"name": "2차 익절 (+3.5%)", "content": "current_profit_pct >= 3.5"}
+sell_stg_7 = {"name": "추적 손절 1단계", "content": "current_profit_pct > 1.0 and from_peak_pct < -0.7"}
+sell_stg_8 = {"name": "추적 손절 2단계 (분할 익절 후)", "content": "code in self.trader.sell_half_set and from_peak_pct < -0.5"}
+sell_stg_9 = {"name": "ATR 기반 추적 손절", "content": "current_profit_pct > 1.5 and tick_close < highest_price - ATR * 1.5"}
+sell_stg_10 = {"name": "Stochastic 과매수 탈출", "content": "STOCHK > 80 and STOCHK < STOCHD and current_profit_pct > 1.0"}
+sell_stg_11 = {"name": "RSI 과매수 + MACD 음전환", "content": "RSIT > 70 and osct_negative and current_profit_pct > 0.5"}
+sell_stg_12 = {"name": "볼린저 상단 이탈", "content": "BB_POSITION > 1.5 and current_profit_pct > 1.5"}
+sell_stg_13 = {"name": "CCI 과매수 반전", "content": "CCI > 150 and from_peak_pct < -0.5"}
+sell_stg_14 = {"name": "이평선 데드크로스", "content": "MAT5 < MAT20 and MAM5 < MAM10 and current_profit_pct > 0"}
+sell_stg_15 = {"name": "MACD 이중 음전환", "content": "osct_negative and min_osc_negative"}
+sell_stg_16 = {"name": "VWAP 이탈", "content": "tick_close < tick_VWAP and min_close < min_VWAP and current_profit_pct > 0.5"}
+sell_stg_17 = {"name": "장마감 청산", "content": "after_market_close"}
+sell_stg_18 = {"name": "급락 감지", "content": "(STOCHK < 20 and min_STOCHK < 20) or (CCI < -150 and min_CCI < -150)"}
+sell_stg_19 = {"name": "목표 달성 (+5.0%)", "content": "current_profit_pct >= 5.0"}
+sell_stg_20 = {"name": "안전 익절 (+4.0% + 기술적)", "content": "current_profit_pct >= 4.0 and (STOCHK > 75 or BB_POSITION > 1.3)"}
+sell_stg_21 = {"name": "Williams %R 과매수", "content": "williams_overbought and current_profit_pct > 1.0"}
+sell_stg_22 = {"name": "ROC 급락 감지", "content": "ROC < -1.5 and min_ROC < -1.0 and current_profit_pct > 0"}
+sell_stg_23 = {"name": "OBV 다이버전스", "content": "obv_divergence and current_profit_pct > 0.7"}
+sell_stg_24 = {"name": "복합 과매수 (Williams + Stochastic + RSI)", "content": "williams_overbought and STOCHK > 75 and RSIT > 70 and current_profit_pct > 1.2"}
+sell_stg_25 = {"name": "복합 다이버전스 (OBV + ROC)", "content": "(obv_divergence or min_obv_divergence) and ROC < 0 and current_profit_pct > 0.5"}
+sell_stg_26 = {"name": "이중 과매도 긴급 청산", "content": "WILLIAMS_R < -85 and min_WILLIAMS_R < -85 and current_profit_pct < 0"}

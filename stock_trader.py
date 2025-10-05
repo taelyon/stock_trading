@@ -1042,7 +1042,9 @@ class CpIndicators:
                 'ATR_PERIOD': 10,
                 'CCI_PERIOD': 12,
                 'BB_PERIOD': 20,
-                'BB_STD': 2
+                'BB_STD': 2,
+                'WILLIAMS_R_PERIOD': 14,  # 추가
+                'ROC_PERIOD': 10,
             }
         elif self.chart_type == 'm':
             return {
@@ -1054,7 +1056,9 @@ class CpIndicators:
                 'ATR_PERIOD': 10,
                 'CCI_PERIOD': 12,
                 'BB_PERIOD': 20,
-                'BB_STD': 2
+                'BB_STD': 2,
+                'WILLIAMS_R_PERIOD': 14,  # 추가
+                'ROC_PERIOD': 10,
             }
         elif self.chart_type == 'D':
             return {
@@ -1079,8 +1083,170 @@ class CpIndicators:
             return filled.tolist()
         else:
             return np.nan_to_num(data, nan=0.0).tolist()
+
+    def calculate_williams_r(self, highs, lows, closes, period=14):
+        """Williams %R 계산
+        
+        과매수/과매도 지표
+        -20 이상: 과매수 (매도 신호)
+        -80 이하: 과매도 (매수 신호)
+        
+        Args:
+            highs: 고가 리스트
+            lows: 저가 리스트
+            closes: 종가 리스트
+            period: 계산 기간 (기본 14)
+        
+        Returns:
+            Williams %R 리스트 (-100 ~ 0)
+        """
+        williams_r = []
+        
+        for i in range(len(closes)):
+            if i < period - 1:
+                williams_r.append(-50)  # 기본값
+                continue
+            
+            # 최근 N일의 최고가/최저가
+            high_max = max(highs[i-period+1:i+1])
+            low_min = min(lows[i-period+1:i+1])
+            
+            if high_max - low_min == 0:
+                williams_r.append(-50)
+            else:
+                # Williams %R = (최고가 - 현재가) / (최고가 - 최저가) * -100
+                wr = ((high_max - closes[i]) / (high_max - low_min)) * -100
+                williams_r.append(wr)
+        
+        return williams_r
+    
+    def calculate_roc(self, closes, period=10):
+        """Price Rate of Change (ROC) 계산
+        
+        가격 변화율 - 모멘텀 지표
+        양수: 상승 추세
+        음수: 하락 추세
+        
+        Args:
+            closes: 종가 리스트
+            period: 계산 기간 (기본 10)
+        
+        Returns:
+            ROC 리스트 (%)
+        """
+        roc = []
+        
+        for i in range(len(closes)):
+            if i < period:
+                roc.append(0)
+            else:
+                if closes[i-period] != 0:
+                    # ROC = (현재가 - N일전 가격) / N일전 가격 * 100
+                    roc_value = ((closes[i] - closes[i-period]) / closes[i-period]) * 100
+                    roc.append(roc_value)
+                else:
+                    roc.append(0)
+        
+        return roc
+    
+    def calculate_obv(self, closes, volumes):
+        """On-Balance Volume (OBV) 계산
+        
+        거래량 기반 추세 확인
+        OBV 상승 + 가격 상승: 강한 상승 추세
+        OBV 하락 + 가격 상승: 약한 상승 추세 (다이버전스)
+        
+        Args:
+            closes: 종가 리스트
+            volumes: 거래량 리스트
+        
+        Returns:
+            OBV 리스트
+        """
+        obv = [0]
+        
+        for i in range(1, len(closes)):
+            if closes[i] > closes[i-1]:
+                # 상승 시 거래량 더함
+                obv.append(obv[-1] + volumes[i])
+            elif closes[i] < closes[i-1]:
+                # 하락 시 거래량 뺌
+                obv.append(obv[-1] - volumes[i])
+            else:
+                # 보합 시 유지
+                obv.append(obv[-1])
+        
+        return obv
+    
+    def calculate_obv_ma(self, obv, period=20):
+        """OBV 이동평균 계산
+        
+        Args:
+            obv: OBV 리스트
+            period: 계산 기간 (기본 20)
+        
+        Returns:
+            OBV MA 리스트
+        """
+        obv_ma = []
+        
+        for i in range(len(obv)):
+            if i < period - 1:
+                obv_ma.append(obv[i])
+            else:
+                ma = sum(obv[i-period+1:i+1]) / period
+                obv_ma.append(ma)
+        
+        return obv_ma
+    
+    def calculate_volume_profile(self, closes, volumes, bins=20):
+        """Volume Profile 계산
+        
+        가격대별 거래량 분포 분석
+        
+        Args:
+            closes: 종가 리스트
+            volumes: 거래량 리스트
+            bins: 가격대 구간 수
+        
+        Returns:
+            (max_volume_price, current_vs_poc): 최대 거래량 가격, 현재가 위치
+        """
+        if len(closes) == 0 or len(volumes) == 0:
+            return 0, 0
+        
+        # 가격 범위
+        price_min = min(closes)
+        price_max = max(closes)
+        
+        if price_max == price_min:
+            return closes[-1], 0
+        
+        # 가격대별 거래량 집계
+        bin_size = (price_max - price_min) / bins
+        volume_profile = {}
+        
+        for price, volume in zip(closes, volumes):
+            bin_index = int((price - price_min) / bin_size) if bin_size > 0 else 0
+            bin_index = min(bin_index, bins - 1)  # 상한선
+            
+            volume_profile[bin_index] = volume_profile.get(bin_index, 0) + volume
+        
+        # 최대 거래량 가격대 (POC: Point of Control)
+        if volume_profile:
+            max_volume_bin = max(volume_profile, key=volume_profile.get)
+            max_volume_price = price_min + (max_volume_bin + 0.5) * bin_size
+        else:
+            max_volume_price = closes[-1]
+        
+        # 현재가 vs POC
+        current_price = closes[-1]
+        current_vs_poc = (current_price - max_volume_price) / max_volume_price if max_volume_price > 0 else 0
+        
+        return max_volume_price, current_vs_poc
     
     def _get_default_result(self, indicator_type, length):
+        """기본 결과값 반환 (데이터 부족 시)"""
         default_value = [0] * length
         
         if indicator_type == 'MA':
@@ -1139,6 +1305,19 @@ class CpIndicators:
         elif indicator_type == 'VWAP':
             return {'VWAP': default_value}
         
+        # === 새로운 지표들 ===
+        elif indicator_type == 'WILLIAMS_R':
+            return {'WILLIAMS_R': default_value}
+        
+        elif indicator_type == 'ROC':
+            return {'ROC': default_value}
+        
+        elif indicator_type == 'OBV':
+            return {'OBV': default_value, 'OBV_MA20': default_value}
+        
+        elif indicator_type == 'VOLUME_PROFILE':
+            return {'VP_POC': 0, 'VP_POSITION': 0}
+        
         return {}
 
     def make_indicator(self, indicator_type, code, chart_data):
@@ -1160,7 +1339,11 @@ class CpIndicators:
                 'ATR': self.params.get('ATR_PERIOD', 14),
                 'CCI': self.params.get('CCI_PERIOD', 14),
                 'BBANDS': self.params.get('BB_PERIOD', 20),
-                'VWAP': 1
+                'VWAP': 1,
+                'WILLIAMS_R': self.params.get('WILLIAMS_R_PERIOD', 14),
+                'ROC': self.params.get('ROC_PERIOD', 10),
+                'OBV': 2,
+                'VOLUME_PROFILE': 20
             }
             
             min_required = min_lengths.get(indicator_type, 20)
@@ -1342,6 +1525,46 @@ class CpIndicators:
                 
                 result['VWAP'] = vwap.tolist()
 
+            elif indicator_type == 'WILLIAMS_R':
+                """Williams %R 계산"""
+                period = self.params.get('WILLIAMS_R_PERIOD', 14)
+                
+                williams_r = self.calculate_williams_r(
+                    highs.tolist(), 
+                    lows.tolist(), 
+                    closes.tolist(), 
+                    period
+                )
+                
+                result['WILLIAMS_R'] = williams_r
+            
+            elif indicator_type == 'ROC':
+                """ROC 계산"""
+                period = self.params.get('ROC_PERIOD', 10)
+                
+                roc = self.calculate_roc(closes.tolist(), period)
+                
+                result['ROC'] = roc
+            
+            elif indicator_type == 'OBV':
+                """OBV 및 OBV MA 계산"""
+                obv = self.calculate_obv(closes.tolist(), volumes.tolist())
+                obv_ma20 = self.calculate_obv_ma(obv, period=20)
+                
+                result['OBV'] = obv
+                result['OBV_MA20'] = obv_ma20
+            
+            elif indicator_type == 'VOLUME_PROFILE':
+                """Volume Profile 계산"""
+                max_volume_price, current_vs_poc = self.calculate_volume_profile(
+                    closes.tolist(), 
+                    volumes.tolist()
+                )
+                
+                # 단일 값이므로 리스트 대신 스칼라
+                result['VP_POC'] = max_volume_price
+                result['VP_POSITION'] = current_vs_poc
+
             else:
                 logging.error(f"알 수 없는 지표 유형: {indicator_type}")
                 return self._get_default_result(indicator_type, desired_length)
@@ -1415,14 +1638,16 @@ class CpData(QObject):
             return strength
 
     def periodic_update_data(self):
+        """주기적 데이터 업데이트 (수정 버전)"""
         try:
             current_time = time.time()
             with self.stockdata_lock:
                 codes = list(self.stockdata.keys())
             
             for code in codes:
-                if (code in self.trader.vistock_set and code not in self.trader.monistock_set 
-                    and code not in self.trader.bought_set):
+                if (code in self.trader.vistock_set and 
+                    code not in self.trader.monistock_set and 
+                    code not in self.trader.bought_set):
                     continue
                 
                 interval = 10 if code in self.trader.bought_set else 15
@@ -1448,16 +1673,26 @@ class CpData(QObject):
                         continue
                     if code not in self.objIndicators:
                         self.objIndicators[code] = CpIndicators(self.chart_type)
+                        
+                        # === 모든 지표 재계산 (새 지표 포함) ===
+                        indicator_types = [
+                            "MA", "MACD", "RSI", "STOCH", 
+                            "ATR", "CCI", "BBANDS", "VWAP",
+                            "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"  # 추가
+                        ]
+                        
                         results = [
                             self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
-                            for ind in ["MA", "MACD", "RSI", "STOCH", "ATR", "CCI", "BBANDS", "VWAP"]
+                            for ind in indicator_types
                         ]
+                        
                         if all(results):
                             for result in results:
                                 self.stockdata[code].update(result)
                             self._update_snapshot(code)
                         else:
                             logging.warning(f"{code}: 지표 생성 실패")
+                            
         except Exception as ex:
             logging.error(f"periodic_update_data -> {ex}")
 
@@ -1490,28 +1725,59 @@ class CpData(QObject):
             return False
 
     def monitor_code(self, code):
+        """종목 모니터링 시작 (수정 버전)"""
         try:
             if code in self.stockdata:
                 return True
             
+            # === 기본 데이터 구조 초기화 ===
             self.stockdata[code] = {
                 'D': [], 'T': [], 'O': [], 'H': [], 'L': [], 'C': [], 'V': [], 'TV': [], 
+                
+                # 이동평균
                 'MAT5': [], 'MAT20': [], 'MAT60': [], 'MAT120': [], 
-                'MAM5': [], 'MAM10': [], 'MAM20': [], 'MACDT': [], 'MACDT_SIGNAL': [], 'OSCT': [], 
+                'MAM5': [], 'MAM10': [], 'MAM20': [], 
+                
+                # MACD
+                'MACDT': [], 'MACDT_SIGNAL': [], 'OSCT': [], 
                 'MACD': [], 'MACD_SIGNAL': [], 'OSC': [], 
-                'RSIT': [], 'RSIT_SIGNAL': [], 'RSI': [], 'RSI_SIGNAL': [], 
-                'STOCHK': [], 'STOCHD': [], 'ATR': [], 'CCI': [],  
-                'BB_UPPER': [], 'BB_MIDDLE': [], 'BB_LOWER': [], 'BB_POSITION': [], 'BB_BANDWIDTH': [], 
-                'TICKS': [], 'MAT5_MAT20_DIFF': [], 'MAT20_MAT60_DIFF': [], 'MAT60_MAT120_DIFF': [], 
-                'C_MAT5_DIFF': [], 'MAM5_MAM10_DIFF': [], 'MAM10_MAM20_DIFF': [], 
-                'C_MAM5_DIFF': [], 'C_ABOVE_MAM5': [], 'VWAP': [], 
-                'MAT5_CHANGE': [], 'MAT20_CHANGE': [], 'MAT60_CHANGE': [], 'MAT120_CHANGE': []
+                
+                # RSI
+                'RSIT': [], 'RSIT_SIGNAL': [], 
+                'RSI': [], 'RSI_SIGNAL': [], 
+                
+                # Stochastic
+                'STOCHK': [], 'STOCHD': [], 
+                
+                # 기타
+                'ATR': [], 'CCI': [],  
+                'BB_UPPER': [], 'BB_MIDDLE': [], 'BB_LOWER': [], 
+                'BB_POSITION': [], 'BB_BANDWIDTH': [], 
+                'VWAP': [],
+                
+                # === 새로운 지표들 추가 ===
+                'WILLIAMS_R': [],      # Williams %R
+                'ROC': [],             # Rate of Change
+                'OBV': [],             # On-Balance Volume
+                'OBV_MA20': [],        # OBV 이동평균
+                'VP_POC': 0,           # Volume Profile POC (단일 값)
+                'VP_POSITION': 0,      # VP 현재가 위치 (단일 값)
+                
+                # 기타
+                'TICKS': [], 
+                'MAT5_MAT20_DIFF': [], 'MAT20_MAT60_DIFF': [], 
+                'MAT60_MAT120_DIFF': [], 'C_MAT5_DIFF': [], 
+                'MAM5_MAM10_DIFF': [], 'MAM10_MAM20_DIFF': [], 
+                'C_MAM5_DIFF': [], 'C_ABOVE_MAM5': [], 
+                'MAT5_CHANGE': [], 'MAT20_CHANGE': [], 
+                'MAT60_CHANGE': [], 'MAT120_CHANGE': []
             }
             
             # 체결강도 초기화
             self.buy_volumes[code] = deque(maxlen=10)
             self.sell_volumes[code] = deque(maxlen=10)
 
+            # 데이터 로드
             success = self.update_chart_data_from_market_open(code)
             
             if not success:
@@ -1524,21 +1790,34 @@ class CpData(QObject):
             with self.stockdata_lock:
                 if code not in self.objIndicators:
                     self.objIndicators[code] = CpIndicators(self.chart_type)
+                    
+                    # === 모든 지표 계산 (새 지표 포함) ===
+                    indicator_types = [
+                        "MA", "MACD", "RSI", "STOCH", 
+                        "ATR", "CCI", "BBANDS", "VWAP",
+                        "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"  # 추가
+                    ]
+                    
                     results = [
                         self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
-                        for ind in ["MA", "MACD", "RSI", "STOCH", "ATR", "CCI", "BBANDS", "VWAP"]
+                        for ind in indicator_types
                     ]
+                    
                     if all(results):
                         for result in results:
                             self.stockdata[code].update(result)
+                        
                         self._update_snapshot(code)
+                        
                         if code not in self.objCur:
                             self.objCur[code] = CpPBStockCur()
                             self.objCur[code].Subscribe(code, self)
                         return True
                     else:
                         return False
+            
             return True
+            
         except Exception as ex:
             logging.error(f"monitor_code -> {code}, {ex}")
             return False
@@ -1767,7 +2046,7 @@ class CpData(QObject):
             return False
 
     def _update_snapshot(self, code):
-        """읽기 전용 스냅샷 업데이트 (락 내부에서 호출)"""
+        """읽기 전용 스냅샷 업데이트 (수정 버전)"""
         try:
             if code not in self.stockdata:
                 return
@@ -1776,22 +2055,33 @@ class CpData(QObject):
             
             if self.chart_type == 'T':
                 self.latest_snapshot[code] = {
+                    # 기본 가격
                     'C': data.get('C', [0])[-1] if data.get('C') else 0,
                     'O': data.get('O', [0])[-1] if data.get('O') else 0,
                     'H': data.get('H', [0])[-1] if data.get('H') else 0,
                     'L': data.get('L', [0])[-1] if data.get('L') else 0,
                     'V': data.get('V', [0])[-1] if data.get('V') else 0,
+                    
+                    # 이동평균
                     'MAT5': data.get('MAT5', [0])[-1] if data.get('MAT5') else 0,
                     'MAT20': data.get('MAT20', [0])[-1] if data.get('MAT20') else 0,
                     'MAT60': data.get('MAT60', [0])[-1] if data.get('MAT60') else 0,
                     'MAT120': data.get('MAT120', [0])[-1] if data.get('MAT120') else 0,
+                    
+                    # RSI
                     'RSIT': data.get('RSIT', [0])[-1] if data.get('RSIT') else 0,
                     'RSIT_SIGNAL': data.get('RSIT_SIGNAL', [0])[-1] if data.get('RSIT_SIGNAL') else 0,
+                    
+                    # MACD
                     'MACDT': data.get('MACDT', [0])[-1] if data.get('MACDT') else 0,
                     'MACDT_SIGNAL': data.get('MACDT_SIGNAL', [0])[-1] if data.get('MACDT_SIGNAL') else 0,
                     'OSCT': data.get('OSCT', [0])[-1] if data.get('OSCT') else 0,
+                    
+                    # Stochastic
                     'STOCHK': data.get('STOCHK', [0])[-1] if data.get('STOCHK') else 0,
                     'STOCHD': data.get('STOCHD', [0])[-1] if data.get('STOCHD') else 0,
+                    
+                    # 기타
                     'ATR': data.get('ATR', [0])[-1] if data.get('ATR') else 0,
                     'CCI': data.get('CCI', [0])[-1] if data.get('CCI') else 0,
                     'BB_UPPER': data.get('BB_UPPER', [0])[-1] if data.get('BB_UPPER') else 0,
@@ -1800,6 +2090,16 @@ class CpData(QObject):
                     'BB_POSITION': data.get('BB_POSITION', [0])[-1] if data.get('BB_POSITION') else 0,
                     'BB_BANDWIDTH': data.get('BB_BANDWIDTH', [0])[-1] if data.get('BB_BANDWIDTH') else 0,
                     'VWAP': data.get('VWAP', [0])[-1] if data.get('VWAP') else 0,
+                    
+                    # === 새로운 지표들 ===
+                    'WILLIAMS_R': data.get('WILLIAMS_R', [0])[-1] if data.get('WILLIAMS_R') else -50,
+                    'ROC': data.get('ROC', [0])[-1] if data.get('ROC') else 0,
+                    'OBV': data.get('OBV', [0])[-1] if data.get('OBV') else 0,
+                    'OBV_MA20': data.get('OBV_MA20', [0])[-1] if data.get('OBV_MA20') else 0,
+                    'VP_POC': data.get('VP_POC', 0),
+                    'VP_POSITION': data.get('VP_POSITION', 0),
+                    
+                    # 최근 추이
                     'C_recent': data.get('C', [0])[-3:] if data.get('C') else [0, 0, 0],
                     'H_recent': data.get('H', [0])[-3:] if data.get('H') else [0, 0, 0],
                     'L_recent': data.get('L', [0])[-3:] if data.get('L') else [0, 0, 0],
@@ -1807,23 +2107,44 @@ class CpData(QObject):
             
             elif self.chart_type == 'm':
                 self.latest_snapshot[code] = {
+                    # 기본 가격
                     'C': data.get('C', [0])[-1] if data.get('C') else 0,
                     'O': data.get('O', [0])[-1] if data.get('O') else 0,
                     'H': data.get('H', [0])[-1] if data.get('H') else 0,
                     'L': data.get('L', [0])[-1] if data.get('L') else 0,
                     'V': data.get('V', [0])[-1] if data.get('V') else 0,
+                    
+                    # 이동평균
                     'MAM5': data.get('MAM5', [0])[-1] if data.get('MAM5') else 0,
                     'MAM10': data.get('MAM10', [0])[-1] if data.get('MAM10') else 0,
                     'MAM20': data.get('MAM20', [0])[-1] if data.get('MAM20') else 0,
+                    
+                    # RSI
                     'RSI': data.get('RSI', [0])[-1] if data.get('RSI') else 0,
                     'RSI_SIGNAL': data.get('RSI_SIGNAL', [0])[-1] if data.get('RSI_SIGNAL') else 0,
+                    
+                    # MACD
                     'MACD': data.get('MACD', [0])[-1] if data.get('MACD') else 0,
-                    'MACD_SIGNAL': data.get('MACD_SIGNAL', [0])[-1] if data.get('MACD') else 0,
+                    'MACD_SIGNAL': data.get('MACD_SIGNAL', [0])[-1] if data.get('MACD_SIGNAL') else 0,
                     'OSC': data.get('OSC', [0])[-1] if data.get('OSC') else 0,
+                    
+                    # Stochastic
                     'STOCHK': data.get('STOCHK', [0])[-1] if data.get('STOCHK') else 0,
                     'STOCHD': data.get('STOCHD', [0])[-1] if data.get('STOCHD') else 0,
+                    
+                    # 기타
                     'CCI': data.get('CCI', [0])[-1] if data.get('CCI') else 0,
                     'VWAP': data.get('VWAP', [0])[-1] if data.get('VWAP') else 0,
+                    
+                    # === 새로운 지표들 ===
+                    'WILLIAMS_R': data.get('WILLIAMS_R', [0])[-1] if data.get('WILLIAMS_R') else -50,
+                    'ROC': data.get('ROC', [0])[-1] if data.get('ROC') else 0,
+                    'OBV': data.get('OBV', [0])[-1] if data.get('OBV') else 0,
+                    'OBV_MA20': data.get('OBV_MA20', [0])[-1] if data.get('OBV_MA20') else 0,
+                    'VP_POC': data.get('VP_POC', 0),
+                    'VP_POSITION': data.get('VP_POSITION', 0),
+                    
+                    # 최근 추이
                     'C_recent': data.get('C', [0])[-2:] if data.get('C') else [0, 0],
                     'O_recent': data.get('O', [0])[-2:] if data.get('O') else [0, 0],
                     'H_recent': data.get('H', [0])[-2:] if data.get('H') else [0, 0],
@@ -2107,6 +2428,14 @@ class CTrader(QObject):
                     tick_BB_POSITION REAL, tick_BB_BANDWIDTH REAL,
                     tick_VWAP REAL,
                     
+                    -- === 새 지표: 틱 ===
+                    tick_WILLIAMS_R REAL,
+                    tick_ROC REAL,
+                    tick_OBV REAL,
+                    tick_OBV_MA20 REAL,
+                    tick_VP_POC REAL,
+                    tick_VP_POSITION REAL,
+                    
                     -- 분봉 데이터 (가장 최근 완성된 분봉)
                     min_C REAL, min_O REAL, min_H REAL, min_L REAL, min_V INTEGER,
                     min_MAM5 REAL, min_MAM10 REAL, min_MAM20 REAL,
@@ -2114,6 +2443,12 @@ class CTrader(QObject):
                     min_MACD REAL, min_MACD_SIGNAL REAL, min_OSC REAL,
                     min_STOCHK REAL, min_STOCHD REAL,
                     min_CCI REAL, min_VWAP REAL,
+                    
+                    -- === 새 지표: 분봉 ===
+                    min_WILLIAMS_R REAL,
+                    min_ROC REAL,
+                    min_OBV REAL,
+                    min_OBV_MA20 REAL,
                     
                     -- 추가 정보
                     strength REAL,
@@ -2202,7 +2537,7 @@ class CTrader(QObject):
             conn.commit()
             conn.close()
             
-            logging.info("데이터베이스 초기화 완료 (combined_tick_data 단일 테이블)")
+            logging.info("데이터베이스 초기화 완료 (새 지표 포함)")
             
         except Exception as ex:
             logging.error(f"init_database -> {ex}\n{traceback.format_exc()}")
@@ -3214,42 +3549,35 @@ class AutoTraderThread(QThread):
             logging.error(f"{code} 이벤트 기반 평가 오류: {ex}")
 
     def save_to_db_if_needed(self, code, timestamp, tick_data, min_data, trigger_reason):
-        """조건부 DB 저장 (중복 방지 + 동시성 안전)"""
+        """조건부 DB 저장 (새 지표 포함)"""
         
         should_save = False
         save_reason = ""
         last_save_backup = 0
         
-        # ===== 1. 저장 필요 여부 판단 (락 안에서) =====
+        # === 저장 필요 여부 판단 ===
         with self.save_lock:
             now = time.time()
             last_save = self.last_save_time.get(code, 0)
-            last_save_backup = last_save  # 롤백용 백업
+            last_save_backup = last_save
             
-            # 저장 조건 체크
             if now - last_save >= 5.0:
-                # 주기적 저장 (5초)
                 should_save = True
                 save_reason = "주기적 저장"
-                self.last_save_time[code] = now  # ✅ 미리 업데이트하여 중복 방지
-                
+                self.last_save_time[code] = now
             elif "완성" in trigger_reason and now - last_save >= 1.0:
-                # 틱/분봉 완성 이벤트 (최소 1초 간격)
                 should_save = True
                 save_reason = trigger_reason
                 self.last_save_time[code] = now
-                
             elif (code in self.trader.buyorder_set or code in self.trader.sellorder_set):
-                # 매매 발생 시 (즉시 저장)
                 should_save = True
                 save_reason = "매매 발생"
                 self.last_save_time[code] = now
         
-        # ===== 2. 저장 불필요 시 조기 리턴 =====
         if not should_save:
             return
         
-        # ===== 3. 실제 DB 저장 (락 밖에서) =====
+        # === 실제 DB 저장 ===
         try:
             conn = sqlite3.connect(self.trader.db_name, timeout=5)
             cursor = conn.cursor()
@@ -3284,12 +3612,15 @@ class AutoTraderThread(QThread):
                     tick_BB_UPPER, tick_BB_MIDDLE, tick_BB_LOWER,
                     tick_BB_POSITION, tick_BB_BANDWIDTH,
                     tick_VWAP,
+                    tick_WILLIAMS_R, tick_ROC, tick_OBV, tick_OBV_MA20,
+                    tick_VP_POC, tick_VP_POSITION,
                     min_C, min_O, min_H, min_L, min_V,
                     min_MAM5, min_MAM10, min_MAM20,
                     min_RSI, min_RSI_SIGNAL,
                     min_MACD, min_MACD_SIGNAL, min_OSC,
                     min_STOCHK, min_STOCHD,
                     min_CCI, min_VWAP,
+                    min_WILLIAMS_R, min_ROC, min_OBV, min_OBV_MA20,
                     strength, buy_price, position_type,
                     save_reason
                 ) VALUES (
@@ -3303,12 +3634,15 @@ class AutoTraderThread(QThread):
                     ?, ?, ?,
                     ?, ?,
                     ?,
+                    ?, ?, ?, ?,
+                    ?, ?,
                     ?, ?, ?, ?, ?,
                     ?, ?, ?,
                     ?, ?,
                     ?, ?, ?,
                     ?, ?,
                     ?, ?,
+                    ?, ?, ?, ?,
                     ?, ?, ?,
                     ?
                 )
@@ -3328,6 +3662,10 @@ class AutoTraderThread(QThread):
                 tick_data.get('BB_LOWER', 0),
                 tick_data.get('BB_POSITION', 0), tick_data.get('BB_BANDWIDTH', 0),
                 tick_data.get('VWAP', 0),
+                # 새 지표 - 틱
+                tick_data.get('WILLIAMS_R', -50), tick_data.get('ROC', 0),
+                tick_data.get('OBV', 0), tick_data.get('OBV_MA20', 0),
+                tick_data.get('VP_POC', 0), tick_data.get('VP_POSITION', 0),
                 # 분봉 데이터
                 min_data.get('C', 0), min_data.get('O', 0), 
                 min_data.get('H', 0), min_data.get('L', 0), min_data.get('V', 0),
@@ -3338,6 +3676,9 @@ class AutoTraderThread(QThread):
                 min_data.get('OSC', 0),
                 min_data.get('STOCHK', 0), min_data.get('STOCHD', 0),
                 min_data.get('CCI', 0), min_data.get('VWAP', 0),
+                # 새 지표 - 분봉
+                min_data.get('WILLIAMS_R', -50), min_data.get('ROC', 0),
+                min_data.get('OBV', 0), min_data.get('OBV_MA20', 0),
                 # 추가 정보
                 strength, buy_price, position_type,
                 save_reason
@@ -3348,23 +3689,9 @@ class AutoTraderThread(QThread):
             
             logging.debug(f"{code}: DB 저장 완료 ({save_reason})")
             
-        except sqlite3.IntegrityError as ex:
-            # 중복 키 오류 (이미 저장됨)
-            logging.debug(f"{code}: DB 중복 데이터 스킵 - {ex}")
-            
-        except sqlite3.OperationalError as ex:
-            # DB 락, 테이블 없음 등
-            logging.error(f"{code}: DB 저장 실패 (OperationalError) - {ex}")
-            
-            # ✅ 실패 시 시간 롤백
-            with self.save_lock:
-                self.last_save_time[code] = last_save_backup
-            
         except Exception as ex:
-            # 기타 예외
-            logging.error(f"{code}: DB 저장 실패 (예상치 못한 오류) - {ex}\n{traceback.format_exc()}")
+            logging.error(f"{code}: DB 저장 실패 - {ex}")
             
-            # ✅ 실패 시 시간 롤백
             with self.save_lock:
                 self.last_save_time[code] = last_save_backup
 
@@ -3515,9 +3842,8 @@ class AutoTraderThread(QThread):
             self.buy_signal.emit(code, "사용자 전략", "0", "03")
 
     def _evaluate_integrated_buy(self, code, buy_strategies, tick_latest, min_latest):
-        """통합 전략 매수 평가 (안전한 eval)"""
+        """매수 평가 - 새 지표 포함"""
         
-        # ===== 안전한 실행 환경 구성 =====
         safe_globals = {
             '__builtins__': {
                 'min': min, 'max': max, 'abs': abs, 'round': round,
@@ -3527,7 +3853,7 @@ class AutoTraderThread(QThread):
             }
         }
         
-        # ===== 기본 변수들 =====
+        # === 기존 변수들 ===
         MAT5 = tick_latest.get('MAT5', 0)
         MAT20 = tick_latest.get('MAT20', 0)
         MAT60 = tick_latest.get('MAT60', 0)
@@ -3535,12 +3861,36 @@ class AutoTraderThread(QThread):
         C = tick_latest.get('C', 0)
         VWAP = tick_latest.get('VWAP', 0)
         RSIT = tick_latest.get('RSIT', 50)
+        MACDT = tick_latest.get('MACDT', 0)
+        OSCT = tick_latest.get('OSCT', 0)
+        STOCHK = tick_latest.get('STOCHK', 50)
+        STOCHD = tick_latest.get('STOCHD', 50)
+        ATR = tick_latest.get('ATR', 0)
+        BB_POSITION = tick_latest.get('BB_POSITION', 0)
+        BB_BANDWIDTH = tick_latest.get('BB_BANDWIDTH', 0)
         
         MAM5 = min_latest.get('MAM5', 0)
         MAM10 = min_latest.get('MAM10', 0)
         MAM20 = min_latest.get('MAM20', 0)
+        min_close = min_latest.get('C', 0)
+        min_RSI = min_latest.get('RSI', 50)
+        min_STOCHK = min_latest.get('STOCHK', 50)
+        min_STOCHD = min_latest.get('STOCHD', 50)
         
-        # ===== 계산된 값들 =====
+        # === 새로운 지표들 ===
+        WILLIAMS_R = tick_latest.get('WILLIAMS_R', -50)
+        ROC = tick_latest.get('ROC', 0)
+        OBV = tick_latest.get('OBV', 0)
+        OBV_MA20 = tick_latest.get('OBV_MA20', 0)
+        VP_POC = tick_latest.get('VP_POC', 0)
+        VP_POSITION = tick_latest.get('VP_POSITION', 0)
+        
+        min_WILLIAMS_R = min_latest.get('WILLIAMS_R', -50)
+        min_ROC = min_latest.get('ROC', 0)
+        min_OBV = min_latest.get('OBV', 0)
+        min_OBV_MA20 = min_latest.get('OBV_MA20', 0)
+        
+        # === 기타 변수 ===
         strength = self.trader.tickdata.get_strength(code)
         momentum_score = 0
         if self.window.momentum_scanner:
@@ -3556,41 +3906,69 @@ class AutoTraderThread(QThread):
         if hasattr(self.window, 'gap_scanner'):
             gap_hold = self.window.gap_scanner.check_gap_hold(code)
         
-        # ===== 허용된 변수만 포함 =====
+        # === ROC 최근 추이 ===
+        tick_recent = self.trader.tickdata.get_recent_data(code, 5)
+        ROC_recent = tick_recent.get('ROC', [0] * 5)
+        
+        # === Volume Profile 돌파 여부 ===
+        volume_profile_breakout = (VP_POSITION > 0)  # 현재가가 POC 위
+        
+        # === 허용된 변수 딕셔너리 ===
         safe_locals = {
+            # 틱 데이터 - 기본
             'MAT5': MAT5, 'MAT20': MAT20, 'MAT60': MAT60, 'MAT120': MAT120,
             'C': C, 'VWAP': VWAP, 'RSIT': RSIT,
+            'MACDT': MACDT, 'OSCT': OSCT,
+            'STOCHK': STOCHK, 'STOCHD': STOCHD,
+            'ATR': ATR, 'BB_POSITION': BB_POSITION, 'BB_BANDWIDTH': BB_BANDWIDTH,
+            
+            # 틱 데이터 - 새 지표
+            'WILLIAMS_R': WILLIAMS_R,
+            'ROC': ROC,
+            'ROC_recent': ROC_recent,
+            'OBV': OBV,
+            'OBV_MA20': OBV_MA20,
+            'VP_POC': VP_POC,
+            'VP_POSITION': VP_POSITION,
+            'volume_profile_breakout': volume_profile_breakout,
+            
+            # 분봉 데이터 - 기본
             'MAM5': MAM5, 'MAM10': MAM10, 'MAM20': MAM20,
-            'strength': strength, 'momentum_score': momentum_score,
-            'threshold': threshold, 'volatility_breakout': volatility_breakout,
+            'min_close': min_close, 'min_RSI': min_RSI,
+            'min_STOCHK': min_STOCHK, 'min_STOCHD': min_STOCHD,
+            
+            # 분봉 데이터 - 새 지표
+            'min_WILLIAMS_R': min_WILLIAMS_R,
+            'min_ROC': min_ROC,
+            'min_OBV': min_OBV,
+            'min_OBV_MA20': min_OBV_MA20,
+            
+            # 기타
+            'strength': strength,
+            'momentum_score': momentum_score,
+            'threshold': threshold,
+            'volatility_breakout': volatility_breakout,
             'gap_hold': gap_hold,
-            'code': code  # 디버깅용
+            'code': code
         }
         
-        # ===== 전략 평가 =====
+        # === 전략 평가 ===
         for strategy in buy_strategies:
             try:
                 condition = strategy.get('content', '')
                 
-                # ✅ 안전한 eval 실행
                 if eval(condition, safe_globals, safe_locals):
                     buy_reason = strategy.get('name', '통합 전략')
                     logging.info(
                         f"{cpCodeMgr.CodeToName(code)}({code}): {buy_reason} 매수 "
-                        f"(체결강도: {strength:.0f}, 점수: {momentum_score})"
+                        f"(체결강도: {strength:.0f}, 점수: {momentum_score}, "
+                        f"Williams %R: {WILLIAMS_R:.1f}, ROC: {ROC:.2f}%)"
                     )
                     self.buy_signal.emit(code, buy_reason, "0", "03")
                     return True
                     
-            except NameError as ex:
-                # 정의되지 않은 변수
-                logging.error(f"{code} 매수 전략 '{strategy.get('name')}' 오류 - 변수 미정의: {ex}")
-            except SyntaxError as ex:
-                # 문법 오류
-                logging.error(f"{code} 매수 전략 '{strategy.get('name')}' 오류 - 문법: {ex}")
             except Exception as ex:
-                # 기타 오류
-                logging.error(f"{code} 매수 전략 '{strategy.get('name')}' 오류: {ex}\n{traceback.format_exc()}")
+                logging.error(f"{code} 매수 전략 '{strategy.get('name')}' 오류: {ex}")
         
         return False
 
@@ -3802,10 +4180,9 @@ class AutoTraderThread(QThread):
             self.sell_signal.emit(code, "전략 매도")
 
     def _evaluate_integrated_sell(self, code, sell_strategies, tick_latest, min_latest,
-                                  current_profit_pct, from_peak_pct, hold_minutes):
-        """통합 전략 매도 평가 (안전한 eval)"""
+                              current_profit_pct, from_peak_pct, hold_minutes):
+        """매도 평가 - 새 지표 포함"""
         
-        # ===== 안전한 실행 환경 =====
         safe_globals = {
             '__builtins__': {
                 'min': min, 'max': max, 'abs': abs, 'round': round,
@@ -3815,12 +4192,38 @@ class AutoTraderThread(QThread):
             }
         }
         
-        # ===== 기본 변수들 =====
+        # === 기존 변수들 ===
+        tick_close = tick_latest.get('C', 0)
+        MAT5 = tick_latest.get('MAT5', 0)
+        MAT20 = tick_latest.get('MAT20', 0)
+        RSIT = tick_latest.get('RSIT', 50)
+        OSCT = tick_latest.get('OSCT', 0)
+        STOCHK = tick_latest.get('STOCHK', 50)
+        STOCHD = tick_latest.get('STOCHD', 50)
+        ATR = tick_latest.get('ATR', 0)
+        BB_POSITION = tick_latest.get('BB_POSITION', 0)
+        CCI = tick_latest.get('CCI', 0)
+        
         min_close = min_latest.get('C', 0)
         MAM5 = min_latest.get('MAM5', 0)
         MAM10 = min_latest.get('MAM10', 0)
+        min_RSI = min_latest.get('RSI', 50)
+        min_STOCHK = min_latest.get('STOCHK', 50)
+        min_STOCHD = min_latest.get('STOCHD', 50)
+        min_CCI = min_latest.get('CCI', 0)
         
-        # ===== 계산된 값들 =====
+        # === 새로운 지표들 ===
+        WILLIAMS_R = tick_latest.get('WILLIAMS_R', -50)
+        ROC = tick_latest.get('ROC', 0)
+        OBV = tick_latest.get('OBV', 0)
+        OBV_MA20 = tick_latest.get('OBV_MA20', 0)
+        
+        min_WILLIAMS_R = min_latest.get('WILLIAMS_R', -50)
+        min_ROC = min_latest.get('ROC', 0)
+        min_OBV = min_latest.get('OBV', 0)
+        min_OBV_MA20 = min_latest.get('OBV_MA20', 0)
+        
+        # === 파생 지표 ===
         osct_negative = False
         tick_recent = self.trader.tickdata.get_recent_data(code, 3)
         OSCT_recent = tick_recent.get('OSCT', [0, 0, 0])
@@ -3828,45 +4231,88 @@ class AutoTraderThread(QThread):
             osct_negative = OSCT_recent[-2] < 0 and OSCT_recent[-1] < 0
         
         after_market_close = self.is_after_time(14, 45)
+        buy_price = self.trader.buy_price.get(code, 0)
+        highest_price = self.trader.highest_price.get(code, buy_price)
         
-        # ===== 허용된 변수만 포함 =====
+        # === OBV 다이버전스 감지 ===
+        obv_divergence = (OBV < OBV_MA20 and current_profit_pct > 0)
+        min_obv_divergence = (min_OBV < min_OBV_MA20 and current_profit_pct > 0)
+        
+        # === Williams %R 과매수/과매도 ===
+        williams_overbought = (WILLIAMS_R > -20)  # 과매수
+        williams_oversold = (WILLIAMS_R < -80)    # 과매도
+        
+        # === 허용된 변수 딕셔너리 ===
         safe_locals = {
-            'min_close': min_close, 'MAM5': MAM5, 'MAM10': MAM10,
+            # 틱 데이터 - 기본
+            'tick_close': tick_close, 'C': tick_close,
+            'MAT5': MAT5, 'MAT20': MAT20,
+            'RSIT': RSIT, 'OSCT': OSCT, 'osct_negative': osct_negative,
+            'STOCHK': STOCHK, 'STOCHD': STOCHD,
+            'ATR': ATR, 'BB_POSITION': BB_POSITION, 'CCI': CCI,
+            
+            # 틱 데이터 - 새 지표
+            'WILLIAMS_R': WILLIAMS_R,
+            'williams_overbought': williams_overbought,
+            'williams_oversold': williams_oversold,
+            'ROC': ROC,
+            'OBV': OBV,
+            'OBV_MA20': OBV_MA20,
+            'obv_divergence': obv_divergence,
+            
+            # 분봉 데이터 - 기본
+            'min_close': min_close,
+            'MAM5': MAM5, 'MAM10': MAM10,
+            'min_RSI': min_RSI,
+            'min_STOCHK': min_STOCHK, 'min_STOCHD': min_STOCHD,
+            'min_CCI': min_CCI,
+            
+            # 분봉 데이터 - 새 지표
+            'min_WILLIAMS_R': min_WILLIAMS_R,
+            'min_ROC': min_ROC,
+            'min_OBV': min_OBV,
+            'min_OBV_MA20': min_OBV_MA20,
+            'min_obv_divergence': min_obv_divergence,
+            
+            # 수익률 정보
             'current_profit_pct': current_profit_pct,
             'from_peak_pct': from_peak_pct,
             'hold_minutes': hold_minutes,
-            'osct_negative': osct_negative,
+            'buy_price': buy_price,
+            'highest_price': highest_price,
+            
+            # 기타
             'after_market_close': after_market_close,
-            'code': code,  # trader 접근용
-            'self': self  # self.trader 접근 허용
+            'code': code,
+            'self': self
         }
         
-        # ===== 전략 평가 =====
+        # === 전략 평가 ===
         for strategy in sell_strategies:
             try:
                 condition = strategy.get('content', '')
                 
-                # ✅ 안전한 eval 실행
                 if eval(condition, safe_globals, safe_locals):
                     sell_reason = strategy.get('name', '통합 전략')
-                    logging.info(f"{cpCodeMgr.CodeToName(code)}({code}): {sell_reason} ({current_profit_pct:.2f}%)")
                     
-                    # 분할 매도 vs 전량 매도
+                    logging.info(
+                        f"{cpCodeMgr.CodeToName(code)}({code}): {sell_reason} "
+                        f"({current_profit_pct:+.2f}%, {hold_minutes:.0f}분 보유, "
+                        f"Williams %R: {WILLIAMS_R:.1f}, ROC: {ROC:.2f}%)"
+                    )
+                    
                     if '분할' in sell_reason:
                         self.sell_half_signal.emit(code, sell_reason)
                     else:
                         self.sell_signal.emit(code, sell_reason)
+                    
                     return True
                     
-            except NameError as ex:
-                logging.error(f"{code} 매도 전략 '{strategy.get('name')}' 오류 - 변수 미정의: {ex}")
-            except SyntaxError as ex:
-                logging.error(f"{code} 매도 전략 '{strategy.get('name')}' 오류 - 문법: {ex}")
             except Exception as ex:
-                logging.error(f"{code} 매도 전략 '{strategy.get('name')}' 오류: {ex}\n{traceback.format_exc()}")
+                logging.error(f"{code} 매도 전략 '{strategy.get('name')}' 오류: {ex}")
         
         return False
-    
+
 # ==================== ChartDrawer 관련 클래스 (유지) ====================
 class ChartDrawerThread(QThread):
     data_ready = pyqtSignal(dict)
