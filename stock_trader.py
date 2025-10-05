@@ -1352,6 +1352,8 @@ class CpIndicators:
 
 # ==================== CpData (체결강도 추가) ====================
 class CpData(QObject):
+    new_bar_completed = pyqtSignal(str)
+
     def __init__(self, interval, chart_type, number, trader):
         super().__init__()
         self.interval = interval
@@ -1874,11 +1876,9 @@ class CpData(QObject):
             vol = item['vol']
             current_time = time.time()
             
-            # 체결강도 업데이트 (임시로 거래량 기반)
-            # 실제로는 호가창 데이터가 필요하지만, 여기서는 간단히 구현
+            # 체결강도 업데이트
             with self.stockdata_lock:
                 if code in self.buy_volumes:
-                    # 상승시 매수로 간주
                     if len(self.stockdata.get(code, {}).get('C', [])) > 0:
                         prev_price = self.stockdata[code]['C'][-1]
                         if cur > prev_price:
@@ -1892,6 +1892,9 @@ class CpData(QObject):
                             self.sell_volumes[code].append(vol / 2)
 
             with self.stockdata_lock:
+                # ✅ 새 봉 완성 여부 체크
+                bar_completed = False
+                
                 if self.chart_type == 'T':
                     hh, mm = divmod(time_val, 10000)
                     mm, tt = divmod(mm, 100)
@@ -1919,6 +1922,9 @@ class CpData(QObject):
                                 self.stockdata[code]['TICKS'][-1] += 1
 
                         if not bFind:
+                            # ✅ 새 봉 생성 = 완성 이벤트
+                            bar_completed = True
+                            
                             self.stockdata[code]['D'].append(self.todayDate)
                             self.stockdata[code]['T'].append(lCurTime)
                             self.stockdata[code]['O'].append(cur)
@@ -1976,6 +1982,9 @@ class CpData(QObject):
                                 self.stockdata[code]['V'][-1] += vol
         
                         if not bFind:
+                            # ✅ 새 봉 생성 = 완성 이벤트
+                            bar_completed = True
+                            
                             self.stockdata[code]['D'].append(self.todayDate)
                             self.stockdata[code]['T'].append(lCurTime)
                             self.stockdata[code]['O'].append(cur)
@@ -2004,6 +2013,10 @@ class CpData(QObject):
                             
                             self.last_indicator_update[code] = current_time
                 
+                # ✅ 새 봉 완성 시 signal 발생
+                if bar_completed:
+                    self.new_bar_completed.emit(code)
+        
         except Exception as ex:
             logging.error(f"updateCurData -> {ex}")
 
@@ -2316,68 +2329,50 @@ class CTrader(QObject):
     def init_database(self):
         """데이터베이스 초기화"""
         try:
-            if os.path.exists(self.db_name):
-                os.remove(self.db_name)
-                logging.debug(f"{self.db_name} 삭제 완료")
-
             conn = sqlite3.connect(self.db_name)
             cursor = conn.cursor()
             
-            # ==================== 차트 데이터 테이블 ====================
-            
-            # 틱 데이터
+            # ✅ 결합 틱 데이터 (모든 평가 시점마다 저장)
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tick_data (
-                    code TEXT, date TEXT, time TEXT, sequence INTEGER, C REAL, V INTEGER,
-                    MAT5 REAL, MAT20 REAL, MAT60 REAL, MAT120 REAL, RSIT REAL, RSIT_SIGNAL REAL,
-                    MACDT REAL, MACDT_SIGNAL REAL, OSCT REAL, STOCHK REAL, STOCHD REAL, 
-                    ATR REAL, CCI REAL, BB_UPPER REAL, BB_MIDDLE REAL, BB_LOWER REAL, 
-                    BB_POSITION REAL, BB_BANDWIDTH REAL, MAT5_MAT20_DIFF REAL, 
-                    MAT20_MAT60_DIFF REAL, MAT60_MAT120_DIFF REAL, C_MAT5_DIFF REAL, VWAP REAL,
-                    PRIMARY KEY (code, date, time, sequence)
-                )
-            ''')
-            
-            # 분봉 데이터
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS min_data (
-                    code TEXT, date TEXT, time TEXT, sequence INTEGER, C REAL, V INTEGER,
-                    MAM5 REAL, MAM10 REAL, MAM20 REAL, RSI REAL, RSI_SIGNAL REAL,
-                    MACD REAL, MACD_SIGNAL REAL, OSC REAL, STOCHK REAL, STOCHD REAL,
-                    CCI REAL, MAM5_MAM10_DIFF REAL, MAM10_MAM20_DIFF REAL,
-                    C_MAM5_DIFF REAL, C_ABOVE_MAM5 REAL, VWAP REAL,
-                    PRIMARY KEY (code, date, time, sequence)
-                )
-            ''')
-            
-            # ==================== 거래/분석 테이블 ====================
-            
-            # 실거래 기록
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS trades (
+                CREATE TABLE IF NOT EXISTS combined_tick_data (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     code TEXT NOT NULL,
-                    stock_name TEXT,
+                    timestamp DATETIME NOT NULL,
                     date TEXT NOT NULL,
                     time TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    price REAL NOT NULL,
-                    quantity INTEGER NOT NULL,
-                    amount REAL NOT NULL,
-                    strategy TEXT,
-                    buy_reason TEXT,
-                    sell_reason TEXT,
+                    
+                    -- 틱 데이터 (현재 시점)
+                    tick_C REAL, tick_O REAL, tick_H REAL, tick_L REAL, tick_V INTEGER,
+                    tick_MAT5 REAL, tick_MAT20 REAL, tick_MAT60 REAL, tick_MAT120 REAL,
+                    tick_RSIT REAL, tick_RSIT_SIGNAL REAL,
+                    tick_MACDT REAL, tick_MACDT_SIGNAL REAL, tick_OSCT REAL,
+                    tick_STOCHK REAL, tick_STOCHD REAL,
+                    tick_ATR REAL, tick_CCI REAL,
+                    tick_BB_UPPER REAL, tick_BB_MIDDLE REAL, tick_BB_LOWER REAL,
+                    tick_BB_POSITION REAL, tick_BB_BANDWIDTH REAL,
+                    tick_VWAP REAL,
+                    
+                    -- 분봉 데이터 (가장 최근 완성된 분봉)
+                    min_C REAL, min_O REAL, min_H REAL, min_L REAL, min_V INTEGER,
+                    min_MAM5 REAL, min_MAM10 REAL, min_MAM20 REAL,
+                    min_RSI REAL, min_RSI_SIGNAL REAL,
+                    min_MACD REAL, min_MACD_SIGNAL REAL, min_OSC REAL,
+                    min_STOCHK REAL, min_STOCHD REAL,
+                    min_CCI REAL, min_VWAP REAL,
+                    
+                    -- 추가 정보
+                    strength REAL,
                     buy_price REAL,
-                    profit REAL,
-                    profit_pct REAL,
-                    hold_minutes REAL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    position_type TEXT,
+                    save_reason TEXT,  -- ✅ 저장 이유 추가
+                    
+                    UNIQUE(code, timestamp)
                 )
             ''')
             
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(date)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_code ON trades(code)')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_trades_action ON trades(action)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_combined_code ON combined_tick_data(code)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_combined_date ON combined_tick_data(date)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_combined_timestamp ON combined_tick_data(timestamp)')
             
             # 일별 요약
             cursor.execute('''
@@ -2449,9 +2444,7 @@ class CTrader(QObject):
             ''')
             
             conn.commit()
-            conn.close()
-            
-            logging.info("데이터베이스 초기화 완료")
+            conn.close()            
             
         except Exception as ex:
             logging.error(f"init_database -> {ex}\n{traceback.format_exc()}")
@@ -3410,18 +3403,249 @@ class AutoTraderThread(QThread):
         
         self.counter = 0
         
-        # 변동성 돌파 전략 추가
         self.volatility_strategy = None
+        
+        self.load_trading_settings()
+        
+        self.last_evaluation_time = {}
+        self.evaluation_lock = threading.Lock()
+        
+        # ✅ DB 저장용
+        self.last_save_time = {}  # 종목별 마지막 저장 시각
+        self.save_lock = threading.Lock()
+
+    def load_trading_settings(self):
+        """매매 평가 설정 로드"""
+        config = configparser.ConfigParser(interpolation=None)
+        if os.path.exists('settings.ini'):
+            config.read('settings.ini', encoding='utf-8')
+        
+        # 기본값 설정
+        self.evaluation_interval = config.getint('TRADING', 'evaluation_interval', fallback=5)
+        self.event_based_evaluation = config.getboolean('TRADING', 'event_based_evaluation', fallback=True)
+        self.min_evaluation_gap = config.getfloat('TRADING', 'min_evaluation_gap', fallback=3.0)
+        
+        logging.info(
+            f"매매 평가 설정: 주기={self.evaluation_interval}초, "
+            f"이벤트기반={self.event_based_evaluation}, "
+            f"최소간격={self.min_evaluation_gap}초"
+        )
 
     def set_volatility_strategy(self, strategy):
         """변동성 돌파 전략 설정"""
         self.volatility_strategy = strategy
 
+    def connect_bar_signals(self):
+        """봉 완성 signal 연결"""
+        if self.event_based_evaluation:
+            # 틱봉 완성 시
+            self.trader.tickdata.new_bar_completed.connect(self.on_tick_bar_completed)
+            # 분봉 완성 시
+            self.trader.mindata.new_bar_completed.connect(self.on_min_bar_completed)
+            logging.info("이벤트 기반 매매 평가 활성화")
+
+    @pyqtSlot(str)
+    def on_tick_bar_completed(self, code):
+        """틱봉 완성 시 즉시 평가"""
+        self._evaluate_code_if_ready(code, "틱봉 완성")
+
+    @pyqtSlot(str)
+    def on_min_bar_completed(self, code):
+        """분봉 완성 시 즉시 평가"""
+        self._evaluate_code_if_ready(code, "분봉 완성")
+
+    def _evaluate_code_if_ready(self, code, reason):
+        """종목 평가 (최소 간격 체크) + DB 저장"""
+        
+        if code not in self.trader.monistock_set:
+            return
+        
+        with self.evaluation_lock:
+            now = time.time()
+            last_time = self.last_evaluation_time.get(code, 0)
+            
+            if now - last_time < self.min_evaluation_gap:
+                return
+            
+            self.last_evaluation_time[code] = now
+        
+        t_now = datetime.now()
+        
+        if not self._is_trading_hours(t_now):
+            return
+        
+        try:
+            # 현재 데이터 조회
+            tick_latest = self.trader.tickdata.get_latest_data(code)
+            min_latest = self.trader.mindata.get_latest_data(code)
+            
+            if not tick_latest or not min_latest:
+                return
+            
+            # ✅ 평가 시점마다 DB 저장
+            self.save_to_db_if_needed(code, t_now, tick_latest, min_latest, reason)
+            
+            # 매매 조건 평가
+            current_strategy = self.window.comboStg.currentText()
+            buy_strategies = [
+                stg for stg in self.window.strategies.get(current_strategy, []) 
+                if stg['key'].startswith('buy')
+            ]
+            sell_strategies = [
+                stg for stg in self.window.strategies.get(current_strategy, []) 
+                if stg['key'].startswith('sell')
+            ]
+            
+            if code not in self.trader.buyorder_set and code not in self.trader.bought_set:
+                logging.debug(f"{code}: {reason} - 매수 조건 평가")
+                self._evaluate_buy_condition(code, t_now, current_strategy, buy_strategies)
+            
+            elif (code in self.trader.bought_set and 
+                  code not in self.trader.buyorder_set and 
+                  code not in self.trader.sellorder_set):
+                logging.debug(f"{code}: {reason} - 매도 조건 평가")
+                self._evaluate_sell_condition(code, t_now, current_strategy, sell_strategies)
+                
+        except Exception as ex:
+            logging.error(f"{code} 이벤트 기반 평가 오류: {ex}")
+
+    def save_to_db_if_needed(self, code, timestamp, tick_data, min_data, trigger_reason):
+        """조건부 DB 저장 (중복 방지)"""
+        
+        with self.save_lock:
+            now = time.time()
+            last_save = self.last_save_time.get(code, 0)
+            
+            # ✅ 저장 조건
+            save_needed = False
+            
+            # 1. 5초 이상 경과 (주기적 저장)
+            if now - last_save >= 5.0:
+                save_needed = True
+                save_reason = "주기적 저장"
+            
+            # 2. 틱/분봉 완성 이벤트 (즉시 저장)
+            elif "완성" in trigger_reason:
+                save_needed = True
+                save_reason = trigger_reason
+            
+            # 3. 매매 발생 시 (즉시 저장)
+            elif code in self.trader.buyorder_set or code in self.trader.sellorder_set:
+                save_needed = True
+                save_reason = "매매 발생"
+            
+            if not save_needed:
+                return
+            
+            self.last_save_time[code] = now
+        
+        # ✅ 실제 저장 (락 밖에서 수행)
+        try:
+            conn = sqlite3.connect(self.trader.db_name, timeout=5)
+            cursor = conn.cursor()
+            
+            date_str = timestamp.strftime('%Y%m%d')
+            time_str = timestamp.strftime('%H%M%S')
+            
+            # 체결강도
+            strength = self.trader.tickdata.get_strength(code)
+            
+            # 포지션 정보
+            if code in self.trader.bought_set:
+                position_type = 'BOUGHT'
+                buy_price = self.trader.buy_price.get(code, None)
+            elif code in self.trader.buyorder_set:
+                position_type = 'BUYORDER'
+                buy_price = None
+            else:
+                position_type = 'NONE'
+                buy_price = None
+            
+            cursor.execute('''
+                INSERT OR REPLACE INTO combined_tick_data (
+                    code, timestamp, date, time,
+                    tick_C, tick_O, tick_H, tick_L, tick_V,
+                    tick_MAT5, tick_MAT20, tick_MAT60, tick_MAT120,
+                    tick_RSIT, tick_RSIT_SIGNAL,
+                    tick_MACDT, tick_MACDT_SIGNAL, tick_OSCT,
+                    tick_STOCHK, tick_STOCHD,
+                    tick_ATR, tick_CCI,
+                    tick_BB_UPPER, tick_BB_MIDDLE, tick_BB_LOWER,
+                    tick_BB_POSITION, tick_BB_BANDWIDTH,
+                    tick_VWAP,
+                    min_C, min_O, min_H, min_L, min_V,
+                    min_MAM5, min_MAM10, min_MAM20,
+                    min_RSI, min_RSI_SIGNAL,
+                    min_MACD, min_MACD_SIGNAL, min_OSC,
+                    min_STOCHK, min_STOCHD,
+                    min_CCI, min_VWAP,
+                    strength, buy_price, position_type,
+                    save_reason
+                ) VALUES (
+                    ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?, ?,
+                    ?, ?, ?,
+                    ?
+                )
+            ''', (
+                code, timestamp, date_str, time_str,
+                # 틱 데이터
+                tick_data.get('C', 0), tick_data.get('O', 0), 
+                tick_data.get('H', 0), tick_data.get('L', 0), tick_data.get('V', 0),
+                tick_data.get('MAT5', 0), tick_data.get('MAT20', 0), 
+                tick_data.get('MAT60', 0), tick_data.get('MAT120', 0),
+                tick_data.get('RSIT', 0), tick_data.get('RSIT_SIGNAL', 0),
+                tick_data.get('MACDT', 0), tick_data.get('MACDT_SIGNAL', 0), 
+                tick_data.get('OSCT', 0),
+                tick_data.get('STOCHK', 0), tick_data.get('STOCHD', 0),
+                tick_data.get('ATR', 0), tick_data.get('CCI', 0),
+                tick_data.get('BB_UPPER', 0), tick_data.get('BB_MIDDLE', 0), 
+                tick_data.get('BB_LOWER', 0),
+                tick_data.get('BB_POSITION', 0), tick_data.get('BB_BANDWIDTH', 0),
+                tick_data.get('VWAP', 0),
+                # 분봉 데이터
+                min_data.get('C', 0), min_data.get('O', 0), 
+                min_data.get('H', 0), min_data.get('L', 0), min_data.get('V', 0),
+                min_data.get('MAM5', 0), min_data.get('MAM10', 0), 
+                min_data.get('MAM20', 0),
+                min_data.get('RSI', 0), min_data.get('RSI_SIGNAL', 0),
+                min_data.get('MACD', 0), min_data.get('MACD_SIGNAL', 0), 
+                min_data.get('OSC', 0),
+                min_data.get('STOCHK', 0), min_data.get('STOCHD', 0),
+                min_data.get('CCI', 0), min_data.get('VWAP', 0),
+                # 추가 정보
+                strength, buy_price, position_type,
+                save_reason
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            logging.debug(f"{code}: DB 저장 ({save_reason})")
+            
+        except Exception as ex:
+            logging.error(f"save_to_db_if_needed -> {code}, {ex}")
+
     def run(self):
         """메인 루프"""
         while self.running:
             self.autotrade()
-            self.msleep(1000)
+            # ✅ 5초 주기로 변경
+            self.msleep(self.evaluation_interval * 1000)
 
     def stop(self):
         """스레드 정지"""
@@ -3433,7 +3657,7 @@ class AutoTraderThread(QThread):
         logging.info("AutoTraderThread 정지 완료")
 
     def autotrade(self):
-        """자동매매 메인 루프"""
+        """자동매매 메인 루프 (주기적 평가)"""
         try:
             t_now = datetime.now()
             
@@ -3443,6 +3667,7 @@ class AutoTraderThread(QThread):
             self._update_stock_data_table()
             
             if self._is_trading_hours(t_now):
+                # ✅ 주기적 평가 + 저장
                 self._execute_trading_logic(t_now)
             elif self._is_market_close_time(t_now):
                 self._handle_market_close()
@@ -3488,16 +3713,7 @@ class AutoTraderThread(QThread):
         self.stock_data_updated.emit(stock_data_list)
 
     def _execute_trading_logic(self, t_now):
-        """거래 로직 실행"""
-        current_strategy = self.window.comboStg.currentText()
-        buy_strategies = [
-            stg for stg in self.window.strategies.get(current_strategy, []) 
-            if stg['key'].startswith('buy')
-        ]
-        sell_strategies = [
-            stg for stg in self.window.strategies.get(current_strategy, []) 
-            if stg['key'].startswith('sell')
-        ]
+        """거래 로직 실행 (5초 주기)"""
         
         monitored_codes = list(self.trader.monistock_set.copy())
         
@@ -3506,13 +3722,8 @@ class AutoTraderThread(QThread):
                 continue
             
             try:
-                if code not in self.trader.buyorder_set and code not in self.trader.bought_set:
-                    self._evaluate_buy_condition(code, t_now, current_strategy, buy_strategies)
-                
-                elif (code in self.trader.bought_set and 
-                      code not in self.trader.buyorder_set and 
-                      code not in self.trader.sellorder_set):
-                    self._evaluate_sell_condition(code, t_now, current_strategy, sell_strategies)
+                # ✅ 5초마다 평가 + 저장
+                self._evaluate_code_if_ready(code, t_now, "주기적 평가")
                     
             except Exception as ex:
                 logging.error(f"{code} 거래 로직 오류: {ex}")
@@ -4295,6 +4506,10 @@ class MyWindow(QWidget):
         self.trader_thread.stock_removed_from_monitor.connect(self.on_stock_removed)
         self.trader_thread.counter_updated.connect(self.update_counter_label)
         self.trader_thread.stock_data_updated.connect(self.update_stock_table)
+        
+        # ✅ 봉 완성 signal 연결
+        self.trader_thread.connect_bar_signals()
+
         self.trader_thread.start()
 
     def start_timers(self):
