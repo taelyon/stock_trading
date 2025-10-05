@@ -34,11 +34,11 @@ import copy
 import talib
 import traceback
 import pyautogui
+from collections import deque
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
 
-# matplotlib의 폰트 관련 설정
 plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -86,7 +86,6 @@ def setup_logging():
     logger.addHandler(console_handler)
 
 def send_slack_message(login_handler, channel, message):
-    """Slack 메시지를 비동기로 전송한다."""
     if login_handler is None or login_handler.slack is None:
         logging.warning("Slack 설정이 되어 있지 않습니다.")
         return
@@ -107,6 +106,624 @@ class SlackMessageSender(QRunnable):
         except Exception as ex:
             logging.error(f"Slack 메시지 전송 실패: {ex}")
 
+# ==================== API 제한 관리자 ====================
+class APILimiter:
+    """API 호출 제한 관리"""
+    
+    def __init__(self):
+        self.request_times = deque(maxlen=15)  # 최근 15개 요청 시간
+        self.lock = threading.Lock()
+        
+    def wait_if_needed(self):
+        """필요시 대기"""
+        with self.lock:
+            now = time.time()
+            
+            # 1분 내 15개 요청 체크
+            while len(self.request_times) >= 15:
+                oldest = self.request_times[0]
+                if now - oldest < 60:
+                    wait_time = 60 - (now - oldest) + 0.1
+                    logging.debug(f"API 제한: {wait_time:.1f}초 대기")
+                    time.sleep(wait_time)
+                    now = time.time()
+                else:
+                    break
+            
+            # 초당 1회 체크
+            if len(self.request_times) > 0:
+                last_request = self.request_times[-1]
+                if now - last_request < 1.0:
+                    time.sleep(1.0 - (now - last_request))
+            
+            self.request_times.append(time.time())
+
+# 전역 API 제한자
+api_limiter = APILimiter()
+
+# ==================== 데이터 캐시 ====================
+class DataCache:
+    """종목 정보 캐싱"""
+    
+    def __init__(self, expire_seconds=300):
+        self.cache = {}
+        self.expire_seconds = expire_seconds
+        self.lock = threading.Lock()
+    
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                data, timestamp = self.cache[key]
+                if time.time() - timestamp < self.expire_seconds:
+                    return data
+                else:
+                    del self.cache[key]
+            return None
+    
+    def set(self, key, value):
+        with self.lock:
+            self.cache[key] = (value, time.time())
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+
+# 전역 캐시
+stock_info_cache = DataCache(expire_seconds=300)  # 5분
+
+# ==================== 급등주 스캐너 ====================
+class MomentumScanner(QObject):
+    """급등주 실시간 스캔"""
+    
+    stock_found = pyqtSignal(dict)
+    
+    def __init__(self, trader):
+        super().__init__()
+        self.trader = trader
+        self.scan_timer = QTimer()
+        self.scan_timer.timeout.connect(self.scan_market)
+        self.candidate_codes = []
+        self.scanned_codes = set()
+        self.last_scan_time = 0
+        self.cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
+        
+    def start_screening(self):
+        """09:05부터 스캔 시작"""
+        now = datetime.now()
+        start_time = now.replace(hour=9, minute=5, second=0, microsecond=0)
+        
+        if now < start_time:
+            delay = (start_time - now).total_seconds() * 1000
+            logging.info(f"급등주 스캔 {int(delay/1000)}초 후 시작 예정")
+            QTimer.singleShot(int(delay), self.start_screening)
+            return
+        
+        logging.info("급등주 스캔 시작")
+        self.scan_market()
+        
+        # 5분마다 재스캔
+        self.scan_timer.start(300000)
+    
+    def stop_screening(self):
+        """스캔 중지"""
+        if self.scan_timer.isActive():
+            self.scan_timer.stop()
+        logging.info("급등주 스캔 중지")
+    
+    def scan_market(self):
+        """시장 전체 스캔 (API 제한 고려)"""
+        
+        try:
+            now = time.time()
+            if now - self.last_scan_time < 60:
+                logging.debug("스캔 주기 미달, 스킵")
+                return
+            
+            self.last_scan_time = now
+            
+            logging.info("=== 급등주 스캔 시작 ===")
+            
+            # KOSDAQ 전체 종목
+            code_list = cpCodeMgr.GetStockListByMarket(2)
+            
+            # 시가총액으로 사전 필터링 (API 절약)
+            filtered_codes = self._pre_filter_by_market_cap(code_list)
+            
+            candidates = []
+            scan_count = 0
+            max_scan = 100  # 한 번에 최대 100개만 스캔
+            
+            for code in filtered_codes:
+                if scan_count >= max_scan:
+                    break
+                
+                # 이미 모니터링 중이면 스킵
+                if code in self.trader.monistock_set:
+                    continue
+                
+                # 이미 스캔했으면 스킵
+                if code in self.scanned_codes:
+                    continue
+                
+                # API 제한 대기
+                api_limiter.wait_if_needed()
+                
+                # 모멘텀 점수 계산
+                score = self._calculate_momentum_score(code)
+                
+                if score >= 70:
+                    stock_data = {
+                        'code': code,
+                        'name': cpCodeMgr.CodeToName(code),
+                        'score': score,
+                        'price': self._get_cached_price(code),
+                        'change_pct': self._get_change_pct(code),
+                        'volume_ratio': self._get_volume_ratio(code)
+                    }
+                    candidates.append(stock_data)
+                    self.scanned_codes.add(code)
+                
+                scan_count += 1
+            
+            # 점수 순 정렬
+            candidates.sort(key=lambda x: x['score'], reverse=True)
+            
+            # 상위 5개만 모니터링 추가 (메모리 관리)
+            max_monitoring = min(5, 10 - len(self.trader.monistock_set))
+            
+            for stock in candidates[:max_monitoring]:
+                self._add_to_monitoring(stock)
+            
+            logging.info(
+                f"급등주 스캔 완료: 검색 {scan_count}개, "
+                f"후보 {len(candidates)}개, 추가 {min(max_monitoring, len(candidates))}개"
+            )
+            
+        except Exception as ex:
+            logging.error(f"scan_market 오류: {ex}\n{traceback.format_exc()}")
+    
+    def _pre_filter_by_market_cap(self, code_list):
+        """시가총액으로 사전 필터링"""
+        filtered = []
+        
+        for code in code_list:
+            # 캐시 확인
+            cached = stock_info_cache.get(f"filter_{code}")
+            if cached is not None:
+                if cached:
+                    filtered.append(code)
+                continue
+            
+            # 관리종목 제외
+            if cpCodeMgr.GetStockControlKind(code) != 0:
+                stock_info_cache.set(f"filter_{code}", False)
+                continue
+            
+            # KOSDAQ만
+            if cpCodeMgr.GetStockSectionKind(code) != 2:
+                stock_info_cache.set(f"filter_{code}", False)
+                continue
+            
+            # 시가총액 정보는 cpCodeMgr에서 바로 가져올 수 없으므로
+            # 일단 통과시키고 나중에 상세 체크
+            stock_info_cache.set(f"filter_{code}", True)
+            filtered.append(code)
+        
+        return filtered[:200]  # 최대 200개로 제한
+    
+    def _calculate_momentum_score(self, code):
+        """모멘텀 점수 계산"""
+        
+        try:
+            score = 0
+            
+            # 캐시 확인
+            cached_score = stock_info_cache.get(f"score_{code}")
+            if cached_score is not None:
+                return cached_score
+            
+            # 현재가 정보
+            self.cpStock.SetInputValue(0, code)
+            self.cpStock.BlockRequest2(1)
+            
+            current_price = self.cpStock.GetHeaderValue(11)
+            open_price = self.cpStock.GetHeaderValue(13)
+            high_price = self.cpStock.GetHeaderValue(14)
+            low_price = self.cpStock.GetHeaderValue(15)
+            volume = self.cpStock.GetHeaderValue(18)
+            prev_close = self.cpStock.GetHeaderValue(20)
+            prev_volume = self.cpStock.GetHeaderValue(21)
+            market_cap = self.cpStock.GetHeaderValue(67)  # 백만원 단위
+            
+            # 가격대 필터 (2,000원 ~ 50,000원)
+            if current_price < 2000 or current_price > 50000:
+                stock_info_cache.set(f"score_{code}", 0)
+                return 0
+            
+            # 시가총액 필터 (500억 ~ 5000억)
+            if market_cap < 50000 or market_cap > 500000:
+                stock_info_cache.set(f"score_{code}", 0)
+                return 0
+            
+            # 1. 시가 대비 상승률 (0-30점)
+            if open_price > 0:
+                price_change_pct = (current_price - open_price) / open_price * 100
+                
+                if 2.0 <= price_change_pct < 3.5:
+                    score += 30
+                elif 3.5 <= price_change_pct < 5.0:
+                    score += 20
+                elif 5.0 <= price_change_pct < 7.0:
+                    score += 10
+                elif price_change_pct < 0:
+                    stock_info_cache.set(f"score_{code}", 0)
+                    return 0
+            
+            # 2. 거래량 비율 (0-25점)
+            if prev_volume > 0:
+                volume_ratio = volume / prev_volume
+                
+                if volume_ratio >= 5.0:
+                    score += 25
+                elif volume_ratio >= 3.0:
+                    score += 20
+                elif volume_ratio >= 2.0:
+                    score += 10
+                elif volume_ratio < 1.5:
+                    stock_info_cache.set(f"score_{code}", 0)
+                    return 0
+            
+            # 3. 당일 고가 근처 유지 (0-20점)
+            if high_price > 0 and low_price > 0:
+                position = (current_price - low_price) / (high_price - low_price) if (high_price - low_price) > 0 else 0
+                
+                if position >= 0.8:
+                    score += 20
+                elif position >= 0.6:
+                    score += 15
+                elif position >= 0.4:
+                    score += 10
+            
+            # 4. 시가 상승 유지 (0-15점)
+            if current_price > open_price * 1.015:
+                score += 15
+            elif current_price > open_price:
+                score += 10
+            
+            # 5. 시간대 가중치 (0-10점)
+            now = datetime.now()
+            if 9 <= now.hour < 10:
+                score += 10
+            elif 10 <= now.hour < 12:
+                score += 7
+            elif 13 <= now.hour < 14:
+                score += 5
+            
+            stock_info_cache.set(f"score_{code}", score)
+            return score
+            
+        except Exception as ex:
+            logging.error(f"_calculate_momentum_score({code}): {ex}")
+            return 0
+    
+    def _get_cached_price(self, code):
+        """현재가 조회 (캐시)"""
+        cached = stock_info_cache.get(f"price_{code}")
+        if cached:
+            return cached
+        
+        try:
+            self.cpStock.SetInputValue(0, code)
+            self.cpStock.BlockRequest2(1)
+            price = self.cpStock.GetHeaderValue(11)
+            stock_info_cache.set(f"price_{code}", price)
+            return price
+        except:
+            return 0
+    
+    def _get_change_pct(self, code):
+        """등락률 조회"""
+        try:
+            self.cpStock.SetInputValue(0, code)
+            self.cpStock.BlockRequest2(1)
+            
+            current = self.cpStock.GetHeaderValue(11)
+            prev = self.cpStock.GetHeaderValue(20)
+            
+            if prev > 0:
+                return (current - prev) / prev * 100
+            return 0
+        except:
+            return 0
+    
+    def _get_volume_ratio(self, code):
+        """거래량 비율 조회"""
+        try:
+            self.cpStock.SetInputValue(0, code)
+            self.cpStock.BlockRequest2(1)
+            
+            volume = self.cpStock.GetHeaderValue(18)
+            prev_volume = self.cpStock.GetHeaderValue(21)
+            
+            if prev_volume > 0:
+                return volume / prev_volume
+            return 0
+        except:
+            return 0
+    
+    def _add_to_monitoring(self, stock):
+        """모니터링 대상 추가"""
+        
+        code = stock['code']
+        
+        try:
+            # 일봉/틱봉/분봉 데이터 로드
+            if (self.trader.daydata.select_code(code) and 
+                self.trader.tickdata.monitor_code(code) and 
+                self.trader.mindata.monitor_code(code)):
+                
+                # 시작 시간/가격 기록
+                self.trader.starting_time[code] = datetime.now().strftime('%m/%d %H:%M:%S')
+                self.trader.starting_price[code] = stock['price']
+                
+                # 모니터링 세트 추가
+                self.trader.monistock_set.add(code)
+                self.trader.stock_added_to_monitor.emit(code)
+                
+                logging.info(
+                    f"{stock['name']}({code}) -> "
+                    f"급등주 추가 (점수: {stock['score']}, "
+                    f"상승률: {stock['change_pct']:.2f}%, "
+                    f"거래량비: {stock['volume_ratio']:.1f}배)"
+                )
+                
+                self.stock_found.emit(stock)
+                
+            else:
+                logging.warning(f"{code}: 데이터 로드 실패")
+                
+        except Exception as ex:
+            logging.error(f"_add_to_monitoring({code}): {ex}")
+
+# ==================== 변동성 돌파 전략 ====================
+class VolatilityBreakout:
+    """변동성 돌파 전략"""
+    
+    def __init__(self, trader):
+        self.trader = trader
+        self.K_value = 0.5
+        self.target_prices = {}
+        self.breakout_checked = set()
+    
+    def calculate_target_price(self, code):
+        """목표가 계산"""
+        
+        try:
+            # 일봉 데이터
+            day_data = self.trader.daydata.stockdata.get(code, {})
+            
+            if len(day_data.get('H', [])) < 2:
+                return None
+            
+            # 전일 고가/저가
+            prev_high = day_data['H'][-2]
+            prev_low = day_data['L'][-2]
+            
+            # 당일 시가
+            today_open = day_data['O'][-1]
+            
+            # 변동폭
+            range_value = prev_high - prev_low
+            
+            # 목표가
+            target = today_open + (range_value * self.K_value)
+            
+            self.target_prices[code] = target
+            
+            return target
+            
+        except Exception as ex:
+            logging.error(f"calculate_target_price({code}): {ex}")
+            return None
+    
+    def check_breakout(self, code):
+        """돌파 확인"""
+        
+        try:
+            # 이미 체크했으면 스킵
+            if code in self.breakout_checked:
+                return False
+            
+            # 목표가 계산
+            if code not in self.target_prices:
+                target = self.calculate_target_price(code)
+                if not target:
+                    return False
+            else:
+                target = self.target_prices[code]
+            
+            # 현재가
+            tick_latest = self.trader.tickdata.get_latest_data(code)
+            current_price = tick_latest.get('C', 0)
+            
+            if current_price == 0:
+                return False
+            
+            # 돌파 확인
+            if current_price >= target:
+                # 거래량 확인
+                volume_ratio = self._get_volume_ratio(code)
+                
+                if volume_ratio >= 1.5:
+                    self.breakout_checked.add(code)
+                    
+                    logging.info(
+                        f"{cpCodeMgr.CodeToName(code)}({code}): "
+                        f"변동성 돌파 (목표: {target:.0f}, "
+                        f"현재: {current_price:.0f}, "
+                        f"거래량비: {volume_ratio:.1f}배)"
+                    )
+                    
+                    return True
+            
+            return False
+            
+        except Exception as ex:
+            logging.error(f"check_breakout({code}): {ex}")
+            return False
+    
+    def _get_volume_ratio(self, code):
+        """거래량 비율"""
+        try:
+            day_data = self.trader.daydata.stockdata.get(code, {})
+            
+            if len(day_data.get('V', [])) < 2:
+                return 0
+            
+            today_vol = day_data['V'][-1]
+            prev_vol = day_data['V'][-2]
+            
+            if prev_vol > 0:
+                return today_vol / prev_vol
+            return 0
+        except:
+            return 0
+
+# ==================== 갭 상승 전략 ====================
+class GapUpScanner:
+    """갭 상승 종목 스캔"""
+    
+    def __init__(self, trader):
+        self.trader = trader
+        self.gap_stocks = []
+        self.cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
+    
+    def scan_gap_up_stocks(self):
+        """09:00 갭 상승 종목 스캔"""
+        
+        try:
+            now = datetime.now()
+            if now.hour != 9 or now.minute > 5:
+                logging.warning("갭 상승 스캔은 09:00-09:05에만 가능")
+                return
+            
+            logging.info("=== 갭 상승 스캔 시작 ===")
+            
+            code_list = cpCodeMgr.GetStockListByMarket(2)
+            
+            scan_count = 0
+            max_scan = 150
+            
+            for code in code_list:
+                if scan_count >= max_scan:
+                    break
+                
+                # 이미 모니터링 중이면 스킵
+                if code in self.trader.monistock_set:
+                    continue
+                
+                # API 제한
+                api_limiter.wait_if_needed()
+                
+                gap_pct = self._calculate_gap(code)
+                
+                # 갭 상승 1.5% ~ 4%
+                if 1.5 <= gap_pct <= 4.0:
+                    stock_data = {
+                        'code': code,
+                        'gap_pct': gap_pct,
+                        'name': cpCodeMgr.CodeToName(code)
+                    }
+                    self.gap_stocks.append(stock_data)
+                
+                scan_count += 1
+            
+            # 모니터링 추가
+            for stock in self.gap_stocks[:5]:
+                self._add_to_monitoring(stock)
+            
+            logging.info(f"갭 상승 종목: {len(self.gap_stocks)}개, 추가: {min(5, len(self.gap_stocks))}개")
+            
+        except Exception as ex:
+            logging.error(f"scan_gap_up_stocks: {ex}\n{traceback.format_exc()}")
+    
+    def _calculate_gap(self, code):
+        """갭 계산"""
+        
+        try:
+            # 일봉 데이터 로드
+            if not self.trader.daydata.select_code(code):
+                return 0
+            
+            day_data = self.trader.daydata.stockdata.get(code, {})
+            
+            if len(day_data.get('C', [])) < 2:
+                return 0
+            
+            prev_close = day_data['C'][-2]
+            today_open = day_data['O'][-1]
+            
+            if prev_close > 0:
+                gap_pct = (today_open - prev_close) / prev_close * 100
+                return gap_pct
+            
+            return 0
+            
+        except:
+            return 0
+    
+    def check_gap_hold(self, code):
+        """갭 유지 확인"""
+        
+        try:
+            day_data = self.trader.daydata.stockdata.get(code, {})
+            
+            if len(day_data.get('O', [])) == 0:
+                return False
+            
+            today_open = day_data['O'][-1]
+            
+            # 현재가
+            tick_latest = self.trader.tickdata.get_latest_data(code)
+            current_price = tick_latest.get('C', 0)
+            
+            # 시가 대비 -0.3% 이내 (갭 유지)
+            if current_price >= today_open * 0.997:
+                return True
+            
+            return False
+            
+        except:
+            return False
+    
+    def _add_to_monitoring(self, stock):
+        """모니터링 추가"""
+        
+        code = stock['code']
+        
+        try:
+            if (self.trader.tickdata.monitor_code(code) and 
+                self.trader.mindata.monitor_code(code)):
+                
+                self.trader.starting_time[code] = datetime.now().strftime('%m/%d %H:%M:%S')
+                
+                # 갭 상승가 기록
+                day_data = self.trader.daydata.stockdata.get(code, {})
+                if len(day_data.get('O', [])) > 0:
+                    self.trader.starting_price[code] = day_data['O'][-1]
+                
+                self.trader.monistock_set.add(code)
+                self.trader.stock_added_to_monitor.emit(code)
+                
+                logging.info(
+                    f"{stock['name']}({code}) -> "
+                    f"갭 상승 추가 (갭: {stock['gap_pct']:.2f}%)"
+                )
+                
+        except Exception as ex:
+            logging.error(f"_add_to_monitoring({code}): {ex}")
+
+# ==================== 기존 CpEvent 클래스 (유지) ====================
 class CpEvent:
     def __init__(self):
         self.last_update_time = None
@@ -140,6 +757,7 @@ class CpEvent:
                             logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> VI 발동")
                             self.caller.monitor_vi(time, code, event2)
             return
+        
         if self.name == 'stockcur':
             code = self.client.GetHeaderValue(0)
             timess = self.client.GetHeaderValue(18)
@@ -151,6 +769,7 @@ class CpEvent:
                 item = {'code': code, 'time': timess, 'cur': cprice, 'vol': cVol}
                 self.caller.updateCurData(item)
             return
+        
         if self.name == 'cssalert':
             stgid = self.client.GetHeaderValue(0)
             stgmonid = self.client.GetHeaderValue(1)
@@ -164,6 +783,7 @@ class CpEvent:
             if inoutflag == ord('1') and combined_datetime < combined_datetime.replace(hour=15, minute=15, second=0):
                 self.caller.checkRealtimeStg(stgid, stgmonid, code, stgprice, time)
             return
+        
         if self.name == 'conclusion':
             conflag = self.client.GetHeaderValue(14)
             ordernum = self.client.GetHeaderValue(5)
@@ -176,6 +796,7 @@ class CpEvent:
             conflags = {"1": "체결", "2": "확인", "3": "거부", "4": "접수"}.get(conflag, "")
             self.caller.monitorOrderStatus(code, ordernum, conflags, price, qty, bs, balance, buyprice)
 
+# ==================== 기존 Publish 클래스들 (유지) ====================
 class CpPublish:
     def __init__(self, name, service_id):
         self.name = name
@@ -258,6 +879,7 @@ class CpRequest:
             if self.caller and hasattr(self.caller, 'cp_request'):
                 self.caller.cp_request.is_requesting = False
 
+# ==================== 기존 CpStrategy (유지) ====================
 class CpStrategy:
     def __init__(self, trader):
         self.monList = {}
@@ -401,13 +1023,13 @@ class CpStrategy:
 
         self.objpb.Unsubscribe()
 
+# ==================== CpIndicators (유지) ====================
 class CpIndicators:
     def __init__(self, chart_type):
         self.chart_type = chart_type
         self.params = self._get_default_params()
     
     def _get_default_params(self):
-        """지표별 기본 파라미터 정의"""
         if self.chart_type == 'T':
             return {
                 'MA_PERIODS': [5, 20, 60, 120],
@@ -440,7 +1062,6 @@ class CpIndicators:
         return {}
     
     def _validate_data(self, chart_data, min_length):
-        """데이터 유효성 검증"""
         required_keys = ['C', 'H', 'L', 'V', 'D', 'T']
         for key in required_keys:
             if key not in chart_data:
@@ -450,7 +1071,6 @@ class CpIndicators:
         return True
     
     def _fill_nan(self, data, method='smart'):
-        """스마트한 NaN 처리"""
         if method == 'smart':
             series = pd.Series(data)
             filled = series.fillna(method='ffill').fillna(method='bfill').fillna(0)
@@ -459,7 +1079,6 @@ class CpIndicators:
             return np.nan_to_num(data, nan=0.0).tolist()
     
     def _get_default_result(self, indicator_type, length):
-        """데이터 부족 시 기본값 반환"""
         default_value = [0] * length
         
         if indicator_type == 'MA':
@@ -726,7 +1345,8 @@ class CpIndicators:
         except Exception as ex:
             logging.error(f"make_indicator -> {code}, {indicator_type}{self.chart_type} {ex}\n{traceback.format_exc()}")
             return self._get_default_result(indicator_type, len(chart_data.get('C', [])))
-       
+
+# ==================== CpData (체결강도 추가) ====================
 class CpData(QObject):
     def __init__(self, interval, chart_type, number, trader):
         super().__init__()
@@ -747,6 +1367,11 @@ class CpData(QObject):
         self.last_indicator_update = {}
         self.indicator_update_interval = 1.0
         self.latest_snapshot = {}
+        
+        # 체결강도 계산용
+        self.buy_volumes = {}
+        self.sell_volumes = {}
+        self.strength_cache = {}
 
         now = time.localtime()
         self.todayDate = now.tm_year * 10000 + now.tm_mon * 100 + now.tm_mday
@@ -754,6 +1379,32 @@ class CpData(QObject):
         self.update_data_timer = QTimer()
         self.update_data_timer.timeout.connect(self.periodic_update_data)
         self.update_data_timer.start(10000)
+
+    def get_strength(self, code):
+        """체결강도 반환 (매수세 / 매도세 * 100)"""
+        
+        # 캐시 확인 (1초)
+        if code in self.strength_cache:
+            cached_strength, cached_time = self.strength_cache[code]
+            if time.time() - cached_time < 1.0:
+                return cached_strength
+        
+        with self.stockdata_lock:
+            if code not in self.buy_volumes or len(self.buy_volumes[code]) < 3:
+                return 100
+            
+            total_buy = sum(self.buy_volumes[code])
+            total_sell = sum(self.sell_volumes[code])
+            
+            if total_sell > 0:
+                strength = (total_buy / total_sell) * 100
+            else:
+                strength = 200
+            
+            # 캐시 저장
+            self.strength_cache[code] = (strength, time.time())
+            
+            return strength
 
     def periodic_update_data(self):
         try:
@@ -848,6 +1499,10 @@ class CpData(QObject):
                 'C_MAM5_DIFF': [], 'C_ABOVE_MAM5': [], 'VWAP': [], 
                 'MAT5_CHANGE': [], 'MAT20_CHANGE': [], 'MAT60_CHANGE': [], 'MAT120_CHANGE': []
             }
+            
+            # 체결강도 초기화
+            self.buy_volumes[code] = deque(maxlen=10)
+            self.sell_volumes[code] = deque(maxlen=10)
 
             success = self.update_chart_data_from_market_open(code)
             
@@ -902,6 +1557,12 @@ class CpData(QObject):
                     del self.last_indicator_update[code]
                 if code in self.latest_snapshot:
                     del self.latest_snapshot[code]
+                if code in self.buy_volumes:
+                    del self.buy_volumes[code]
+                if code in self.sell_volumes:
+                    del self.sell_volumes[code]
+                if code in self.strength_cache:
+                    del self.strength_cache[code]
         except Exception as ex:
             logging.error(f"monitor_stop -> {code}, {ex}")
             return False
@@ -909,6 +1570,9 @@ class CpData(QObject):
     def _request_chart_data(self, code, request_type='count', count=None, start_date=None, end_date=None):
         """공통 차트 데이터 요청 로직"""
         try:
+            # API 제한 확인
+            api_limiter.wait_if_needed()
+            
             objRq = win32com.client.Dispatch("CpSysDib.StockChart")
             objRq.SetInputValue(0, code)
             
@@ -1146,7 +1810,7 @@ class CpData(QObject):
                     'RSI': data.get('RSI', [0])[-1] if data.get('RSI') else 0,
                     'RSI_SIGNAL': data.get('RSI_SIGNAL', [0])[-1] if data.get('RSI_SIGNAL') else 0,
                     'MACD': data.get('MACD', [0])[-1] if data.get('MACD') else 0,
-                    'MACD_SIGNAL': data.get('MACD_SIGNAL', [0])[-1] if data.get('MACD_SIGNAL') else 0,
+                    'MACD_SIGNAL': data.get('MACD_SIGNAL', [0])[-1] if data.get('MACD') else 0,
                     'OSC': data.get('OSC', [0])[-1] if data.get('OSC') else 0,
                     'STOCHK': data.get('STOCHK', [0])[-1] if data.get('STOCHK') else 0,
                     'STOCHD': data.get('STOCHD', [0])[-1] if data.get('STOCHD') else 0,
@@ -1205,6 +1869,23 @@ class CpData(QObject):
             cur = item['cur']
             vol = item['vol']
             current_time = time.time()
+            
+            # 체결강도 업데이트 (임시로 거래량 기반)
+            # 실제로는 호가창 데이터가 필요하지만, 여기서는 간단히 구현
+            with self.stockdata_lock:
+                if code in self.buy_volumes:
+                    # 상승시 매수로 간주
+                    if len(self.stockdata.get(code, {}).get('C', [])) > 0:
+                        prev_price = self.stockdata[code]['C'][-1]
+                        if cur > prev_price:
+                            self.buy_volumes[code].append(vol)
+                            self.sell_volumes[code].append(0)
+                        elif cur < prev_price:
+                            self.buy_volumes[code].append(0)
+                            self.sell_volumes[code].append(vol)
+                        else:
+                            self.buy_volumes[code].append(vol / 2)
+                            self.sell_volumes[code].append(vol / 2)
 
             with self.stockdata_lock:
                 if self.chart_type == 'T':
@@ -1322,6 +2003,7 @@ class CpData(QObject):
         except Exception as ex:
             logging.error(f"updateCurData -> {ex}")
 
+# ==================== DatabaseWorker (유지) ====================
 class DatabaseWorker(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
@@ -1466,6 +2148,7 @@ class DatabaseWorker(QObject):
             logging.error(f"{code}: VI 데이터 저장 오류 - {ex}")
             conn.rollback()
 
+# ==================== CTrader (계속) ====================
 class CTrader(QObject):
     stock_added_to_monitor = pyqtSignal(str)
     stock_bought = pyqtSignal(str)
@@ -1760,6 +2443,7 @@ class CTrader(QObject):
             self.highest_price[code] = current_price    
 
     def monitor_vi(self, time, code, event2):
+        """VI 발동 모니터링 (VI 전략 전용)"""
         try:
             if code in self.monistock_set or len(self.monistock_set) >= 10 or code in self.bought_set:
                 return
@@ -1882,6 +2566,7 @@ class CTrader(QObject):
             logging.error(f"monitor_vi -> {code}, {ex}\n{traceback.format_exc()}")
 
     def download_vi(self):
+        """VI 발동 전날 데이터 다운로드"""
         try:
             date = datetime.today() - timedelta(days=1)
             while True:
@@ -2322,6 +3007,454 @@ class CTrader(QObject):
         except Exception as ex:
             logging.error(f"monitorOrderStatus -> {ex}")
 
+# ==================== AutoTraderThread (통합 전략 적용) ====================
+class AutoTraderThread(QThread):
+    """자동매매 스레드 - 통합 전략"""
+    
+    buy_signal = pyqtSignal(str, str, str, str)
+    sell_signal = pyqtSignal(str, str)
+    sell_half_signal = pyqtSignal(str, str)
+    sell_all_signal = pyqtSignal()
+    stock_removed_from_monitor = pyqtSignal(str)
+    counter_updated = pyqtSignal(int)
+    stock_data_updated = pyqtSignal(list)
+
+    def __init__(self, trader, window):
+        super().__init__()
+        
+        self.trader = trader
+        self.window = window
+        
+        self.running = True
+        self.sell_all_emitted = False
+        
+        self.counter = 0
+        
+        # 변동성 돌파 전략 추가
+        self.volatility_strategy = None
+
+    def set_volatility_strategy(self, strategy):
+        """변동성 돌파 전략 설정"""
+        self.volatility_strategy = strategy
+
+    def run(self):
+        """메인 루프"""
+        while self.running:
+            self.autotrade()
+            self.msleep(1000)
+
+    def stop(self):
+        """스레드 정지"""
+        logging.info("AutoTraderThread 정지 시작...")
+        self.running = False
+        
+        self.quit()
+        self.wait()
+        logging.info("AutoTraderThread 정지 완료")
+
+    def autotrade(self):
+        """자동매매 메인 루프"""
+        try:
+            t_now = datetime.now()
+            
+            self.counter += 1
+            self.counter_updated.emit(self.counter)
+            
+            self._update_stock_data_table()
+            
+            if self._is_trading_hours(t_now):
+                self._execute_trading_logic(t_now)
+            elif self._is_market_close_time(t_now):
+                self._handle_market_close()
+                
+        except Exception as ex:
+            logging.error(f"autotrade 오류: {ex}\n{traceback.format_exc()}")
+
+    def _is_trading_hours(self, t_now):
+        """거래 시간인지 확인"""
+        t_0903 = t_now.replace(hour=9, minute=3, second=0, microsecond=0)
+        t_1515 = t_now.replace(hour=15, minute=15, second=0, microsecond=0)
+        return t_0903 < t_now <= t_1515
+
+    def _is_market_close_time(self, t_now):
+        """장 종료 시간인지 확인"""
+        t_1515 = t_now.replace(hour=15, minute=15, second=0, microsecond=0)
+        t_exit = t_now.replace(hour=15, minute=20, second=0, microsecond=0)
+        return t_1515 < t_now < t_exit and not self.sell_all_emitted
+
+    def _update_stock_data_table(self):
+        """주식 데이터 테이블 업데이트"""
+        stock_data_list = []
+        
+        monitored_codes = list(self.trader.monistock_set.copy())
+        
+        for code in monitored_codes:
+            if code not in self.trader.monistock_set:
+                continue
+            
+            tick_latest = self.trader.tickdata.get_latest_data(code)
+            current_price = tick_latest.get('C', 0.0) if tick_latest else 0.0
+            buy_price = self.trader.buy_price.get(code, 0.0)
+            quantity = self.trader.buy_qty.get(code, 0)
+
+            stock_data_list.append({
+                'code': code,
+                'current_price': float(current_price),
+                'upward_probability': 0.0,  # CNN 제거로 0
+                'buy_price': float(buy_price),
+                'quantity': quantity
+            })
+        
+        self.stock_data_updated.emit(stock_data_list)
+
+    def _execute_trading_logic(self, t_now):
+        """거래 로직 실행"""
+        current_strategy = self.window.comboStg.currentText()
+        buy_strategies = [
+            stg for stg in self.window.strategies.get(current_strategy, []) 
+            if stg['key'].startswith('buy')
+        ]
+        sell_strategies = [
+            stg for stg in self.window.strategies.get(current_strategy, []) 
+            if stg['key'].startswith('sell')
+        ]
+        
+        monitored_codes = list(self.trader.monistock_set.copy())
+        
+        for code in monitored_codes:
+            if code not in self.trader.monistock_set:
+                continue
+            
+            try:
+                if code not in self.trader.buyorder_set and code not in self.trader.bought_set:
+                    self._evaluate_buy_condition(code, t_now, current_strategy, buy_strategies)
+                
+                elif (code in self.trader.bought_set and 
+                      code not in self.trader.buyorder_set and 
+                      code not in self.trader.sellorder_set):
+                    self._evaluate_sell_condition(code, t_now, current_strategy, sell_strategies)
+                    
+            except Exception as ex:
+                logging.error(f"{code} 거래 로직 오류: {ex}")
+
+    def _handle_market_close(self):
+        """장 종료 처리"""
+        if self.trader.buyorder_set or self.trader.sellorder_set:
+            return
+        
+        if self.trader.bought_set:
+            logging.info("보유 주식 전부 매도")
+            self.sell_all_signal.emit()
+        
+        self.sell_all_emitted = True
+
+    def _evaluate_buy_condition(self, code, t_now, strategy, buy_strategies):
+        """매수 조건 평가 - 통합 전략"""
+        tick_latest = self.trader.tickdata.get_latest_data(code)
+        min_latest = self.trader.mindata.get_latest_data(code)
+        
+        if not tick_latest or not min_latest:
+            return
+        
+        if tick_latest.get('MAT5', 0) == 0:
+            logging.debug(f"{code}: 지표 준비 미완료")
+            return
+        
+        if self._should_remove_from_monitor(code, tick_latest, min_latest, t_now):
+            return
+        
+        # ===== 통합 전략: 여러 조건 체크 =====
+        buy_signal = False
+        buy_reason = ""
+        
+        # 1. 급등주 모멘텀 조건
+        if self._check_momentum_buy(code, tick_latest, min_latest):
+            buy_signal = True
+            buy_reason = "급등 모멘텀"
+        
+        # 2. 변동성 돌파 조건
+        elif self.volatility_strategy and self.volatility_strategy.check_breakout(code):
+            buy_signal = True
+            buy_reason = "변동성 돌파"
+        
+        # 3. 갭 상승 조건 (갭 스캐너에서 추가된 종목)
+        elif hasattr(self.window, 'gap_scanner') and code in [s['code'] for s in self.window.gap_scanner.gap_stocks]:
+            if self.window.gap_scanner.check_gap_hold(code):
+                if self._check_momentum_buy(code, tick_latest, min_latest):
+                    buy_signal = True
+                    buy_reason = "갭 상승 유지"
+        
+        # 4. 사용자 정의 전략
+        elif self._evaluate_strategy_conditions(code, buy_strategies, tick_latest, min_latest):
+            buy_signal = True
+            buy_reason = "사용자 전략"
+        
+        if buy_signal:
+            self.buy_signal.emit(code, buy_reason, "0", "03")
+
+    def _check_momentum_buy(self, code, tick_latest, min_latest):
+        """급등주 모멘텀 매수 조건"""
+        
+        if len(self.trader.bought_set) >= self.trader.target_buy_count:
+            return False
+        
+        # ===== 1. 체결강도 확인 =====
+        strength = self.trader.tickdata.get_strength(code)
+        if strength < 120:
+            logging.debug(f"{code}: 체결강도 부족 ({strength:.0f})")
+            return False
+        
+        # ===== 2. 모멘텀 점수 계산 =====
+        score = 0
+        
+        # 가격 모멘텀 (0-30점)
+        tick_recent = self.trader.tickdata.get_recent_data(code, 5)
+        C_recent = tick_recent.get('C', [0]*5)
+        
+        if len(C_recent) >= 5 and C_recent[0] > 0:
+            price_momentum = (C_recent[-1] - C_recent[0]) / C_recent[0] * 100
+            
+            if price_momentum > 1.0:
+                score += 30
+            elif price_momentum > 0.5:
+                score += 20
+            elif price_momentum > 0:
+                score += 10
+        
+        # 이평선 추세 (0-25점)
+        MAT5 = tick_latest.get('MAT5', 0)
+        MAT20 = tick_latest.get('MAT20', 0)
+        MAT60 = tick_latest.get('MAT60', 0)
+        C = tick_latest.get('C', 0)
+        
+        if C > MAT5 > MAT20:
+            score += 25
+        elif C > MAT5:
+            score += 15
+        elif MAT5 > MAT20:
+            score += 10
+        
+        # VWAP 대비 위치 (0-20점)
+        VWAP = tick_latest.get('VWAP', 0)
+        if VWAP > 0:
+            if C > VWAP * 1.01:
+                score += 20
+            elif C > VWAP:
+                score += 10
+        
+        # 체결강도 점수 (0-15점)
+        if strength >= 150:
+            score += 15
+        elif strength >= 130:
+            score += 10
+        elif strength >= 120:
+            score += 5
+        
+        # RSI (0-10점)
+        RSIT = tick_latest.get('RSIT', 50)
+        if 50 < RSIT < 70:
+            score += 10
+        elif 40 < RSIT <= 50:
+            score += 5
+        
+        # ===== 3. 시간대별 임계값 =====
+        now = datetime.now()
+        hour = now.hour
+        
+        if hour == 9:
+            threshold = 65  # 장 초반: 낮춤
+        elif hour >= 14:
+            threshold = 85  # 장 후반: 높임
+        else:
+            threshold = 75  # 평상시
+        
+        logging.debug(
+            f"{code}: 매수점수 {score}/{threshold} "
+            f"(체결강도: {strength:.0f})"
+        )
+        
+        return score >= threshold
+
+    def _should_remove_from_monitor(self, code, tick_latest, min_latest, t_now):
+        """투자 대상에서 제거해야 하는지 확인"""
+        min_close = min_latest.get('C', 0)
+        MAM5 = min_latest.get('MAM5', 0)
+        MAM10 = min_latest.get('MAM10', 0)
+        
+        # 급격한 하락
+        if code in self.trader.starting_price:
+            if min_close < self.trader.starting_price[code] * 0.97:
+                if MAM5 < MAM10:
+                    try:
+                        start_time_str = self.trader.starting_time.get(code, '')
+                        if start_time_str:
+                            start_time = datetime.strptime(
+                                f"{datetime.now().year}/{start_time_str}", 
+                                '%Y/%m/%d %H:%M:%S'
+                            )
+                            if t_now - start_time > timedelta(hours=1):
+                                logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 투자 대상 제거 (하락)")
+                                self.stock_removed_from_monitor.emit(code)
+                                return True
+                    except Exception as ex:
+                        logging.error(f"{code} 시작 시각 파싱 오류: {ex}")
+        
+        # 상한가 체크
+        min_high_recent = min_latest.get('H_recent', [0, 0])
+        min_low_recent = min_latest.get('L_recent', [0, 0])
+        
+        if len(min_high_recent) >= 2 and len(min_low_recent) >= 2:
+            if all(h == l for h, l in zip(min_high_recent[-2:], min_low_recent[-2:])):
+                logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 투자 대상 제거 (상한가)")
+                self.stock_removed_from_monitor.emit(code)
+                return True
+        
+        return False
+
+    def _evaluate_strategy_conditions(self, code, strategies, tick_latest, min_latest):
+        """전략별 조건 평가"""
+        if not strategies:
+            return False
+        
+        tick_data_full = self.trader.tickdata.get_recent_data(code, 10)
+        min_data_full = self.trader.mindata.get_recent_data(code, 10)
+        
+        tick_close_price = tick_data_full.get('C', [0])
+        MAT5 = tick_data_full.get('MAT5', [0])
+        MAT20 = tick_data_full.get('MAT20', [0])
+        MAT60 = tick_data_full.get('MAT60', [0])
+        RSIT = tick_data_full.get('RSIT', [0])
+        OSCT = tick_data_full.get('OSCT', [0])
+        bb_upper = tick_data_full.get('BB_UPPER', [0])
+        
+        min_close_price = min_data_full.get('C', [0])
+        MAM5 = min_data_full.get('MAM5', [0])
+        MAM10 = min_data_full.get('MAM10', [0])
+        RSI = min_data_full.get('RSI', [0])
+        OSC = min_data_full.get('OSC', [0])
+        VWAP = min_data_full.get('VWAP', [0])
+        
+        min_close_recent = min_data_full.get('C', [0, 0])[-2:]
+        min_open_recent = min_data_full.get('O', [0, 0])[-2:]
+        positive_candle = all(
+            min_close_recent[i] > min_open_recent[i] 
+            for i in range(min(2, len(min_close_recent), len(min_open_recent)))
+        )
+        
+        for strategy in strategies:
+            try:
+                condition = strategy.get('content', '')
+                if eval(condition):
+                    logging.debug(f"{code}: {strategy.get('name')} 조건 만족")
+                    return True
+            except Exception as ex:
+                logging.error(f"{code} 전략 평가 오류: {ex}")
+        
+        return False
+
+    def _evaluate_sell_condition(self, code, t_now, strategy, sell_strategies):
+        """매도 조건 평가 - 개선된 버전"""
+        tick_latest = self.trader.tickdata.get_latest_data(code)
+        min_latest = self.trader.mindata.get_latest_data(code)
+        
+        if not tick_latest or not min_latest:
+            return
+        
+        tick_close = tick_latest.get('C', 0)
+        
+        self.trader.update_highest_price(code, tick_close)
+        
+        buy_price = self.trader.buy_price.get(code, 0)
+        if buy_price == 0:
+            return
+        
+        # ===== 수익률 계산 =====
+        current_profit_pct = (tick_close / buy_price - 1) * 100
+        highest_price = self.trader.highest_price.get(code, buy_price)
+        from_peak_pct = (tick_close / highest_price - 1) * 100
+        
+        # ===== 보유 시간 계산 =====
+        buy_time_str = self.trader.starting_time.get(code)
+        if buy_time_str:
+            try:
+                buy_time = datetime.strptime(
+                    f"{datetime.now().year}/{buy_time_str}", 
+                    '%Y/%m/%d %H:%M:%S'
+                )
+                hold_minutes = (t_now - buy_time).total_seconds() / 60
+            except:
+                hold_minutes = 0
+        else:
+            hold_minutes = 0
+        
+        # ===== 매도 결정 트리 =====
+        
+        # 1️⃣ 손절매 (-0.7% 고정)
+        if current_profit_pct < -0.7:
+            logging.info(f"{cpCodeMgr.CodeToName(code)}: 손절매 ({current_profit_pct:.2f}%)")
+            self.sell_signal.emit(code, f"손절매 ({current_profit_pct:.2f}%)")
+            return
+        
+        # 2️⃣ 시간 기반 손절 (60분 이상 보유 + 손실)
+        if hold_minutes > 60 and current_profit_pct < 0:
+            logging.info(f"{cpCodeMgr.CodeToName(code)}: 시간 손절 ({hold_minutes:.0f}분)")
+            self.sell_signal.emit(code, "시간 손절")
+            return
+        
+        # 3️⃣ 장 마감 30분 전 (14:45 이후)
+        if t_now >= t_now.replace(hour=14, minute=45, second=0):
+            if current_profit_pct > 0:
+                logging.info(f"{cpCodeMgr.CodeToName(code)}: 장마감 익절 ({current_profit_pct:.2f}%)")
+                self.sell_signal.emit(code, "장마감 익절")
+            else:
+                logging.info(f"{cpCodeMgr.CodeToName(code)}: 장마감 손절 ({current_profit_pct:.2f}%)")
+                self.sell_signal.emit(code, "장마감 손절")
+            return
+        
+        # 4️⃣ 분할 매도 (+1.5% 이상)
+        if current_profit_pct >= 1.5 and code not in self.trader.sell_half_set:
+            logging.info(f"{cpCodeMgr.CodeToName(code)}: 분할 매도 ({current_profit_pct:.2f}%)")
+            self.sell_half_signal.emit(code, f"1.5% 익절")
+            return
+        
+        # 5️⃣ 분할 매도 후 trailing stop (-0.5% 하락)
+        if code in self.trader.sell_half_set:
+            if from_peak_pct < -0.5:
+                logging.info(f"{cpCodeMgr.CodeToName(code)}: 추적 손절 (고점 대비 {from_peak_pct:.2f}%)")
+                self.sell_signal.emit(code, "추적 손절")
+                return
+        
+        # 6️⃣ 고점 대비 trailing stop (-1.0% 하락)
+        if current_profit_pct > 0.5 and from_peak_pct < -1.0:
+            logging.info(f"{cpCodeMgr.CodeToName(code)}: 추적 손절 ({from_peak_pct:.2f}%)")
+            self.sell_signal.emit(code, "추적 손절")
+            return
+        
+        # 7️⃣ 기술적 지표 매도 신호
+        MAM5 = min_latest.get('MAM5', 0)
+        MAM10 = min_latest.get('MAM10', 0)
+        min_close = min_latest.get('C', 0)
+        
+        # 데드크로스
+        if min_close < MAM5 or MAM5 < MAM10:
+            logging.info(f"{cpCodeMgr.CodeToName(code)}: 데드크로스")
+            self.sell_signal.emit(code, "데드크로스")
+            return
+        
+        # OSCT 음전환 (2틱 연속)
+        tick_recent = self.trader.tickdata.get_recent_data(code, 3)
+        OSCT_recent = tick_recent.get('OSCT', [0, 0, 0])
+        if len(OSCT_recent) >= 2:
+            if OSCT_recent[-2] < 0 and OSCT_recent[-1] < 0:
+                logging.info(f"{cpCodeMgr.CodeToName(code)}: OSCT 음전환")
+                self.sell_signal.emit(code, "OSCT 음전환")
+                return
+        
+        # 8️⃣ 전략별 매도 조건
+        if self._evaluate_strategy_conditions(code, sell_strategies, tick_latest, min_latest):
+            self.sell_signal.emit(code, "전략 매도")
+
+# ==================== ChartDrawer 관련 클래스 (유지) ====================
 class ChartDrawerThread(QThread):
     data_ready = pyqtSignal(dict)
 
@@ -2598,302 +3731,11 @@ class ChartDrawer(QObject):
 
         return labels
 
-class AutoTraderThread(QThread):
-    """자동매매 스레드 - CNN 제거 버전"""
-    
-    buy_signal = pyqtSignal(str, str, str, str)
-    sell_signal = pyqtSignal(str, str)
-    sell_half_signal = pyqtSignal(str, str)
-    sell_all_signal = pyqtSignal()
-    stock_removed_from_monitor = pyqtSignal(str)
-    counter_updated = pyqtSignal(int)
-    stock_data_updated = pyqtSignal(list)
-
-    def __init__(self, trader, window):
-        super().__init__()
-        
-        self.trader = trader
-        self.window = window
-        
-        self.running = True
-        self.sell_all_emitted = False
-        
-        self.counter = 0
-
-    def run(self):
-        """메인 루프"""
-        while self.running:
-            self.autotrade()
-            self.msleep(1000)
-
-    def stop(self):
-        """스레드 정지"""
-        logging.info("AutoTraderThread 정지 시작...")
-        self.running = False
-        
-        self.quit()
-        self.wait()
-        logging.info("AutoTraderThread 정지 완료")
-
-    def autotrade(self):
-        """자동매매 메인 루프"""
-        try:
-            t_now = datetime.now()
-            
-            self.counter += 1
-            self.counter_updated.emit(self.counter)
-            
-            self._update_stock_data_table()
-            
-            if self._is_trading_hours(t_now):
-                self._execute_trading_logic(t_now)
-            elif self._is_market_close_time(t_now):
-                self._handle_market_close()
-                
-        except Exception as ex:
-            logging.error(f"autotrade 오류: {ex}\n{traceback.format_exc()}")
-
-    def _is_trading_hours(self, t_now):
-        """거래 시간인지 확인"""
-        t_0903 = t_now.replace(hour=9, minute=3, second=0, microsecond=0)
-        t_1515 = t_now.replace(hour=15, minute=15, second=0, microsecond=0)
-        return t_0903 < t_now <= t_1515
-
-    def _is_market_close_time(self, t_now):
-        """장 종료 시간인지 확인"""
-        t_1515 = t_now.replace(hour=15, minute=15, second=0, microsecond=0)
-        t_exit = t_now.replace(hour=15, minute=20, second=0, microsecond=0)
-        return t_1515 < t_now < t_exit and not self.sell_all_emitted
-
-    def _update_stock_data_table(self):
-        """주식 데이터 테이블 업데이트"""
-        stock_data_list = []
-        
-        monitored_codes = list(self.trader.monistock_set.copy())
-        
-        for code in monitored_codes:
-            if code not in self.trader.monistock_set:
-                continue
-            
-            tick_latest = self.trader.tickdata.get_latest_data(code)
-            current_price = tick_latest.get('C', 0.0) if tick_latest else 0.0
-            buy_price = self.trader.buy_price.get(code, 0.0)
-            quantity = self.trader.buy_qty.get(code, 0)
-
-            stock_data_list.append({
-                'code': code,
-                'current_price': float(current_price),
-                'upward_probability': 0.0,
-                'buy_price': float(buy_price),
-                'quantity': quantity
-            })
-        
-        self.stock_data_updated.emit(stock_data_list)
-
-    def _execute_trading_logic(self, t_now):
-        """거래 로직 실행"""
-        current_strategy = self.window.comboStg.currentText()
-        buy_strategies = [
-            stg for stg in self.window.strategies.get(current_strategy, []) 
-            if stg['key'].startswith('buy')
-        ]
-        sell_strategies = [
-            stg for stg in self.window.strategies.get(current_strategy, []) 
-            if stg['key'].startswith('sell')
-        ]
-        
-        monitored_codes = list(self.trader.monistock_set.copy())
-        
-        for code in monitored_codes:
-            if code not in self.trader.monistock_set:
-                continue
-            
-            try:
-                if code not in self.trader.buyorder_set and code not in self.trader.bought_set:
-                    self._evaluate_buy_condition(code, t_now, current_strategy, buy_strategies)
-                
-                elif (code in self.trader.bought_set and 
-                      code not in self.trader.buyorder_set and 
-                      code not in self.trader.sellorder_set):
-                    self._evaluate_sell_condition(code, t_now, current_strategy, sell_strategies)
-                    
-            except Exception as ex:
-                logging.error(f"{code} 거래 로직 오류: {ex}")
-
-    def _handle_market_close(self):
-        """장 종료 처리"""
-        if self.trader.buyorder_set or self.trader.sellorder_set:
-            return
-        
-        if self.trader.bought_set:
-            logging.info("보유 주식 전부 매도")
-            self.sell_all_signal.emit()
-        
-        self.sell_all_emitted = True
-
-    def _evaluate_buy_condition(self, code, t_now, strategy, buy_strategies):
-        """매수 조건 평가"""
-        tick_latest = self.trader.tickdata.get_latest_data(code)
-        min_latest = self.trader.mindata.get_latest_data(code)
-        
-        if not tick_latest or not min_latest:
-            return
-        
-        if tick_latest.get('MAT5', 0) == 0:
-            logging.debug(f"{code}: 지표 준비 미완료")
-            return
-        
-        if self._should_remove_from_monitor(code, tick_latest, min_latest, t_now):
-            return
-        
-        if self._check_buy_conditions(code, strategy, tick_latest, min_latest, buy_strategies):
-            self.buy_signal.emit(code, "매수 신호", "0", "03")
-
-    def _should_remove_from_monitor(self, code, tick_latest, min_latest, t_now):
-        """투자 대상에서 제거해야 하는지 확인"""
-        min_close = min_latest.get('C', 0)
-        MAM5 = min_latest.get('MAM5', 0)
-        MAM10 = min_latest.get('MAM10', 0)
-        
-        if code in self.trader.starting_price:
-            if min_close < self.trader.starting_price[code] * 0.99 and MAM5 < MAM10:
-                try:
-                    vi_time = datetime.strptime(
-                        f"{datetime.now().year}/{self.trader.starting_time[code]}", 
-                        '%Y/%m/%d %H:%M:%S'
-                    )
-                    if t_now - vi_time > timedelta(hours=1):
-                        logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 투자 대상 제거 (하락)")
-                        self.stock_removed_from_monitor.emit(code)
-                        return True
-                except Exception as ex:
-                    logging.error(f"{code} VI 시각 파싱 오류: {ex}")
-        
-        min_high_recent = min_latest.get('H_recent', [0, 0])
-        min_low_recent = min_latest.get('L_recent', [0, 0])
-        
-        if len(min_high_recent) >= 2 and len(min_low_recent) >= 2:
-            if all(h == l for h, l in zip(min_high_recent[-2:], min_low_recent[-2:])):
-                logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 투자 대상 제거 (상한가)")
-                self.stock_removed_from_monitor.emit(code)
-                return True
-        
-        return False
-
-    def _check_buy_conditions(self, code, strategy, tick_latest, min_latest, buy_strategies):
-        """매수 조건 종합 체크"""
-        if len(self.trader.bought_set) >= self.trader.target_buy_count:
-            return False
-        
-        min_close = min_latest.get('C', 0)
-        MAM5 = min_latest.get('MAM5', 0)
-        MAM10 = min_latest.get('MAM10', 0)
-        MAT5 = tick_latest.get('MAT5', 0)
-        MAT20 = tick_latest.get('MAT20', 0)
-        MAT60 = tick_latest.get('MAT60', 0)
-        MAT120 = tick_latest.get('MAT120', 0)
-        
-        tick_recent = self.trader.tickdata.get_recent_data(code, 3)
-        MACDT_SIGNAL = tick_recent.get('MACDT_SIGNAL', [0, 0, 0])
-        OSCT = tick_recent.get('OSCT', [0, 0, 0])
-        
-        macdt_increasing = (len(MACDT_SIGNAL) >= 2 and 
-                           MACDT_SIGNAL[-1] > MACDT_SIGNAL[-2])
-        osct_positive = all(x > 0 for x in OSCT[-2:])
-        
-        min_close_recent = min_latest.get('C_recent', [0, 0])
-        min_open_recent = min_latest.get('O_recent', [0, 0])
-        positive_candle = all(
-            min_close_recent[i] > min_open_recent[i] 
-            for i in range(min(2, len(min_close_recent), len(min_open_recent)))
-        )
-        
-        if strategy == "VI 발동":
-            return (min_close > MAM5 > MAM10 and
-                    MAT5 > MAT20 and
-                    MAT60 > MAT120 and
-                    macdt_increasing and
-                    osct_positive and
-                    positive_candle)
-        
-        return self._evaluate_strategy_conditions(code, buy_strategies, tick_latest, min_latest)
-
-    def _evaluate_strategy_conditions(self, code, strategies, tick_latest, min_latest):
-        """전략별 조건 평가"""
-        if not strategies:
-            return False
-        
-        tick_data_full = self.trader.tickdata.get_recent_data(code, 10)
-        min_data_full = self.trader.mindata.get_recent_data(code, 10)
-        
-        tick_close_price = tick_data_full.get('C', [0])
-        MAT5 = tick_data_full.get('MAT5', [0])
-        MAT20 = tick_data_full.get('MAT20', [0])
-        MAT60 = tick_data_full.get('MAT60', [0])
-        RSIT = tick_data_full.get('RSIT', [0])
-        OSCT = tick_data_full.get('OSCT', [0])
-        bb_upper = tick_data_full.get('BB_UPPER', [0])
-        
-        min_close_price = min_data_full.get('C', [0])
-        MAM5 = min_data_full.get('MAM5', [0])
-        MAM10 = min_data_full.get('MAM10', [0])
-        RSI = min_data_full.get('RSI', [0])
-        OSC = min_data_full.get('OSC', [0])
-        VWAP = min_data_full.get('VWAP', [0])
-        
-        min_close_recent = min_data_full.get('C', [0, 0])[-2:]
-        min_open_recent = min_data_full.get('O', [0, 0])[-2:]
-        positive_candle = all(
-            min_close_recent[i] > min_open_recent[i] 
-            for i in range(min(2, len(min_close_recent), len(min_open_recent)))
-        )
-        
-        for strategy in strategies:
-            try:
-                condition = strategy.get('content', '')
-                if eval(condition):
-                    logging.debug(f"{code}: {strategy.get('name')} 조건 만족")
-                    return True
-            except Exception as ex:
-                logging.error(f"{code} 전략 평가 오류: {ex}")
-        
-        return False
-
-    def _evaluate_sell_condition(self, code, t_now, strategy, sell_strategies):
-        """매도 조건 평가"""
-        tick_latest = self.trader.tickdata.get_latest_data(code)
-        min_latest = self.trader.mindata.get_latest_data(code)
-        
-        if not tick_latest or not min_latest:
-            return
-        
-        tick_close = tick_latest.get('C', 0)
-        
-        self.trader.update_highest_price(code, tick_close)
-        
-        buy_price = self.trader.buy_price.get(code, 0)
-        if buy_price == 0:
-            return
-        
-        self.stock_rate = (tick_close / buy_price - 1) * 100
-        
-        if self.stock_rate < -0.5:
-            logging.info(f"{cpCodeMgr.CodeToName(code)}({code}): 손절매")
-            self.sell_signal.emit(code, "손절매")
-            return
-        
-        if self.stock_rate > 1.0 and code not in self.trader.sell_half_set:
-            logging.info(f"{cpCodeMgr.CodeToName(code)}({code}): 분할 매도")
-            self.sell_half_signal.emit(code, "1.0% 초과")
-            return
-        
-        if self._evaluate_strategy_conditions(code, sell_strategies, tick_latest, min_latest):
-            self.sell_signal.emit(code, "전략 매도")
-
+# ==================== LoginHandler ====================
 class LoginHandler:
     def __init__(self, parent_window):
         self.parent = parent_window
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(interpolation=None)
         self.config_file = 'settings.ini'
         self.process = None
         self.slack = None
@@ -2970,6 +3812,7 @@ class LoginHandler:
         except Exception as e:
             logging.error(f"모의투자 접속 버튼 클릭 실패: {e}")
 
+# ==================== MyWindow ====================
 class MyWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -2980,9 +3823,15 @@ class MyWindow(QWidget):
         self.login_handler.load_settings()
         self.login_handler.attempt_auto_login()
         self.update_chart_status_timer = None
+        
+        # 통합 전략 객체들
+        self.momentum_scanner = None
+        self.gap_scanner = None
+        self.volatility_strategy = None
 
     def __del__(self):
-        self.objstg.Clear()
+        if hasattr(self, 'objstg'):
+            self.objstg.Clear()
 
     def post_login_setup(self):
         logger = logging.getLogger()
@@ -2990,6 +3839,7 @@ class MyWindow(QWidget):
             text_edit_logger = QTextEditLogger(self.terminalOutput)
             text_edit_logger.setLevel(logging.INFO)
             logger.addHandler(text_edit_logger)
+        
         buycount = int(self.buycountEdit.text())
         self.trader = CTrader(cpTrade, cpBalance, cpCodeMgr, cpCash, cpOrder, cpStock, buycount, self)
         self.objstg = CpStrategy(self.trader)
@@ -3295,6 +4145,13 @@ class MyWindow(QWidget):
                         sell_strategy['key'] = sell_key
                         self.strategies[investment_strategy].append(sell_strategy)
 
+            # 통합 전략 추가
+            if "통합 전략" not in existing_stgnames:
+                self.login_handler.config.set('STRATEGIES', 'stg_integrated', "통합 전략")
+                existing_stgnames.add("통합 전략")
+                with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
+                    self.login_handler.config.write(configfile)
+
             self.comboStg.blockSignals(True)
             for stgname in existing_stgnames:
                 self.comboStg.addItem(stgname)
@@ -3319,11 +4176,16 @@ class MyWindow(QWidget):
         if not self.is_loading_strategy:
             self.sell_all_item()
             self.trader.clear_list_db('mylist.db')
-            
+        
+        # 기존 전략 객체 정리
+        if self.momentum_scanner:
+            self.momentum_scanner.stop_screening()
+            self.momentum_scanner = None
+        
+        # ===== 전략별 초기화 =====
         if stgName == 'VI 발동':
             self.objstg.Clear()
-
-            logging.info(f"전략 초기화")
+            logging.info(f"전략 초기화: VI 발동")
             
             self.trader.init_stock_balance()
             self.trader.load_from_list_db('mylist.db')
@@ -3349,16 +4211,61 @@ class MyWindow(QWidget):
                 self.pb9619.Unsubscribe()
             self.objstg.Clear()
             
-            logging.info(f"전략 초기화")
-
+            logging.info(f"전략 초기화: VI 발동 D1")
             self.trader.init_stock_balance()
             self.trader.download_vi()
 
+        elif stgName == "통합 전략":
+            # 통합 전략 초기화
+            if hasattr(self, 'pb9619'):
+                self.pb9619.Unsubscribe()
+            self.objstg.Clear()
+            
+            logging.info(f"=== 통합 전략 시작 ===")
+            self.trader.init_stock_balance()
+            
+            # 1. 급등주 스캐너
+            self.momentum_scanner = MomentumScanner(self.trader)
+            self.momentum_scanner.stock_found.connect(self.on_momentum_stock_found)
+            self.momentum_scanner.start_screening()
+            logging.info("급등주 스캐너 시작")
+            
+            # 2. 갭 상승 스캐너
+            self.gap_scanner = GapUpScanner(self.trader)
+            now = datetime.now()
+            scan_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            if now < scan_time:
+                delay = (scan_time - now).total_seconds() * 1000
+                QTimer.singleShot(int(delay), self.gap_scanner.scan_gap_up_stocks)
+                logging.info(f"갭 상승 스캔 {int(delay/1000)}초 후 시작 예정")
+            elif now.hour == 9 and now.minute < 10:
+                self.gap_scanner.scan_gap_up_stocks()
+            
+            # 3. 변동성 돌파 전략
+            self.volatility_strategy = VolatilityBreakout(self.trader)
+            self.trader_thread.set_volatility_strategy(self.volatility_strategy)
+            logging.info("변동성 돌파 전략 활성화")
+            
+            # 기존 데이터베이스에서 복원
+            self.trader.load_from_list_db('mylist.db')
+            for code in list(self.trader.database_set):
+                if code not in self.trader.monistock_set:
+                    if self.trader.daydata.select_code(code) and self.trader.tickdata.monitor_code(code) and self.trader.mindata.monitor_code(code):
+                        if code not in self.trader.starting_time:
+                            self.trader.starting_time[code] = datetime.now().strftime('%m/%d 09:00:00')
+                        self.trader.monistock_set.add(code)
+                        self.firstListBox.addItem(code)
+                    else:
+                        self.trader.daydata.monitor_stop(code)
+                        self.trader.mindata.monitor_stop(code)
+                        self.trader.tickdata.monitor_stop(code)
+
         else:
+            # 기타 사용자 정의 전략
             if hasattr(self, 'pb9619'):
                 self.pb9619.Unsubscribe()
 
-            logging.info(f"전략 초기화")
+            logging.info(f"전략 초기화: {stgName}")
             self.trader.init_stock_balance()
             self.trader.load_from_list_db('mylist.db')
             for code in list(self.trader.database_set):
@@ -3374,30 +4281,31 @@ class MyWindow(QWidget):
                         self.trader.mindata.monitor_stop(code)
                         self.trader.tickdata.monitor_stop(code)
             
-            item = self.data8537[stgName]
-            id = item['ID']
-            name = item['전략명']
-            if name != '급등주':
-                ret, self.dataStg = self.objstg.requestStgID(id)
-                if ret == False :
-                    return
-                for s in self.dataStg:
-                    if self.trader.daydata.select_code(s['code']) and self.trader.tickdata.monitor_code(s['code']) and self.trader.mindata.monitor_code(s['code']):
-                        if s['code'] not in self.trader.starting_time:
-                            self.trader.starting_time[s['code']] = datetime.now().strftime('%m/%d 09:00:00')
-                        self.trader.monistock_set.add(s['code'])
-                        self.firstListBox.addItem(s['code'])
-                    else:
-                        self.trader.daydata.monitor_stop(s['code'])
-                        self.trader.mindata.monitor_stop(s['code'])
-                        self.trader.tickdata.monitor_stop(s['code'])
+            item = self.data8537.get(stgName)
+            if item:
+                id = item['ID']
+                name = item['전략명']
+                if name != '급등주':
+                    ret, self.dataStg = self.objstg.requestStgID(id)
+                    if ret == False:
+                        return
+                    for s in self.dataStg:
+                        if self.trader.daydata.select_code(s['code']) and self.trader.tickdata.monitor_code(s['code']) and self.trader.mindata.monitor_code(s['code']):
+                            if s['code'] not in self.trader.starting_time:
+                                self.trader.starting_time[s['code']] = datetime.now().strftime('%m/%d 09:00:00')
+                            self.trader.monistock_set.add(s['code'])
+                            self.firstListBox.addItem(s['code'])
+                        else:
+                            self.trader.daydata.monitor_stop(s['code'])
+                            self.trader.mindata.monitor_stop(s['code'])
+                            self.trader.tickdata.monitor_stop(s['code'])
 
-            ret, monid = self.objstg.requestMonitorID(id)
-            if ret == False:
-                return
-            ret, status = self.objstg.requestStgControl(id, monid, True, stgName)
-            if ret == False:
-                return
+                ret, monid = self.objstg.requestMonitorID(id)
+                if ret == False:
+                    return
+                ret, status = self.objstg.requestStgControl(id, monid, True, stgName)
+                if ret == False:
+                    return
             
         logging.info(f"{stgName} 전략 감시 시작")
 
@@ -3419,6 +4327,11 @@ class MyWindow(QWidget):
             if self.comboSellStg.count() > 0:
                 self.comboSellStg.setCurrentIndex(0)
                 self.sellStgChanged()
+
+    @pyqtSlot(dict)
+    def on_momentum_stock_found(self, stock):
+        """급등주 발견 시 처리"""
+        logging.info(f"급등주 발견: {stock['name']}({stock['code']}) - 점수: {stock['score']}")
 
     def buyStgChanged(self):
         try:
@@ -3619,6 +4532,10 @@ class MyWindow(QWidget):
         if reply == QMessageBox.Yes:
             self.save_last_stg()
 
+            # 전략 객체 정리
+            if self.momentum_scanner:
+                self.momentum_scanner.stop_screening()
+            
             if hasattr(self.trader, 'db_worker'):
                 self.trader.db_worker.stop()
                 self.trader.db_thread.quit()
@@ -3671,7 +4588,7 @@ class MyWindow(QWidget):
                     logging.warning(f"Killed  {proc.info['name']} (PID: {proc.info['pid']})")
 
     def init_ui(self):
-        self.setWindowTitle("초단타 매매 프로그램 v2.3")
+        self.setWindowTitle("초단타 매매 프로그램 v3.0 - 통합전략")
         self.setGeometry(0, 0, 1900, 980)
 
         loginLayout = QVBoxLayout()
@@ -3866,6 +4783,7 @@ class MyWindow(QWidget):
         self.saveBuyStgButton.clicked.connect(self.save_buystrategy)
         self.saveSellStgButton.clicked.connect(self.save_sellstrategy)
 
+# ==================== QTextEditLogger ====================
 class QTextEditLogger(QObject, logging.Handler):
     log_signal = pyqtSignal(str)
 
@@ -3892,6 +4810,7 @@ class QTextEditLogger(QObject, logging.Handler):
 
         self.log_signal.emit(msg)
 
+# ==================== Main ====================
 if __name__ == "__main__":
     setup_logging()
 
