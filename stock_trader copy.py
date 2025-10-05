@@ -3735,7 +3735,7 @@ class ChartDrawer(QObject):
 class LoginHandler:
     def __init__(self, parent_window):
         self.parent = parent_window
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(interpolation=None)
         self.config_file = 'settings.ini'
         self.process = None
         self.slack = None

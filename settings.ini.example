@@ -16,6 +16,7 @@ stg_1 = VI 발동
 stg_2 = VI 발동 D1
 stg_3 = 전일상한가
 stg_4 = 급등주
+stg_integrated = 통합 전략
 
 [VI 발동]
 buy_stg_1 = {"name": "골든크로스", "content": "(MAT5[-1] > MAT20[-1] > MAT60[-1]) and (min_close_price[-1] > MAM5[-1] > MAM10[-1]) and (OSCT[-1] > 0) and RSIT[-1] > 60 and (OSC[-1] > 0) and RSI[-1] > 60 and (tick_close_price[-1] > bb_upper[-1] * 1.02) and positive_candle and (min_close_price[-1] > VWAP[-1])"}
@@ -39,6 +40,14 @@ sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip
 sell_stg_2 = {"name": "데드크로스", "content": "(min_close_price[-1] < MAM5[-1]) or (MAT5[-1] < MAT20[-1])"}
 sell_stg_3 = {"name": "OSCT 음수 전환", "content": "(OSCT[-2] < OSCT[-1] < 0)"}
 sell_stg_4 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.993 and self.stock_rate > 0.3"}
+
+[통합 전략]
+buy_stg_1 = {"name": "급등주 모멘텀", "content": "# 급등주 모멘텀 매수 조건\\n# 체결강도 120 이상\\n# 가격 모멘텀 양수\\n# MAT5 > MAT20\\n# RSI 50~70\\n# 자동으로 점수 계산하여 임계값 이상시 매수"}
+buy_stg_2 = {"name": "변동성 돌파", "content": "# 변동성 돌파 매수 조건\\n# 목표가 = 시가 + (전일 고가-저가) * 0.5\\n# 현재가 >= 목표가\\n# 거래량 >= 전일 대비 1.5배\\n# 자동으로 감지하여 매수"}
+buy_stg_3 = {"name": "갭 상승", "content": "# 갭 상승 매수 조건\\n# 갭 상승률 1.5% ~ 4%\\n# 시가 대비 -0.3% 이내 유지\\n# 급등주 모멘텀 조건 만족\\n# 자동으로 09:00 스캔하여 매수"}
+sell_stg_1 = {"name": "손익 기반 매도", "content": "# 손익 기반 매도 조건\\n# 손절: -0.7%\\n# 분할 익절: +1.5% (절반 매도)\\n# 추적 손절: 고점 대비 -1.0% (수익 0.5% 이상시)\\n# 분할 후 추적: 고점 대비 -0.5%"}
+sell_stg_2 = {"name": "시간 기반 매도", "content": "# 시간 기반 매도 조건\\n# 60분 이상 보유 + 손실 상태: 매도\\n# 14:45 이후: 무조건 청산\\n# 장마감 대비 안전 청산"}
+sell_stg_3 = {"name": "기술적 지표 매도", "content": "# 기술적 지표 매도 조건\\n# 데드크로스: 현재가 < MAM5 또는 MAM5 < MAM10\\n# OSCT 음전환: 2틱 연속 음수\\n# 모멘텀 소진시 매도"}
 
 [BUYCOUNT]
 target_buy_count = 3
