@@ -35,6 +35,7 @@ class Backtester:
         
         # 전략 설정
         self.strategy_params = {}
+        self.tick_interval = 30
     
     def load_codes(self, start_date, end_date):
         """기간 내 거래된 종목 목록"""
@@ -142,33 +143,44 @@ class Backtester:
         
         # ===== 매도 조건 =====
         
-        # 1. 손절매 (-0.7%)
-        if profit_pct < -0.7:
-            return True, "손절매"
+        # 1. 목표 익절 (+3.0%)
+        if profit_pct >= 3.0:
+            return True, "목표 익절"
         
-        # 2. 시간 손절 (60분 이상 + 손실)
-        if hold_minutes > 60 and profit_pct < 0:
+        # 2. 손절 (-0.7%)
+        if profit_pct < -0.7:
+            return True, "손절"
+        
+        # 3. 추적 손절
+        if profit_pct > 1.5 and from_peak_pct < -0.8:
+            return True, "추적 손절"
+        
+        # 4. 시간 손절 (90분)
+        if hold_minutes > 90 and profit_pct < 0.5:
             return True, "시간 손절"
         
-        # 3. 장마감 청산 (14:45 이후)
+        # 5. 장마감 청산 (14:45 이후)
         hour = row['timestamp'].hour
         minute = row['timestamp'].minute
         if hour >= 14 and minute >= 45:
             return True, "장마감 청산"
         
-        # 4. 분할 익절 (+1.5%)
-        if profit_pct >= 1.5:
-            return True, "분할 익절"
-        
-        # 5. 추적 손절
-        if profit_pct > 0.5 and from_peak_pct < -1.0:
-            return True, "추적 손절"
-        
-        # 6. 데드크로스
+        # 6. 기술적 매도
+        MAT5 = row['tick_MAT5']
+        MAT20 = row['tick_MAT20']
         MAM5 = row['min_MAM5']
         MAM10 = row['min_MAM10']
-        if MAM5 < MAM10:
-            return True, "데드크로스"
+        OSCT = row['tick_OSCT']
+        
+        if (MAT5 < MAT20 or MAM5 < MAM10) and OSCT < 0 and profit_pct < 1.0:
+            return True, "기술적 매도"
+        
+        # 7. 과매수 청산
+        STOCHK = row['tick_STOCHK']
+        WILLIAMS_R = row['tick_WILLIAMS_R']
+        
+        if (STOCHK > 80 or WILLIAMS_R > -20) and profit_pct > 2.0 and from_peak_pct < -0.5:
+            return True, "과매수 청산"
         
         return False, None
     

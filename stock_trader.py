@@ -2215,7 +2215,6 @@ class CpData(QObject):
                             self.sell_volumes[code].append(vol / 2)
 
             with self.stockdata_lock:
-                # ✅ 새 봉 완성 여부 체크
                 bar_completed = False
                 
                 if self.chart_type == 'T':
@@ -2233,7 +2232,7 @@ class CpData(QObject):
                     if code in self.stockdata:
                         if len(self.stockdata[code]['T']) > 0:
                             lastCount = self.stockdata[code]['TICKS'][-1]
-                            if 1 <= lastCount < 60:
+                            if 1 <= lastCount < self.interval:
                                 bFind = True
                                 self.stockdata[code]['T'][-1] = lCurTime
                                 self.stockdata[code]['C'][-1] = cur
@@ -2245,7 +2244,6 @@ class CpData(QObject):
                                 self.stockdata[code]['TICKS'][-1] += 1
 
                         if not bFind:
-                            # ✅ 새 봉 생성 = 완성 이벤트
                             bar_completed = True
                             
                             self.stockdata[code]['D'].append(self.todayDate)
@@ -2257,7 +2255,7 @@ class CpData(QObject):
                             self.stockdata[code]['V'].append(vol)
                             self.stockdata[code]['TICKS'].append(1)
 
-                        desired_length = 400
+                        desired_length = 600
                         for key in self.stockdata[code]:
                             self.stockdata[code][key] = self.stockdata[code][key][-desired_length:]
 
@@ -2268,7 +2266,8 @@ class CpData(QObject):
                             if code in self.objIndicators:
                                 results = [
                                     self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
-                                    for ind in ["MA", "RSI", "MACD", "STOCH", "ATR", "CCI", "BBANDS", "VWAP"]
+                                    for ind in ["MA", "RSI", "MACD", "STOCH", "ATR", "CCI", "BBANDS", "VWAP",
+                                               "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"]
                                 ]
                                 if all(results):
                                     for result in results:
@@ -2388,7 +2387,7 @@ class CTrader(QObject):
 
         self.daydata = CpData(1, 'D', 50, self)
         self.mindata = CpData(3, 'm', 150, self)
-        self.tickdata = CpData(60, 'T', 400, self)
+        self.tickdata = CpData(30, 'T', 600, self)
 
         self.db_name = 'vi_stock_data.db'
 
@@ -4419,7 +4418,11 @@ class ChartDrawer(QObject):
                     keys_to_keep = ['O', 'H', 'L', 'C', 'V', 'D', 'T', 'MAM5', 'MAM10', 'MAM20', 'RSI', 'RSI_SIGNAL', 'MACD', 'MACD_SIGNAL', 'OSC']
 
                 if data_type == 'tick':
-                    filtered_data = {key: [x for x in (chart_data[key][-60:] if len(chart_data[key]) >= 60 else chart_data[key][:])] for key in keys_to_keep}
+                    filtered_data = {
+                        key: [x for x in (chart_data[key][-90:] if len(chart_data[key]) >= 90 
+                                         else chart_data[key][:])] 
+                        for key in keys_to_keep
+                    }
 
                     df = pd.DataFrame({
                         'Open': filtered_data['O'], 'High': filtered_data['H'], 'Low': filtered_data['L'], 'Close': filtered_data['C'], 'Volume': filtered_data['V'], 
