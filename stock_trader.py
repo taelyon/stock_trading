@@ -1,11 +1,14 @@
 import sys
 import ctypes
 from PyQt5.QtWidgets import *
-from PyQt5.QtCore import QTimer, pyqtSignal, QProcess, QObject, QThread, Qt, pyqtSlot, QRunnable, QThreadPool, QEventLoop
+from PyQt5.QtCore import (
+    QTimer, pyqtSignal, QProcess, QObject, QThread, Qt, 
+    pyqtSlot, QRunnable, QThreadPool, QEventLoop
+)
 from PyQt5.QtGui import QIcon, QPainter, QFont
 from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
-# import matplotlib
-# matplotlib.use('Agg')
+import matplotlib
+matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -5962,7 +5965,6 @@ if __name__ == "__main__":
         logging.info("=== 초단타 매매 프로그램 시작 ===")
         logging.info(f"실행 경로: {os.getcwd()}")
         logging.info(f"Python 버전: {sys.version}")
-        logging.info(f"PyQt5 버전: {Qt.PYQT_VERSION_STR}")
         logging.info("=" * 50)
 
         # QApplication 생성

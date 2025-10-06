@@ -5,7 +5,6 @@ OLD/
 data/
 stock_trader_deepseek.spec
 *.log
-*.spec
 test.py
 venv64/
 log
