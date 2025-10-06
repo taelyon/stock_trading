@@ -7,8 +7,6 @@ from PyQt5.QtCore import (
 )
 from PyQt5.QtGui import QIcon, QPainter, QFont
 from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
-import matplotlib
-matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
