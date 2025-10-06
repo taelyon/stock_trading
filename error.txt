@@ -1,0 +1,13 @@
+발생 시간: 2025-10-06 20:31:07.611450
+실행 경로: C:\MyAPP\stock_trading
+Python: 3.9.13 (tags/v3.9.13:6de2ca5, May 17 2022, 16:24:45) [MSC v.1929 32 bit (Intel)]
+
+프로그램 실행 중 치명적 오류 발생:
+
+AttributeError: type object 'Qt' has no attribute 'PYQT_VERSION_STR'
+
+상세 정보:
+Traceback (most recent call last):
+  File "c:\MyAPP\stock_trading\stock_trader.py", line 5965, in <module>
+    logging.info(f"PyQt5 버전: {Qt.PYQT_VERSION_STR}")
+AttributeError: type object 'Qt' has no attribute 'PYQT_VERSION_STR'

@@ -4,6 +4,8 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtCore import QTimer, pyqtSignal, QProcess, QObject, QThread, Qt, pyqtSlot, QRunnable, QThreadPool, QEventLoop
 from PyQt5.QtGui import QIcon, QPainter, QFont
 from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
+# import matplotlib
+# matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -13,7 +15,6 @@ import win32com.client
 import time
 import numpy as np
 
-import pickle
 import re
 import mplfinance as mpf
 import sqlite3
@@ -64,26 +65,53 @@ def init_plus_check():
     return True
 
 def setup_logging():
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
-    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    """로그 설정 (PyInstaller 대응)"""
+    try:
+        logger = logging.getLogger()
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
-    log_dir = os.path.join(os.getcwd(), 'log')
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+        # ✅ 실행 파일 경로 확인
+        if getattr(sys, 'frozen', False):
+            # PyInstaller로 빌드된 경우
+            application_path = os.path.dirname(sys.executable)
+        else:
+            # 일반 Python 실행
+            application_path = os.path.dirname(os.path.abspath(__file__))
 
-    log_path = os.path.join(log_dir, f"trading_{datetime.now().strftime('%Y%m%d')}.log")
-    file_handler = logging.FileHandler(log_path, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
+        # ✅ 로그 디렉토리 생성 (안전하게)
+        log_dir = os.path.join(application_path, 'log')
+        try:
+            if not os.path.exists(log_dir):
+                os.makedirs(log_dir)
+        except Exception as e:
+            # 로그 폴더 생성 실패 시 임시 폴더 사용
+            log_dir = os.path.join(os.environ.get('TEMP', 'C:\\Temp'), 'stock_trader_log')
+            os.makedirs(log_dir, exist_ok=True)
 
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.WARNING)
-    console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
+        # 로그 파일 경로
+        log_path = os.path.join(log_dir, f"trading_{datetime.now().strftime('%Y%m%d')}.log")
+        
+        # 파일 핸들러
+        file_handler = logging.FileHandler(log_path, encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        logger.addHandler(file_handler)
+
+        # 콘솔 핸들러
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.WARNING)
+        console_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+        
+        logging.info(f"로그 초기화 완료: {log_path}")
+        
+    except Exception as ex:
+        # 로그 설정 실패 시에도 프로그램은 계속 실행
+        print(f"로그 설정 오류: {ex}")
+        traceback.print_exc()
 
 def send_slack_message(login_handler, channel, message):
     if login_handler is None or login_handler.slack is None:
@@ -173,158 +201,38 @@ class DataCache:
 # 전역 캐시
 stock_info_cache = DataCache(expire_seconds=300)  # 5분
 
-# ==================== 급등주 스캐너 ====================
+# ==================== 급등주 스캐너 (검증용으로만 사용) ====================
 class MomentumScanner(QObject):
-    """급등주 실시간 스캔"""
+    """급등주 검증 - 조건검색 편입 종목 재확인용"""
     
     stock_found = pyqtSignal(dict)
     
     def __init__(self, trader):
         super().__init__()
         self.trader = trader
-        self.scan_timer = QTimer()
-        self.scan_timer.timeout.connect(self.scan_market)
-        self.candidate_codes = []
-        self.scanned_codes = set()
-        self.last_scan_time = 0
         self.cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
-        
-    def start_screening(self):
-        """09:05부터 스캔 시작"""
-        now = datetime.now()
-        start_time = now.replace(hour=9, minute=5, second=0, microsecond=0)
-        
-        if now < start_time:
-            delay = (start_time - now).total_seconds() * 1000
-            logging.info(f"급등주 스캔 {int(delay/1000)}초 후 시작 예정")
-            QTimer.singleShot(int(delay), self.start_screening)
-            return
-        
-        logging.info("급등주 스캔 시작")
-        self.scan_market()
-        
-        # 5분마다 재스캔
-        self.scan_timer.start(300000)
     
-    def stop_screening(self):
-        """스캔 중지"""
-        if self.scan_timer.isActive():
-            self.scan_timer.stop()
-        logging.info("급등주 스캔 중지")
+    # ⚠️ scan_market() 메서드 삭제 - 더 이상 직접 스캔 안함
+    # ⚠️ start_screening() 메서드 삭제
+    # ⚠️ stop_screening() 메서드 삭제
     
-    def scan_market(self):
-        """시장 전체 스캔 (API 제한 고려)"""
+    def verify_momentum_conditions(self, code):
+        """급등주 조건 재확인
         
+        조건검색으로 들어온 종목이 실제로 급등주 조건을 만족하는지 검증
+        
+        Returns:
+            (is_valid, score, message): (검증 통과 여부, 점수, 메시지)
+        """
         try:
-            now = time.time()
-            if now - self.last_scan_time < 60:
-                logging.debug("스캔 주기 미달, 스킵")
-                return
-            
-            self.last_scan_time = now
-            
-            logging.info("=== 급등주 스캔 시작 ===")
-            
-            # KOSDAQ 전체 종목
-            code_list = cpCodeMgr.GetStockListByMarket(2)
-            
-            # 시가총액으로 사전 필터링 (API 절약)
-            filtered_codes = self._pre_filter_by_market_cap(code_list)
-            
-            candidates = []
-            scan_count = 0
-            max_scan = 100  # 한 번에 최대 100개만 스캔
-            
-            for code in filtered_codes:
-                if scan_count >= max_scan:
-                    break
-                
-                # 이미 모니터링 중이면 스킵
-                if code in self.trader.monistock_set:
-                    continue
-                
-                # 이미 스캔했으면 스킵
-                if code in self.scanned_codes:
-                    continue
-                
-                # API 제한 대기
-                api_limiter.wait_if_needed()
-                
-                # 모멘텀 점수 계산
-                score = self._calculate_momentum_score(code)
-                
-                if score >= 70:
-                    stock_data = {
-                        'code': code,
-                        'name': cpCodeMgr.CodeToName(code),
-                        'score': score,
-                        'price': self._get_cached_price(code),
-                        'change_pct': self._get_change_pct(code),
-                        'volume_ratio': self._get_volume_ratio(code)
-                    }
-                    candidates.append(stock_data)
-                    self.scanned_codes.add(code)
-                
-                scan_count += 1
-            
-            # 점수 순 정렬
-            candidates.sort(key=lambda x: x['score'], reverse=True)
-            
-            # 상위 5개만 모니터링 추가 (메모리 관리)
-            max_monitoring = min(5, 10 - len(self.trader.monistock_set))
-            
-            for stock in candidates[:max_monitoring]:
-                self._add_to_monitoring(stock)
-            
-            logging.info(
-                f"급등주 스캔 완료: 검색 {scan_count}개, "
-                f"후보 {len(candidates)}개, 추가 {min(max_monitoring, len(candidates))}개"
-            )
-            
-        except Exception as ex:
-            logging.error(f"scan_market 오류: {ex}\n{traceback.format_exc()}")
-    
-    def _pre_filter_by_market_cap(self, code_list):
-        """시가총액으로 사전 필터링"""
-        filtered = []
-        
-        for code in code_list:
-            # 캐시 확인
-            cached = stock_info_cache.get(f"filter_{code}")
-            if cached is not None:
-                if cached:
-                    filtered.append(code)
-                continue
-            
-            # 관리종목 제외
-            if cpCodeMgr.GetStockControlKind(code) != 0:
-                stock_info_cache.set(f"filter_{code}", False)
-                continue
-            
-            # KOSDAQ만
-            if cpCodeMgr.GetStockSectionKind(code) != 2:
-                stock_info_cache.set(f"filter_{code}", False)
-                continue
-            
-            # 시가총액 정보는 cpCodeMgr에서 바로 가져올 수 없으므로
-            # 일단 통과시키고 나중에 상세 체크
-            stock_info_cache.set(f"filter_{code}", True)
-            filtered.append(code)
-        
-        return filtered[:200]  # 최대 200개로 제한
-    
-    def _calculate_momentum_score(self, code):
-        """모멘텀 점수 계산"""
-        
-        try:
-            score = 0
-            
             # 캐시 확인
             cached_score = stock_info_cache.get(f"score_{code}")
             if cached_score is not None:
-                return cached_score
+                return (cached_score >= 70, cached_score, "캐시에서 조회")
             
             # 현재가 정보
+            api_limiter.wait_if_needed()
+            
             self.cpStock.SetInputValue(0, code)
             self.cpStock.BlockRequest2(1)
             
@@ -337,15 +245,14 @@ class MomentumScanner(QObject):
             prev_volume = self.cpStock.GetHeaderValue(21)
             market_cap = self.cpStock.GetHeaderValue(67)  # 백만원 단위
             
-            # 가격대 필터 (2,000원 ~ 50,000원)
+            # 1차 필터링
             if current_price < 2000 or current_price > 50000:
-                stock_info_cache.set(f"score_{code}", 0)
-                return 0
+                return (False, 0, f"가격대 미달 ({current_price}원)")
             
-            # 시가총액 필터 (500억 ~ 5000억)
             if market_cap < 50000 or market_cap > 500000:
-                stock_info_cache.set(f"score_{code}", 0)
-                return 0
+                return (False, 0, f"시가총액 미달 ({market_cap/10000:.0f}억)")
+            
+            score = 0
             
             # 1. 시가 대비 상승률 (0-30점)
             if open_price > 0:
@@ -358,8 +265,7 @@ class MomentumScanner(QObject):
                 elif 5.0 <= price_change_pct < 7.0:
                     score += 10
                 elif price_change_pct < 0:
-                    stock_info_cache.set(f"score_{code}", 0)
-                    return 0
+                    return (False, 0, "시가 대비 하락")
             
             # 2. 거래량 비율 (0-25점)
             if prev_volume > 0:
@@ -372,8 +278,7 @@ class MomentumScanner(QObject):
                 elif volume_ratio >= 2.0:
                     score += 10
                 elif volume_ratio < 1.5:
-                    stock_info_cache.set(f"score_{code}", 0)
-                    return 0
+                    return (False, 0, f"거래량 부족 ({volume_ratio:.1f}배)")
             
             # 3. 당일 고가 근처 유지 (0-20점)
             if high_price > 0 and low_price > 0:
@@ -402,91 +307,145 @@ class MomentumScanner(QObject):
                 score += 5
             
             stock_info_cache.set(f"score_{code}", score)
-            return score
+            
+            is_valid = score >= 70
+            message = f"급등주 점수: {score}/100"
+            
+            return (is_valid, score, message)
             
         except Exception as ex:
-            logging.error(f"_calculate_momentum_score({code}): {ex}")
-            return 0
-    
-    def _get_cached_price(self, code):
-        """현재가 조회 (캐시)"""
-        cached = stock_info_cache.get(f"price_{code}")
-        if cached:
-            return cached
+            logging.error(f"verify_momentum_conditions({code}): {ex}")
+            return (False, 0, f"검증 오류: {ex}")
         
+# ==================== 갭 상승 스캐너 (검증 + 매수조건) ====================
+class GapUpScanner:
+    """갭 상승 스캐너 - 검증 + 매수 조건 체크"""
+    
+    def __init__(self, trader):
+        self.trader = trader
+        self.cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
+    
+    def verify_gap_conditions(self, code):
+        """갭 상승 조건 재확인
+        
+        조건검색으로 들어온 종목이 실제로 갭 상승 조건을 만족하는지 검증
+        
+        HTS 조건검색: 간단한 조건만
+        - 갭 상승 1.5% ~ 4.0%
+        - 현재가 > 시가
+        
+        Python 재검증: 정밀한 조건 추가
+        - 현재가 >= 시가 * 0.99 (시가 대비 -1% 이내)
+        - 거래량 비율 >= 150%
+        
+        Returns:
+            (is_valid, gap_pct, message): (검증 통과 여부, 갭 비율, 메시지)
+        """
         try:
+            # 일봉 데이터 로드
+            if not self.trader.daydata.select_code(code):
+                return (False, 0, "일봉 데이터 로드 실패")
+            
+            day_data = self.trader.daydata.stockdata.get(code, {})
+            
+            if len(day_data.get('C', [])) < 2:
+                return (False, 0, "데이터 부족")
+            
+            # 1️⃣ 갭 상승 비율 확인
+            prev_close = day_data['C'][-2]
+            today_open = day_data['O'][-1]
+            
+            if prev_close == 0:
+                return (False, 0, "전일 종가 0")
+            
+            gap_pct = (today_open - prev_close) / prev_close * 100
+            
+            # 갭 상승 1.5% ~ 4%
+            if not (1.5 <= gap_pct <= 4.0):
+                return (False, gap_pct, f"갭 범위 미달 ({gap_pct:.2f}%)")
+            
+            # 2️⃣ 시가 유지 확인 (HTS에서 못하는 정밀 조건)
+            # HTS: 현재가 > 시가
+            # Python: 현재가 >= 시가 * 0.99 (시가 대비 -1% 이내)
+            
+            # 현재가 조회
+            api_limiter.wait_if_needed()
+            
             self.cpStock.SetInputValue(0, code)
             self.cpStock.BlockRequest2(1)
-            price = self.cpStock.GetHeaderValue(11)
-            stock_info_cache.set(f"price_{code}", price)
-            return price
-        except:
-            return 0
-    
-    def _get_change_pct(self, code):
-        """등락률 조회"""
-        try:
-            self.cpStock.SetInputValue(0, code)
-            self.cpStock.BlockRequest2(1)
+            current_price = self.cpStock.GetHeaderValue(11)
             
-            current = self.cpStock.GetHeaderValue(11)
-            prev = self.cpStock.GetHeaderValue(20)
+            if current_price < today_open * 0.99:
+                return (False, gap_pct, f"시가 미유지 ({current_price}/{today_open}, {(current_price/today_open-1)*100:.2f}%)")
             
-            if prev > 0:
-                return (current - prev) / prev * 100
-            return 0
-        except:
-            return 0
-    
-    def _get_volume_ratio(self, code):
-        """거래량 비율 조회"""
-        try:
-            self.cpStock.SetInputValue(0, code)
-            self.cpStock.BlockRequest2(1)
-            
-            volume = self.cpStock.GetHeaderValue(18)
-            prev_volume = self.cpStock.GetHeaderValue(21)
-            
-            if prev_volume > 0:
-                return volume / prev_volume
-            return 0
-        except:
-            return 0
-    
-    def _add_to_monitoring(self, stock):
-        """모니터링 대상 추가"""
-        
-        code = stock['code']
-        
-        try:
-            # 일봉/틱봉/분봉 데이터 로드
-            if (self.trader.daydata.select_code(code) and 
-                self.trader.tickdata.monitor_code(code) and 
-                self.trader.mindata.monitor_code(code)):
+            # 3️⃣ 거래량 확인
+            if len(day_data.get('V', [])) >= 2:
+                today_vol = day_data['V'][-1]
+                prev_vol = day_data['V'][-2]
                 
-                # 시작 시간/가격 기록
-                self.trader.starting_time[code] = datetime.now().strftime('%m/%d %H:%M:%S')
-                self.trader.starting_price[code] = stock['price']
-                
-                # 모니터링 세트 추가
-                self.trader.monistock_set.add(code)
-                self.trader.stock_added_to_monitor.emit(code)
-                
-                logging.info(
-                    f"{stock['name']}({code}) -> "
-                    f"급등주 추가 (점수: {stock['score']}, "
-                    f"상승률: {stock['change_pct']:.2f}%, "
-                    f"거래량비: {stock['volume_ratio']:.1f}배)"
-                )
-                
-                self.stock_found.emit(stock)
-                
+                if prev_vol > 0:
+                    volume_ratio = today_vol / prev_vol
+                    
+                    if volume_ratio < 1.5:
+                        return (False, gap_pct, f"거래량 부족 ({volume_ratio:.1f}배)")
+                    
+                    # ✅ 모든 조건 통과
+                    return (
+                        True, 
+                        gap_pct, 
+                        f"갭상승 {gap_pct:.2f}%, 거래량 {volume_ratio:.1f}배, "
+                        f"시가유지 {(current_price/today_open-1)*100:+.2f}%"
+                    )
+                else:
+                    # 거래량 정보 없어도 갭과 시가 조건만으로 통과
+                    return (
+                        True, 
+                        gap_pct, 
+                        f"갭상승 {gap_pct:.2f}%, 시가유지 {(current_price/today_open-1)*100:+.2f}%"
+                    )
             else:
-                logging.warning(f"{code}: 데이터 로드 실패")
-                
+                # 거래량 정보 없어도 갭과 시가 조건만으로 통과
+                return (
+                    True, 
+                    gap_pct, 
+                    f"갭상승 {gap_pct:.2f}%, 시가유지 {(current_price/today_open-1)*100:+.2f}%"
+                )
+            
         except Exception as ex:
-            logging.error(f"_add_to_monitoring({code}): {ex}")
-
+            logging.error(f"verify_gap_conditions({code}): {ex}")
+            return (False, 0, f"검증 오류: {ex}")
+    
+    def check_gap_hold(self, code):
+        """갭 유지 확인 (매수 조건)
+        
+        매수 시점에 갭이 여전히 유지되고 있는지 확인
+        시가 대비 -0.3% 이내면 갭 유지로 판단
+        """
+        try:
+            day_data = self.trader.daydata.stockdata.get(code, {})
+            
+            if len(day_data.get('O', [])) == 0:
+                return False
+            
+            today_open = day_data['O'][-1]
+            
+            # 현재가
+            tick_latest = self.trader.tickdata.get_latest_data(code)
+            current_price = tick_latest.get('C', 0)
+            
+            if current_price == 0:
+                return False
+            
+            # 시가 대비 -0.3% 이내 (갭 유지)
+            if current_price >= today_open * 0.997:
+                return True
+            
+            return False
+            
+        except Exception as ex:
+            logging.error(f"check_gap_hold({code}): {ex}")
+            return False
+        
 # ==================== 변동성 돌파 전략 ====================
 class VolatilityBreakout:
     """변동성 돌파 전략"""
@@ -590,140 +549,6 @@ class VolatilityBreakout:
             return 0
         except:
             return 0
-
-# ==================== 갭 상승 전략 ====================
-class GapUpScanner:
-    """갭 상승 종목 스캔"""
-    
-    def __init__(self, trader):
-        self.trader = trader
-        self.gap_stocks = []
-        self.cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
-    
-    def scan_gap_up_stocks(self):
-        """09:00 갭 상승 종목 스캔"""
-        
-        try:
-            now = datetime.now()
-            if now.hour != 9 or now.minute > 5:
-                logging.warning("갭 상승 스캔은 09:00-09:05에만 가능")
-                return
-            
-            logging.info("=== 갭 상승 스캔 시작 ===")
-            
-            code_list = cpCodeMgr.GetStockListByMarket(2)
-            
-            scan_count = 0
-            max_scan = 150
-            
-            for code in code_list:
-                if scan_count >= max_scan:
-                    break
-                
-                # 이미 모니터링 중이면 스킵
-                if code in self.trader.monistock_set:
-                    continue
-                
-                # API 제한
-                api_limiter.wait_if_needed()
-                
-                gap_pct = self._calculate_gap(code)
-                
-                # 갭 상승 1.5% ~ 4%
-                if 1.5 <= gap_pct <= 4.0:
-                    stock_data = {
-                        'code': code,
-                        'gap_pct': gap_pct,
-                        'name': cpCodeMgr.CodeToName(code)
-                    }
-                    self.gap_stocks.append(stock_data)
-                
-                scan_count += 1
-            
-            # 모니터링 추가
-            for stock in self.gap_stocks[:5]:
-                self._add_to_monitoring(stock)
-            
-            logging.info(f"갭 상승 종목: {len(self.gap_stocks)}개, 추가: {min(5, len(self.gap_stocks))}개")
-            
-        except Exception as ex:
-            logging.error(f"scan_gap_up_stocks: {ex}\n{traceback.format_exc()}")
-    
-    def _calculate_gap(self, code):
-        """갭 계산"""
-        
-        try:
-            # 일봉 데이터 로드
-            if not self.trader.daydata.select_code(code):
-                return 0
-            
-            day_data = self.trader.daydata.stockdata.get(code, {})
-            
-            if len(day_data.get('C', [])) < 2:
-                return 0
-            
-            prev_close = day_data['C'][-2]
-            today_open = day_data['O'][-1]
-            
-            if prev_close > 0:
-                gap_pct = (today_open - prev_close) / prev_close * 100
-                return gap_pct
-            
-            return 0
-            
-        except:
-            return 0
-    
-    def check_gap_hold(self, code):
-        """갭 유지 확인"""
-        
-        try:
-            day_data = self.trader.daydata.stockdata.get(code, {})
-            
-            if len(day_data.get('O', [])) == 0:
-                return False
-            
-            today_open = day_data['O'][-1]
-            
-            # 현재가
-            tick_latest = self.trader.tickdata.get_latest_data(code)
-            current_price = tick_latest.get('C', 0)
-            
-            # 시가 대비 -0.3% 이내 (갭 유지)
-            if current_price >= today_open * 0.997:
-                return True
-            
-            return False
-            
-        except:
-            return False
-    
-    def _add_to_monitoring(self, stock):
-        """모니터링 추가"""
-        
-        code = stock['code']
-        
-        try:
-            if (self.trader.tickdata.monitor_code(code) and 
-                self.trader.mindata.monitor_code(code)):
-                
-                self.trader.starting_time[code] = datetime.now().strftime('%m/%d %H:%M:%S')
-                
-                # 갭 상승가 기록
-                day_data = self.trader.daydata.stockdata.get(code, {})
-                if len(day_data.get('O', [])) > 0:
-                    self.trader.starting_price[code] = day_data['O'][-1]
-                
-                self.trader.monistock_set.add(code)
-                self.trader.stock_added_to_monitor.emit(code)
-                
-                logging.info(
-                    f"{stock['name']}({code}) -> "
-                    f"갭 상승 추가 (갭: {stock['gap_pct']:.2f}%)"
-                )
-                
-        except Exception as ex:
-            logging.error(f"_add_to_monitoring({code}): {ex}")
 
 # ==================== 기존 CpEvent 클래스 (유지) ====================
 class CpEvent:
@@ -881,13 +706,17 @@ class CpRequest:
             if self.caller and hasattr(self.caller, 'cp_request'):
                 self.caller.cp_request.is_requesting = False
 
-# ==================== 기존 CpStrategy (유지) ====================
+# ==================== CpStrategy (조건검색 편입 처리 수정) ====================
 class CpStrategy:
     def __init__(self, trader):
         self.monList = {}
         self.trader = trader
         self.stgname = {}
         self.objpb = CpPBCssAlert()
+        
+        # ✅ 검증용 스캐너 (조건검색 편입 종목 재확인용)
+        self.momentum_scanner = None
+        self.gap_scanner = None
 
     def requestList(self):
         retStgList = {}
@@ -987,33 +816,133 @@ class CpStrategy:
         return (True, status)
 
     def checkRealtimeStg(self, stgid, stgmonid, code, stgprice, time):
+        """조건검색 편입 시 호출 - 재검증 후 투자대상 추가"""
+        
         if stgid not in self.monList:
             return
         if (stgmonid != self.monList[stgid]):
             return
+        
+        # API 제한 체크
         remain_time0 = cpStatus.GetLimitRemainTime(0)
         remain_time1 = cpStatus.GetLimitRemainTime(1)
         if remain_time0 != 0 or remain_time1 != 0:
             return
+        
+        # 장 시작 후에만 처리
         if datetime.now() < datetime.now().replace(hour=9, minute=3, second=0, microsecond=0):
             return
-        if code not in self.trader.monistock_set:
-            if self.trader.daydata.select_code(code) and self.trader.tickdata.monitor_code(code) and self.trader.mindata.monitor_code(code):
-                stgname = self.stgname.get(stgid, '')
-                if stgname in ['급등주']:
-                    self.trader.starting_time[code] = datetime.now().strftime('%m/%d 09:00:00')
-                    self.trader.starting_price[code] = stgprice
+        
+        # 이미 모니터링 중이면 스킵
+        if code in self.trader.monistock_set:
+            return
+        
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ✅ 조건검색별 재검증
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        
+        stgname = self.stgname.get(stgid, '')
+        stock_name = cpCodeMgr.CodeToName(code)
+        
+        try:
+            # 1️⃣ 급등주 조건검색
+            if stgname == '급등주':
+                if not self.momentum_scanner:
+                    logging.warning("MomentumScanner가 초기화되지 않음")
+                    return
+                
+                # 급등주 조건 재확인
+                is_valid, score, message = self.momentum_scanner.verify_momentum_conditions(code)
+                
+                if not is_valid:
+                    logging.debug(f"{stock_name}({code}): 급등주 재검증 실패 - {message}")
+                    return
+                
+                logging.info(
+                    f"{stock_name}({code}) -> 급등주 조건검색 편입 "
+                    f"(검증: {message}, 체결강도 확인중...)"
+                )
+                
+                # 추가 검증: 체결강도 (데이터 로드 후)
+                if self.trader.daydata.select_code(code):
+                    if self.trader.tickdata.monitor_code(code) and self.trader.mindata.monitor_code(code):
+                        # 잠시 대기 후 체결강도 확인
+                        time.sleep(0.5)
+                        strength = self.trader.tickdata.get_strength(code)
+                        
+                        if strength >= 120:
+                            # ✅ 투자대상 추가
+                            self._add_to_monitoring(code, stgprice, time, f"급등주 (점수: {score}, 체결강도: {strength:.0f})")
+                        else:
+                            logging.debug(f"{stock_name}({code}): 체결강도 부족 ({strength:.0f})")
+                            self.trader.daydata.monitor_stop(code)
+                            self.trader.tickdata.monitor_stop(code)
+                            self.trader.mindata.monitor_stop(code)
+                    else:
+                        self.trader.daydata.monitor_stop(code)
                 else:
-                    if code not in self.trader.starting_time:
-                        self.trader.starting_time[code] = datetime.now().strftime('%m/%d 09:00:00')
-                self.trader.monistock_set.add(code)
-                self.trader.stock_added_to_monitor.emit(code)
-                self.trader.save_list_db(code, self.trader.starting_time[code], self.trader.starting_price[code], 1)
-                logging.info(f"{cpCodeMgr.CodeToName(code)}({code}) -> 투자 대상 종목 추가")
+                    pass
+            
+            # 2️⃣ 갭상승 조건검색
+            elif stgname == '갭상승':
+                if not self.gap_scanner:
+                    logging.warning("GapUpScanner가 초기화되지 않음")
+                    return
+                
+                # 갭상승 조건 재확인
+                is_valid, gap_pct, message = self.gap_scanner.verify_gap_conditions(code)
+                
+                if not is_valid:
+                    logging.debug(f"{stock_name}({code}): 갭상승 재검증 실패 - {message}")
+                    self.trader.daydata.monitor_stop(code)
+                    return
+                
+                logging.info(
+                    f"{stock_name}({code}) -> 갭상승 조건검색 편입 "
+                    f"(검증: {message})"
+                )
+                
+                # 데이터 로드
+                if self.trader.tickdata.monitor_code(code) and self.trader.mindata.monitor_code(code):
+                    # ✅ 투자대상 추가
+                    self._add_to_monitoring(code, stgprice, time, f"갭상승 ({gap_pct:.2f}%)")
+                else:
+                    self.trader.daydata.monitor_stop(code)
+            
+            # 3️⃣ 기타 조건검색 (VI 발동 등)
             else:
-                self.trader.daydata.monitor_stop(code)
-                self.trader.mindata.monitor_stop(code)
-                self.trader.tickdata.monitor_stop(code)
+                # 기존 로직 유지
+                if self.trader.daydata.select_code(code):
+                    if self.trader.tickdata.monitor_code(code) and self.trader.mindata.monitor_code(code):
+                        if code not in self.trader.starting_time:
+                            self.trader.starting_time[code] = datetime.now().strftime('%m/%d 09:00:00')
+                        self.trader.monistock_set.add(code)
+                        self.trader.stock_added_to_monitor.emit(code)
+                        self.trader.save_list_db(code, self.trader.starting_time[code], self.trader.starting_price[code], 1)
+                        logging.info(f"{stock_name}({code}) -> 투자 대상 종목 추가")
+                    else:
+                        self.trader.daydata.monitor_stop(code)
+                        self.trader.mindata.monitor_stop(code)
+                        self.trader.tickdata.monitor_stop(code)
+        
+        except Exception as ex:
+            logging.error(f"checkRealtimeStg({code}, {stgname}): {ex}\n{traceback.format_exc()}")
+
+    def _add_to_monitoring(self, code, price, time, reason):
+        """투자대상 종목 추가"""
+        try:
+            stock_name = cpCodeMgr.CodeToName(code)
+            
+            self.trader.starting_time[code] = time
+            self.trader.starting_price[code] = price
+            self.trader.monistock_set.add(code)
+            self.trader.stock_added_to_monitor.emit(code)
+            self.trader.save_list_db(code, time, price, 1)
+            
+            logging.info(f"{stock_name}({code}) -> 투자 대상 추가: {reason}")
+            
+        except Exception as ex:
+            logging.error(f"_add_to_monitoring({code}): {ex}")
 
     def Clear(self):
         delitem = []
@@ -5157,8 +5086,7 @@ class MyWindow(QWidget):
             self.trader.clear_list_db('mylist.db')
         
         # 기존 전략 객체 정리
-        if self.momentum_scanner:
-            self.momentum_scanner.stop_screening()
+        if hasattr(self, 'momentum_scanner') and self.momentum_scanner:
             self.momentum_scanner = None
         
         # ===== 전략별 초기화 =====
@@ -5195,35 +5123,73 @@ class MyWindow(QWidget):
             self.trader.download_vi()
 
         elif stgName == "통합 전략":
-            # 통합 전략 초기화
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # ✅ 통합 전략: 조건검색 + 매수 조건
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            
             if hasattr(self, 'pb9619'):
                 self.pb9619.Unsubscribe()
             self.objstg.Clear()
             
-            logging.info(f"=== 통합 전략 시작 ===")
+            logging.info(f"=== 통합 전략 시작 (조건검색 기반) ===")
             self.trader.init_stock_balance()
             
-            # 1. 급등주 스캐너
-            self.momentum_scanner = MomentumScanner(self.trader)
-            self.momentum_scanner.stock_found.connect(self.on_momentum_stock_found)
-            self.momentum_scanner.start_screening()
-            logging.info("급등주 스캐너 시작")
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 1️⃣ 종목 추출: 조건검색
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             
-            # 2. 갭 상승 스캐너
-            self.gap_scanner = GapUpScanner(self.trader)
-            now = datetime.now()
-            scan_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-            if now < scan_time:
-                delay = (scan_time - now).total_seconds() * 1000
-                QTimer.singleShot(int(delay), self.gap_scanner.scan_gap_up_stocks)
-                logging.info(f"갭 상승 스캔 {int(delay/1000)}초 후 시작 예정")
-            elif now.hour == 9 and now.minute < 10:
-                self.gap_scanner.scan_gap_up_stocks()
+            # 검증용 스캐너 초기화
+            self.objstg.momentum_scanner = MomentumScanner(self.trader)
+            self.objstg.gap_scanner = GapUpScanner(self.trader)
             
-            # 3. 변동성 돌파 전략
+            # 조건검색 1: 급등주
+            momentum_stg = self.data8537.get("급등주")
+            if momentum_stg:
+                id = momentum_stg['ID']
+                name = momentum_stg['전략명']
+                
+                ret, monid = self.objstg.requestMonitorID(id)
+                if ret:
+                    ret, status = self.objstg.requestStgControl(id, monid, True, name)
+                    if ret:
+                        logging.info(f"✅ 조건검색 '{name}' 감시 시작")
+                    else:
+                        logging.warning(f"조건검색 '{name}' 시작 실패")
+                else:
+                    logging.warning(f"조건검색 '{name}' 모니터 ID 획득 실패")
+            else:
+                logging.warning("조건검색 '급등주'를 찾을 수 없습니다. HTS에서 생성하세요.")
+            
+            # 조건검색 2: 갭상승
+            gap_stg = self.data8537.get("갭상승")
+            if gap_stg:
+                id = gap_stg['ID']
+                name = gap_stg['전략명']
+                
+                ret, monid = self.objstg.requestMonitorID(id)
+                if ret:
+                    ret, status = self.objstg.requestStgControl(id, monid, True, name)
+                    if ret:
+                        logging.info(f"✅ 조건검색 '{name}' 감시 시작")
+                    else:
+                        logging.warning(f"조건검색 '{name}' 시작 실패")
+                else:
+                    logging.warning(f"조건검색 '{name}' 모니터 ID 획득 실패")
+            else:
+                logging.warning("조건검색 '갭상승'을 찾을 수 없습니다. HTS에서 생성하세요.")
+            
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # 2️⃣ 매수 조건: Python 로직
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            
+            # 변동성 돌파 전략 (매수 조건 - buy_stg_9)
             self.volatility_strategy = VolatilityBreakout(self.trader)
             self.trader_thread.set_volatility_strategy(self.volatility_strategy)
-            logging.info("변동성 돌파 전략 활성화")
+            logging.info("✅ 변동성 돌파 전략 활성화 (매수 조건)")
+            
+            # 갭 상승 유지 체커 (매수 조건 - buy_stg_10)
+            self.gap_scanner = self.objstg.gap_scanner  # 동일 객체 사용
+            logging.info("✅ 갭 상승 유지 체커 활성화 (매수 조건)")
             
             # 기존 데이터베이스에서 복원
             self.trader.load_from_list_db('mylist.db')
@@ -5238,6 +5204,8 @@ class MyWindow(QWidget):
                         self.trader.daydata.monitor_stop(code)
                         self.trader.mindata.monitor_stop(code)
                         self.trader.tickdata.monitor_stop(code)
+            
+            logging.info(f"=== 통합 전략 초기화 완료 ===")
 
         else:
             # 기타 사용자 정의 전략
@@ -5981,11 +5949,104 @@ class QTextEditLogger(QObject, logging.Handler):
 
 # ==================== Main ====================
 if __name__ == "__main__":
-    setup_logging()
+    # ✅ 실행 경로 설정
+    if getattr(sys, 'frozen', False):
+        # PyInstaller로 빌드된 경우
+        application_path = os.path.dirname(sys.executable)
+        os.chdir(application_path)
+    
+    try:
+        # 로그 초기화
+        setup_logging()
+        logging.info("=" * 50)
+        logging.info("=== 초단타 매매 프로그램 시작 ===")
+        logging.info(f"실행 경로: {os.getcwd()}")
+        logging.info(f"Python 버전: {sys.version}")
+        logging.info(f"PyQt5 버전: {Qt.PYQT_VERSION_STR}")
+        logging.info("=" * 50)
 
-    app = QApplication(sys.argv)
-    app.setFont(QFont("Malgun Gothic", 9))
-    myWindow = MyWindow()
-    myWindow.setWindowIcon(QIcon('stock_trader.ico'))
-    myWindow.showMaximized()
-    app.exec_()
+        # QApplication 생성
+        app = QApplication(sys.argv)
+        
+        # 폰트 설정
+        try:
+            app.setFont(QFont("Malgun Gothic", 9))
+            logging.info("폰트 설정 완료")
+        except Exception as ex:
+            logging.warning(f"폰트 설정 실패: {ex}")
+        
+        # 메인 윈도우 생성
+        logging.info("메인 윈도우 생성 중...")
+        myWindow = MyWindow()
+        
+        # 아이콘 설정
+        try:
+            icon_path = 'stock_trader.ico'
+            if getattr(sys, 'frozen', False):
+                icon_path = os.path.join(application_path, 'stock_trader.ico')
+            
+            if os.path.exists(icon_path):
+                myWindow.setWindowIcon(QIcon(icon_path))
+                logging.info(f"아이콘 설정 완료: {icon_path}")
+            else:
+                logging.warning(f"아이콘 파일 없음: {icon_path}")
+        except Exception as ex:
+            logging.warning(f"아이콘 설정 실패: {ex}")
+        
+        # 창 표시
+        myWindow.showMaximized()
+        logging.info("GUI 초기화 완료")
+        
+        # 이벤트 루프 실행
+        exit_code = app.exec_()
+        logging.info(f"프로그램 종료 (exit code: {exit_code})")
+        sys.exit(exit_code)
+        
+    except Exception as ex:
+        # 최상위 예외 처리
+        error_msg = (
+            f"프로그램 실행 중 치명적 오류 발생:\n\n"
+            f"{type(ex).__name__}: {ex}\n\n"
+            f"상세 정보:\n{traceback.format_exc()}"
+        )
+        
+        # 로그 파일에 기록
+        try:
+            logging.critical(error_msg)
+        except:
+            pass
+        
+        # 오류 파일 생성
+        try:
+            error_file = os.path.join(os.getcwd(), 'error.txt')
+            with open(error_file, 'w', encoding='utf-8') as f:
+                f.write(f"발생 시간: {datetime.now()}\n")
+                f.write(f"실행 경로: {os.getcwd()}\n")
+                f.write(f"Python: {sys.version}\n\n")
+                f.write(error_msg)
+            print(f"\n오류 정보가 저장되었습니다: {error_file}\n")
+        except Exception as e:
+            print(f"오류 파일 저장 실패: {e}")
+        
+        # 메시지 박스 표시
+        try:
+            from PyQt5.QtWidgets import QMessageBox, QApplication
+            app = QApplication.instance()
+            if app is None:
+                app = QApplication(sys.argv)
+            
+            QMessageBox.critical(
+                None, 
+                "프로그램 오류", 
+                f"프로그램 실행 중 오류가 발생했습니다.\n\n"
+                f"{type(ex).__name__}: {ex}\n\n"
+                f"자세한 내용은 error.txt 파일을 확인하세요."
+            )
+        except:
+            # 메시지 박스도 실패하면 콘솔에 출력
+            print("\n" + "=" * 60)
+            print(error_msg)
+            print("=" * 60)
+            input("\nEnter 키를 눌러 종료하세요...")
+        
+        sys.exit(1)
