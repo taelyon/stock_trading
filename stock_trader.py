@@ -2849,86 +2849,6 @@ class CTrader(QObject):
         except Exception as ex:
             logging.error(f"monitor_vi -> {code}, {ex}\n{traceback.format_exc()}")
 
-    def download_vi(self):
-        """VI 발동 전날 데이터 다운로드"""
-        try:
-            date = datetime.today() - timedelta(days=1)
-            while True:
-                date_str = date.strftime('%Y%m%d')
-
-                otp_url = 'http://data.krx.co.kr/comm/fileDn/GenerateOTP/generate.cmd'
-                download_url = 'http://data.krx.co.kr/comm/fileDn/download_excel/download.cmd'
-
-                query_str_params = {
-                    'locale': 'ko_KR',
-                    'mktId': 'ALL',
-                    'inqTpCd1': '01',
-                    'viKindCd': '1',
-                    'tboxisuCd_finder_stkisu1_0': '전체',
-                    'isuCd': 'ALL',
-                    'isuCd2': 'ALL',
-                    'param1isuCd_finder_stkisu1_0': 'ALL',
-                    'prcDetailView': '1',
-                    'share': '1',
-                    'money': '1',
-                    'strtDd': date_str,
-                    'endDd': date_str,
-                    'csvxls_isNo': 'true',
-                    'name': 'fileDown',
-                    'url': 'dbms/MDC/STAT/issue/MDCSTAT22401'
-                }
-
-                headers = {
-                    'Referer': 'http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC02021501',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-                }
-
-                with requests.Session() as session:
-                    r = session.get(otp_url, params=query_str_params, headers=headers)
-                    otp_code = r.content
-                    r = session.post(download_url, data={'code': otp_code}, headers=headers)
-                    df_vi = pd.read_excel(BytesIO(r.content), engine='openpyxl')
-
-                if df_vi['발동가격_가격'].apply(pd.to_numeric, errors='coerce').notnull().all():
-                    break
-                date -= timedelta(days=1)
-
-            df_vi = df_vi[df_vi['발동가격_괴리율'] > 0]
-            df_vi = df_vi[df_vi['거래량'] > 1000000]
-            df_vi = df_vi[df_vi['현재가'] > df_vi['시가']]
-            df_vi = df_vi[df_vi['현재가'] > df_vi['발동가격_가격']]
-            df_vi = df_vi[df_vi['종목코드'].str.match(r'^\d+$')]
-            df_vi['종목코드'] = df_vi['종목코드'].apply(lambda x: f"A{int(x):06d}")
-            idx = df_vi.groupby('종목코드')['발동가격_가격'].idxmax()
-            df_vi = df_vi.loc[idx].reset_index(drop=True)
-            vi_list = df_vi['종목코드'].tolist()
-
-            for code in vi_list:
-                if self.daydata.select_code(code):
-                    if len(self.daydata.stockdata[code].get('MAD5', [])) > 0 and len(self.daydata.stockdata[code].get('MAD10', [])) > 0:
-                        if (self.daydata.stockdata[code]['MAD5'][-1] > self.daydata.stockdata[code]['MAD10'][-1]):
-                            if (self.daydata.stockdata[code]['O'][-1] > self.daydata.stockdata[code]['C'][-2] * 0.99):
-                                if code not in self.monistock_set:
-                                    if self.tickdata.monitor_code(code) == True and self.mindata.monitor_code(code) == True:
-                                        if code not in self.starting_time:
-                                            self.starting_time[code] = datetime.now().strftime('%m/%d 09:00:00')
-                                        self.monistock_set.add(code)
-                                        self.stock_added_to_monitor.emit(code)
-                                    else:
-                                        self.daydata.monitor_stop(code)
-                                        self.mindata.monitor_stop(code)
-                                        self.tickdata.monitor_stop(code)
-                            else:
-                                self.daydata.monitor_stop(code)
-                        else:
-                            self.daydata.monitor_stop(code)
-                    else:
-                        self.daydata.monitor_stop(code)
-                else:
-                    self.daydata.monitor_stop(code)
-        except Exception as ex:
-            logging.error(f"download_vi -> {ex}")
-
     def save_list_db(self, code, starting_time, starting_price, is_moni=0, db_file='mylist.db'):
         """종목 리스트 DB 저장"""
         conn = sqlite3.connect(db_file)
@@ -5113,15 +5033,6 @@ class MyWindow(QWidget):
             if not hasattr(self, 'pb9619'):
                 self.pb9619 = CpPB9619()
                 self.pb9619.Subscribe("", self.trader)
-
-        elif stgName == 'VI 발동 D1':
-            if hasattr(self, 'pb9619'):
-                self.pb9619.Unsubscribe()
-            self.objstg.Clear()
-            
-            logging.info(f"전략 초기화: VI 발동 D1")
-            self.trader.init_stock_balance()
-            self.trader.download_vi()
 
         elif stgName == "통합 전략":
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

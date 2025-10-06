@@ -13,18 +13,14 @@ last_strategy =
 
 [STRATEGIES]
 stg_1 = VI 발동
-stg_2 = VI 발동 D1
-stg_3 = 전일상한가
-stg_4 = 급등주
+stg_2 = 전일상한가
+stg_3 = 급등주
+stg_4 = 갭상승
 stg_integrated = 통합 전략
 
-# ===== 매매 평가 설정 =====
 [TRADING]
-# 매매 판단 주기 (초 단위, 기본값: 5초)
 evaluation_interval = 5
-# 이벤트 기반 평가 활성화 (틱 체결 시 즉시 평가)
 event_based_evaluation = True
-# 최소 평가 간격 (초, 과도한 평가 방지)
 min_evaluation_gap = 3
 
 [DATA_SAVING]
@@ -38,11 +34,6 @@ buy_stg_1 = {"name": "골든크로스", "content": "(MAT5[-1] > MAT20[-1] > MAT6
 sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip(tick_high_price[-3:], tick_low_price[-3:])) and (tick_high_price[-1] == tick_high_price[-2] == tick_high_price[-3])"}
 sell_stg_2 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.995 and self.stock_rate > 0.3"}
 sell_stg_3 = {"name": "OSCT 음수 전환", "content": "(OSCT[-2] < OSCT[-1] < 0)"}
-
-[VI 발동 D1]
-buy_stg_1 = {"name": "시초가", "content": "(tick_close_price[-1] > day_open_price[-1]) and (MAT60[-3] < MAT60[-2] < MAT60[-1]) and (MAT120[-3] < MAT120[-2] < MAT120[-1]) and (MA5[-1] > MA10[-1] > MA20[-1]) and (min_close_price[-1] > MA10[-1]) and (OSC[-2] < OSC[-1]) and (OSC[-1] > 0)"}
-sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip(tick_high_price[-3:], tick_low_price[-3:])) and (tick_high_price[-1] == tick_high_price[-2] == tick_high_price[-3])"}
-sell_stg_2 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.993 and self.stock_rate > 0.3"}
 
 [전일상한가]
 buy_stg_1 = {"name": "전일 상한가 시초가", "content": "(MAT5[-1] > MAT20[-1] > MAT60[-1]) and positive_candle"}
