@@ -4820,6 +4820,7 @@ class LoginHandler:
         self.slack_channel = '#stock'
 
     def load_settings(self):
+        """설정 로드"""
         if os.path.exists(self.config_file):
             self.config.read(self.config_file, encoding='utf-8')
             self.parent.loginEdit.setText(self.config.get('LOGIN', 'username', fallback=''))
@@ -4846,8 +4847,15 @@ class LoginHandler:
             self.config.write(configfile)
 
     def attempt_auto_login(self):
-        if self.parent.autoLoginCheckBox.isChecked() and self.parent.loginEdit.text() and self.parent.passwordEdit.text() and self.parent.certpasswordEdit.text():
-            self.handle_login()
+        """자동 로그인 시도"""
+        try:
+            if (self.parent.autoLoginCheckBox.isChecked() and 
+                self.parent.loginEdit.text() and 
+                self.parent.passwordEdit.text() and 
+                self.parent.certpasswordEdit.text()):
+                self.handle_login()
+        except Exception as ex:
+            logging.error(f"attempt_auto_login: {ex}")
 
     def handle_login(self):
         username = self.parent.loginEdit.text()
@@ -4894,30 +4902,57 @@ class LoginHandler:
 class MyWindow(QWidget):
     def __init__(self):
         super().__init__()
+        
+        # ===== ✅ 기본 변수만 초기화 =====
         self.is_loading_strategy = False
         self.market_close_emitted = False
-        self.login_handler = LoginHandler(self)
-        self.init_ui()
-        self.login_handler.load_settings()
-        self.login_handler.attempt_auto_login()
         self.update_chart_status_timer = None
         
-        # 통합 전략 객체들
+        # 전략 객체들 (나중에 초기화)
         self.momentum_scanner = None
         self.gap_scanner = None
         self.volatility_strategy = None
+        
+        # ===== ✅ LoginHandler 먼저 생성 (UI보다 먼저!) =====
+        self.login_handler = LoginHandler(self)
+        
+        # ===== ✅ UI 생성 (이제 login_handler 사용 가능) =====
+        self.init_ui()
+        
+        # ===== ✅ 설정 로드 (login_handler의 메서드 호출) =====
+        self.login_handler.load_settings()
+        
+        # ===== ✅ 자동 로그인 (비동기) =====
+        QTimer.singleShot(100, self.login_handler.attempt_auto_login)
 
     def __del__(self):
         if hasattr(self, 'objstg'):
             self.objstg.Clear()
 
+    def _attempt_auto_login(self):
+        """자동 로그인 시도 (비동기)"""
+        try:
+            if (self.login_handler.config.getboolean('LOGIN', 'autologin', fallback=False) and 
+                self.loginEdit.text() and 
+                self.passwordEdit.text() and 
+                self.certpasswordEdit.text()):
+                
+                # 약간의 지연 후 로그인
+                QTimer.singleShot(500, self.login_handler.handle_login)
+        except Exception as ex:
+            logging.error(f"_attempt_auto_login: {ex}")
+
     def post_login_setup(self):
+        """로그인 후 설정"""
+        
+        # 로거 초기화
         logger = logging.getLogger()
         if not any(isinstance(handler, QTextEditLogger) for handler in logger.handlers):
             text_edit_logger = QTextEditLogger(self.terminalOutput)
             text_edit_logger.setLevel(logging.INFO)
             logger.addHandler(text_edit_logger)
         
+        # 트레이더 객체 생성
         buycount = int(self.buycountEdit.text())
         self.trader = CTrader(cpTrade, cpBalance, cpCodeMgr, cpCash, cpOrder, cpStock, buycount, self)
         self.objstg = CpStrategy(self.trader)
@@ -4932,6 +4967,7 @@ class MyWindow(QWidget):
         self.trader.get_stock_balance('START', 'post_login_setup')
         logging.info(f"시작 시간 : {datetime.now().strftime('%m/%d %H:%M:%S')}")
 
+        # 시그널 연결
         self.trader.stock_added_to_monitor.connect(self.on_stock_added)
         self.trader.stock_bought.connect(self.on_stock_bought)
         self.trader.stock_sold.connect(self.on_stock_sold)
@@ -4941,6 +4977,7 @@ class MyWindow(QWidget):
         self.load_strategy()
 
         self.start_timers()
+        
         self.trader_thread.buy_signal.connect(self.trader.buy_stock)
         self.trader_thread.sell_signal.connect(self.trader.sell_stock)
         self.trader_thread.sell_half_signal.connect(self.trader.sell_half_stock)
@@ -4949,10 +4986,79 @@ class MyWindow(QWidget):
         self.trader_thread.counter_updated.connect(self.update_counter_label)
         self.trader_thread.stock_data_updated.connect(self.update_stock_table)
         
-        # ✅ 봉 완성 signal 연결
+        # 봉 완성 signal 연결
         self.trader_thread.connect_bar_signals()
 
         self.trader_thread.start()
+
+    def _background_initialization(self):
+        """백그라운드 초기화 (무거운 작업들)"""
+        try:
+            # 60% - 계좌 정보
+            QTimer.singleShot(0, lambda: self.splash.update_progress(60, "계좌 정보 조회 중..."))
+            self.trader.get_stock_balance('START', 'post_login_setup')
+            
+            # 70% - 외부 팝업 닫기
+            QTimer.singleShot(0, lambda: self.splash.update_progress(70, "팝업 정리 중..."))
+            self.close_external_popup()
+            
+            # 80% - 전략 로드
+            QTimer.singleShot(0, lambda: self.splash.update_progress(80, "전략 로드 중..."))
+            self.load_strategy()
+            
+            # 90% - 시그널 연결
+            QTimer.singleShot(0, lambda: self.splash.update_progress(90, "시그널 연결 중..."))
+            self._connect_signals()
+            
+            # 95% - 타이머 시작
+            QTimer.singleShot(0, lambda: self.splash.update_progress(95, "타이머 시작 중..."))
+            self.start_timers()
+            
+            # 100% - 완료
+            QTimer.singleShot(0, lambda: self.splash.update_progress(100, "완료!"))
+            time.sleep(0.5)
+            
+            # 스플래시 닫기 (메인 스레드에서)
+            QTimer.singleShot(0, self._finish_initialization)
+            
+        except Exception as ex:
+            logging.error(f"_background_initialization: {ex}\n{traceback.format_exc()}")
+            QTimer.singleShot(0, lambda: QMessageBox.critical(
+                self, "초기화 오류", f"초기화 중 오류 발생:\n{str(ex)}"
+            ))
+
+    def _connect_signals(self):
+        """시그널 연결"""
+        self.trader.stock_added_to_monitor.connect(self.on_stock_added)
+        self.trader.stock_bought.connect(self.on_stock_bought)
+        self.trader.stock_sold.connect(self.on_stock_sold)
+        
+        self.trader_thread.buy_signal.connect(self.trader.buy_stock)
+        self.trader_thread.sell_signal.connect(self.trader.sell_stock)
+        self.trader_thread.sell_half_signal.connect(self.trader.sell_half_stock)
+        self.trader_thread.sell_all_signal.connect(self.trader.sell_all)
+        self.trader_thread.stock_removed_from_monitor.connect(self.on_stock_removed)
+        self.trader_thread.counter_updated.connect(self.update_counter_label)
+        self.trader_thread.stock_data_updated.connect(self.update_stock_table)
+        
+        self.trader_thread.connect_bar_signals()
+        
+        logging.info(f"시작 시간 : {datetime.now().strftime('%m/%d %H:%M:%S')}")
+
+    def _finish_initialization(self):
+        """초기화 완료"""
+        try:
+            if hasattr(self, 'splash'):
+                self.splash.close()
+                del self.splash
+            
+            # 트레이더 스레드 시작
+            self.trader_thread.start()
+            
+            logging.info("=== 초기화 완료 ===")
+            
+        except Exception as ex:
+            logging.error(f"_finish_initialization: {ex}")
 
     def start_timers(self):
         """타이머 시작 (휴일 대응)"""
@@ -5303,6 +5409,7 @@ class MyWindow(QWidget):
             QMessageBox.critical(self, "수정 실패", f"전략 수정 중 오류가 발생했습니다:\n{str(ex)}")
 
     def load_strategy(self):
+        """전략 로드 (최적화)"""
         try:
             self.dataStg = []
             self.data8537 = {}
@@ -5314,8 +5421,13 @@ class MyWindow(QWidget):
 
             if self.login_handler.config.has_section('STRATEGIES'):
                 existing_stgnames = set(self.login_handler.config['STRATEGIES'].values())
+            else:
+                existing_stgnames = set()
 
+            # ===== ✅ 조건검색 리스트 로드 (캐시 사용) =====
             self.data8537 = self.objstg.requestList()
+            
+            # 나머지는 기존 로직과 동일...
             for stgname, v in self.data8537.items():
                 if stgname not in existing_stgnames:
                     existing_keys = self.login_handler.config['STRATEGIES'].keys()
@@ -5345,7 +5457,6 @@ class MyWindow(QWidget):
                         sell_strategy['key'] = sell_key
                         self.strategies[investment_strategy].append(sell_strategy)
 
-            # 통합 전략 추가
             if "통합 전략" not in existing_stgnames:
                 self.login_handler.config.set('STRATEGIES', 'stg_integrated', "통합 전략")
                 existing_stgnames.add("통합 전략")
@@ -5356,7 +5467,7 @@ class MyWindow(QWidget):
             for stgname in existing_stgnames:
                 self.comboStg.addItem(stgname)
             
-            last_strategy = self.login_handler.config.get('SETTINGS', 'last_strategy', fallback='VI 발동')
+            last_strategy = self.login_handler.config.get('SETTINGS', 'last_strategy', fallback='통합 전략')
             index = self.comboStg.findText(last_strategy)
             if index != -1:
                 self.comboStg.setCurrentIndex(index)
@@ -6345,38 +6456,114 @@ class QTextEditLogger(QObject, logging.Handler):
 
         self.log_signal.emit(msg)
 
+class SplashScreen(QWidget):
+    """로딩 스플래시 스크린"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        
+        # 레이아웃
+        layout = QVBoxLayout()
+        layout.setAlignment(Qt.AlignCenter)
+        
+        # 로고/타이틀
+        title_label = QLabel("초단타 매매 프로그램")
+        title_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 24px;
+                font-weight: bold;
+                background-color: rgba(0, 0, 0, 180);
+                padding: 20px;
+                border-radius: 10px;
+            }
+        """)
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # 로딩 메시지
+        self.message_label = QLabel("초기화 중...")
+        self.message_label.setStyleSheet("""
+            QLabel {
+                color: white;
+                font-size: 14px;
+                background-color: rgba(0, 0, 0, 180);
+                padding: 10px;
+                border-radius: 5px;
+            }
+        """)
+        self.message_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.message_label)
+        
+        # 프로그레스 바
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 2px solid grey;
+                border-radius: 5px;
+                text-align: center;
+                background-color: rgba(255, 255, 255, 200);
+            }
+            QProgressBar::chunk {
+                background-color: #05B8CC;
+                width: 10px;
+                margin: 0.5px;
+            }
+        """)
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        layout.addWidget(self.progress_bar)
+        
+        self.setLayout(layout)
+        self.resize(400, 200)
+        
+        # 화면 중앙 배치
+        self.center()
+    
+    def center(self):
+        """화면 중앙 정렬"""
+        qr = self.frameGeometry()
+        cp = QApplication.desktop().availableGeometry().center()
+        qr.moveCenter(cp)
+        self.move(qr.topLeft())
+    
+    def update_progress(self, value, message=""):
+        """진행 상황 업데이트"""
+        self.progress_bar.setValue(value)
+        if message:
+            self.message_label.setText(message)
+        QApplication.processEvents()
+
 # ==================== Main ====================
 if __name__ == "__main__":
-    # ✅ 실행 경로 설정
     if getattr(sys, 'frozen', False):
-        # PyInstaller로 빌드된 경우
         application_path = os.path.dirname(sys.executable)
         os.chdir(application_path)
     
     try:
-        # 로그 초기화
+        # 로그 초기화 (빠름)
         setup_logging()
         logging.info("=" * 50)
         logging.info("=== 초단타 매매 프로그램 시작 ===")
         logging.info(f"실행 경로: {os.getcwd()}")
-        logging.info(f"Python 버전: {sys.version}")
         logging.info("=" * 50)
 
-        # QApplication 생성
+        # QApplication 생성 (빠름)
         app = QApplication(sys.argv)
         
-        # 폰트 설정
+        # 폰트 설정 (빠름)
         try:
             app.setFont(QFont("Malgun Gothic", 9))
-            logging.info("폰트 설정 완료")
         except Exception as ex:
             logging.warning(f"폰트 설정 실패: {ex}")
         
-        # 메인 윈도우 생성
+        # ===== ✅ 메인 윈도우 즉시 생성 및 표시 =====
         logging.info("메인 윈도우 생성 중...")
         myWindow = MyWindow()
         
-        # 아이콘 설정
+        # 아이콘 설정 (빠름)
         try:
             icon_path = 'stock_trader.ico'
             if getattr(sys, 'frozen', False):
@@ -6384,15 +6571,12 @@ if __name__ == "__main__":
             
             if os.path.exists(icon_path):
                 myWindow.setWindowIcon(QIcon(icon_path))
-                logging.info(f"아이콘 설정 완료: {icon_path}")
-            else:
-                logging.warning(f"아이콘 파일 없음: {icon_path}")
         except Exception as ex:
             logging.warning(f"아이콘 설정 실패: {ex}")
         
-        # 창 표시
+        # ===== ✅ 창 즉시 표시 =====
         myWindow.showMaximized()
-        logging.info("GUI 초기화 완료")
+        logging.info("GUI 표시 완료")
         
         # 이벤트 루프 실행
         exit_code = app.exec_()
