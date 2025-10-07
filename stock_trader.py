@@ -327,7 +327,7 @@ class MomentumScanner(QObject):
         self.cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
     
     def verify_momentum_conditions(self, code):
-        """급등주 조건 재확인 (안전성 강화)
+        """급등주 조건 재확인 (메모리 데이터 기반)
         
         조건검색으로 들어온 종목이 실제로 급등주 조건을 만족하는지 검증
         
@@ -340,30 +340,31 @@ class MomentumScanner(QObject):
             if cached_score is not None:
                 return (cached_score >= 70, cached_score, "캐시에서 조회")
             
-            # ===== ✅ API 제한 대기 =====
-            api_limiter.wait_if_needed()
+            # ===== ✅ 메모리 데이터 기반 검증 =====
+            tick_data = self.trader.tickdata.get_latest_data(code)
+            min_data = self.trader.mindata.get_latest_data(code)
+            day_data = self.trader.daydata.stockdata.get(code, {})
             
-            # 현재가 정보 (타임아웃 처리)
-            try:
-                self.cpStock.SetInputValue(0, code)
-                self.cpStock.BlockRequest2(1)
-            except Exception as ex:
-                logging.error(f"{code}: API 호출 실패: {ex}")
-                return (False, 0, "API 호출 실패")
+            if not tick_data or not min_data or not day_data:
+                return (False, 0, "메모리 데이터 없음")
             
-            # ===== 데이터 추출 =====
+            # ===== 데이터 추출 (메모리에서) =====
             try:
-                current_price = self.cpStock.GetHeaderValue(11)
-                open_price = self.cpStock.GetHeaderValue(13)
-                high_price = self.cpStock.GetHeaderValue(14)
-                low_price = self.cpStock.GetHeaderValue(15)
-                volume = self.cpStock.GetHeaderValue(18)
-                prev_close = self.cpStock.GetHeaderValue(20)
-                prev_volume = self.cpStock.GetHeaderValue(21)
-                market_cap = self.cpStock.GetHeaderValue(67)  # 백만원 단위
+                current_price = tick_data.get('C', 0)
+                open_price = day_data.get('O', [0])[-1] if day_data.get('O') else 0
+                high_price = day_data.get('H', [0])[-1] if day_data.get('H') else 0
+                low_price = day_data.get('L', [0])[-1] if day_data.get('L') else 0
+                volume = day_data.get('V', [0])[-1] if day_data.get('V') else 0
+                prev_close = day_data.get('C', [0])[-2] if len(day_data.get('C', [])) >= 2 else 0
+                prev_volume = day_data.get('V', [0])[-2] if len(day_data.get('V', [])) >= 2 else 0
+                market_cap = 0  # 일봉 데이터에는 시가총액 정보가 없음
+                
+                if current_price == 0 or open_price == 0:
+                    return (False, 0, "가격 데이터 없음")
+                    
             except Exception as ex:
-                logging.error(f"{code}: 데이터 추출 실패: {ex}")
-                return (False, 0, "데이터 추출 실패")
+                logging.error(f"{code}: 메모리 데이터 추출 실패: {ex}")
+                return (False, 0, "메모리 데이터 추출 실패")
             
             # ===== 1차 필터링 =====
             if current_price < 2000 or current_price > 50000:
@@ -454,7 +455,7 @@ class GapUpScanner:
         self.last_verification_time = {}
     
     def verify_gap_conditions(self, code):
-        """갭상승 조건 재확인 (안전성 강화)
+        """갭상승 조건 재확인 (메모리 데이터 기반)
         
         Returns:
             (is_valid, gap_pct, message): (검증 통과 여부, 갭 비율, 메시지)
@@ -471,28 +472,18 @@ class GapUpScanner:
                         logging.debug(f"{code}: 캐시에서 조회 (5초 이내)")
                         return cached
             
-            # ===== ✅ API 제한 대기 =====
-            api_limiter.wait_if_needed()
+            # ===== ✅ 메모리 데이터 기반 검증 =====
+            tick_data = self.trader.tickdata.get_latest_data(code)
+            day_data = self.trader.daydata.stockdata.get(code, {})
             
-            # ===== ✅ 현재가 정보 조회 (타임아웃 처리) =====
-            try:
-                self.cpStock.SetInputValue(0, code)
-                self.cpStock.BlockRequest2(1)
-                
-                rqStatus = self.cpStock.GetDibStatus()
-                if rqStatus != 0:
-                    logging.error(f"{stock_name}({code}): API 상태 오류 ({rqStatus})")
-                    return (False, 0, "API 오류")
-                
-            except Exception as ex:
-                logging.error(f"{stock_name}({code}): API 호출 실패: {ex}")
-                return (False, 0, "API 호출 실패")
+            if not tick_data or not day_data:
+                return (False, 0, "메모리 데이터 없음")
             
-            # ===== ✅ 데이터 안전하게 추출 =====
+            # ===== ✅ 데이터 안전하게 추출 (메모리에서) =====
             try:
-                current_price = self.cpStock.GetHeaderValue(11)  # 현재가
-                open_price = self.cpStock.GetHeaderValue(13)     # 시가
-                prev_close = self.cpStock.GetHeaderValue(20)     # 전일종가
+                current_price = tick_data.get('C', 0)  # 현재가
+                open_price = day_data.get('O', [0])[-1] if day_data.get('O') else 0  # 시가
+                prev_close = day_data.get('C', [0])[-2] if len(day_data.get('C', [])) >= 2 else 0  # 전일종가
                 
                 # 데이터 유효성 검증
                 if not all([current_price, open_price, prev_close]):
@@ -548,7 +539,7 @@ class GapUpScanner:
             if len(day_data.get('O', [])) == 0:
                 return False
             
-            today_open = day_data['O'][-1]
+            today_open = day_data.get('O', [0])[-1] if day_data.get('O') else 0
             
             # 현재가
             tick_latest = self.trader.tickdata.get_latest_data(code)
@@ -588,11 +579,11 @@ class VolatilityBreakout:
                 return None
             
             # 전일 고가/저가
-            prev_high = day_data['H'][-2]
-            prev_low = day_data['L'][-2]
+            prev_high = day_data.get('H', [0])[-2] if len(day_data.get('H', [])) >= 2 else 0
+            prev_low = day_data.get('L', [0])[-2] if len(day_data.get('L', [])) >= 2 else 0
             
             # 당일 시가
-            today_open = day_data['O'][-1]
+            today_open = day_data.get('O', [0])[-1] if day_data.get('O') else 0
             
             # 변동폭
             range_value = prev_high - prev_low
@@ -662,8 +653,8 @@ class VolatilityBreakout:
             if len(day_data.get('V', [])) < 2:
                 return 0
             
-            today_vol = day_data['V'][-1]
-            prev_vol = day_data['V'][-2]
+            today_vol = day_data.get('V', [0])[-1] if day_data.get('V') else 0
+            prev_vol = day_data.get('V', [0])[-2] if len(day_data.get('V', [])) >= 2 else 0
             
             if prev_vol > 0:
                 return today_vol / prev_vol
@@ -4193,9 +4184,7 @@ class AutoTraderThread(QThread):
         
         # === 기타 변수 ===
         strength = self.trader.tickdata.get_strength(code)
-        momentum_score = 0
-        if self.window.momentum_scanner:
-            momentum_score = self.window.momentum_scanner._calculate_momentum_score(code)
+        momentum_score = 0  # ✅ API 호출 제거, 기본값 사용
         
         threshold = self.get_threshold_by_hour()
         
