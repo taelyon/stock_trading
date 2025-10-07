@@ -1,19 +1,19 @@
-발생 시간: 2025-10-06 23:08:54.061948
+발생 시간: 2025-10-07 09:46:47.971140
 실행 경로: C:\MyAPP\stock_trading
 Python: 3.9.13 (tags/v3.9.13:6de2ca5, May 17 2022, 16:24:45) [MSC v.1929 32 bit (Intel)]
 
 프로그램 실행 중 치명적 오류 발생:
 
-AttributeError: 'MyWindow' object has no attribute 'login_handler'
+AttributeError: 'LoginHandler' object has no attribute 'buycount_setting'
 
 상세 정보:
 Traceback (most recent call last):
-  File "c:\MyAPP\stock_trading\stock_trader.py", line 6557, in <module>
+  File "c:\MyAPP\stock_trading\stock_trader.py", line 6651, in <module>
     myWindow = MyWindow()
-  File "c:\MyAPP\stock_trading\stock_trader.py", line 4925, in __init__
+  File "c:\MyAPP\stock_trading\stock_trader.py", line 5007, in __init__
     self.init_ui()
-  File "c:\MyAPP\stock_trading\stock_trader.py", line 6049, in init_ui
+  File "c:\MyAPP\stock_trading\stock_trader.py", line 6143, in init_ui
     self.init_trading_tab()
-  File "c:\MyAPP\stock_trading\stock_trader.py", line 6250, in init_trading_tab
-    self.loginButton.clicked.connect(self.login_handler.handle_login)
-AttributeError: 'MyWindow' object has no attribute 'login_handler'
+  File "c:\MyAPP\stock_trading\stock_trader.py", line 6345, in init_trading_tab
+    self.buycountButton.clicked.connect(self.login_handler.buycount_setting)
+AttributeError: 'LoginHandler' object has no attribute 'buycount_setting'

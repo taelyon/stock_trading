@@ -15,6 +15,9 @@ import pandas as pd
 import win32com.client
 import time
 import numpy as np
+import win32gui
+import win32con
+import win32api
 
 import re
 import mplfinance as mpf
@@ -24,7 +27,6 @@ import psutil
 import configparser
 import pygetwindow as gw
 import requests
-from io import BytesIO
 import warnings
 import logging
 from openpyxl import Workbook
@@ -137,52 +139,81 @@ class SlackMessageSender(QRunnable):
 
 # ==================== API 제한 관리자 ====================
 class APILimiter:
-    """API 호출 제한 관리 (강화)"""
+    """API 호출 제한 관리 (대신증권 제한 고려)"""
     
     def __init__(self):
-        self.request_times = deque(maxlen=15)
+        # ===== ✅ 1분당 12개로 안전하게 제한 (15개 → 12개) =====
+        self.request_times = deque(maxlen=12)  # 여유 확보
         self.lock = threading.Lock()
         self.last_request_time = 0
         
     def wait_if_needed(self):
-        """API 제한 대기 (더 안전하게)"""
+        """API 제한 대기"""
         wait_time = 0
         
         with self.lock:
             now = time.time()
             
-            # 1분당 15개 제한
-            while len(self.request_times) >= 15:
+            # ===== ✅ 대신증권 실시간 제한 확인 =====
+            try:
+                remain_time0 = cpStatus.GetLimitRemainTime(0)
+                remain_time1 = cpStatus.GetLimitRemainTime(1)
+                
+                if remain_time0 > 0 or remain_time1 > 0:
+                    creon_wait = max(remain_time0, remain_time1) / 1000 + 0.5
+                    if creon_wait > wait_time:
+                        wait_time = creon_wait
+                        logging.warning(f"🚨 대신증권 API 제한: {creon_wait:.1f}초 대기")
+            except Exception as ex:
+                logging.debug(f"API 제한 확인 실패: {ex}")
+            
+            # ===== ✅ 자체 1분당 12개 제한 =====
+            while len(self.request_times) >= 12:
                 oldest = self.request_times[0]
                 if now - oldest < 60:
-                    wait_time = 60 - (now - oldest) + 0.2  # 여유 추가
+                    local_wait = 60 - (now - oldest) + 1.0
+                    if local_wait > wait_time:
+                        wait_time = local_wait
+                        logging.debug(f"⏳ 로컬 API 제한: {local_wait:.1f}초 대기")
                     break
                 else:
                     self.request_times.popleft()
             
-            # 최소 간격 (0.5초)
+            # ===== ✅ 최소 간격 1초 =====
             if wait_time == 0 and len(self.request_times) > 0:
                 last_request = self.request_times[-1]
-                min_interval = 0.5  # 기존 1초 → 0.5초로 완화
+                min_interval = 1.0
                 if now - last_request < min_interval:
-                    wait_time = min_interval - (now - last_request)
+                    interval_wait = min_interval - (now - last_request)
+                    if interval_wait > wait_time:
+                        wait_time = interval_wait
         
         # 락 밖에서 sleep
         if wait_time > 0:
-            logging.debug(f"API 제한: {wait_time:.1f}초 대기")
+            if wait_time > 10:
+                logging.warning(f"⏰ API 제한 대기: {wait_time:.1f}초")
+            else:
+                logging.debug(f"API 제한: {wait_time:.1f}초 대기")
             time.sleep(wait_time)
         
         with self.lock:
             self.request_times.append(time.time())
             self.last_request_time = time.time()
     
-    def get_remaining_count(self):
-        """남은 요청 가능 횟수"""
-        with self.lock:
-            now = time.time()
-            # 1분 이내 요청 필터링
-            recent = [t for t in self.request_times if now - t < 60]
-            return max(0, 15 - len(recent))
+    def get_status_info(self):
+        """API 상태 정보"""
+        try:
+            remain0 = cpStatus.GetLimitRemainTime(0)
+            remain1 = cpStatus.GetLimitRemainTime(1)
+            remaining_count = max(0, 12 - len(self.request_times))
+            
+            return {
+                'creon_limit_0': remain0,
+                'creon_limit_1': remain1,
+                'local_remaining': remaining_count
+            }
+        except Exception as ex:
+            return {'error': str(ex)}        
 
 # 전역 API 제한자
 api_limiter = APILimiter()
@@ -219,7 +250,7 @@ stock_info_cache = DataCache(expire_seconds=300)  # 5분
 
 # ==================== 영업일 찾기 유틸리티 ==================== ✅ 여기에 추가
 def get_last_trading_date(target_date=None, max_attempts=10):
-    """가장 최근 영업일 찾기
+    """가장 최근 영업일 찾기 (삼성전자 기준)
     
     Args:
         target_date: 검색 시작일 (datetime 또는 YYYYMMDD 정수)
@@ -229,63 +260,61 @@ def get_last_trading_date(target_date=None, max_attempts=10):
         (success, trading_date): (성공 여부, 영업일 YYYYMMDD 정수)
     """
     try:
-        # target_date가 없으면 오늘
         if target_date is None:
             check_date = datetime.now()
         elif isinstance(target_date, int):
-            # YYYYMMDD 정수를 datetime으로 변환
             date_str = str(target_date)
             check_date = datetime.strptime(date_str, '%Y%m%d')
         else:
             check_date = target_date
         
-        # StockChart API로 데이터 확인
         objRq = win32com.client.Dispatch("CpSysDib.StockChart")
+        attempts = 0
         
-        for i in range(max_attempts):
-            test_date = check_date - timedelta(days=i)
-            test_date_int = test_date.year * 10000 + test_date.month * 100 + test_date.day
+        for i in range(max_attempts * 2):  # 주말 포함
+            if attempts >= max_attempts:
+                break
             
-            # 주말 체크 (빠른 스킵)
-            if test_date.weekday() >= 5:  # 토요일(5), 일요일(6)
-                logging.debug(f"{test_date_int}: 주말, 스킵")
+            test_date = check_date - timedelta(days=i)
+            
+            # 주말 스킵
+            if test_date.weekday() >= 5:
                 continue
             
-            # 임의의 종목(삼성전자)으로 해당 날짜 데이터 확인
+            attempts += 1
+            test_date_int = test_date.year * 10000 + test_date.month * 100 + test_date.day
+            
+            # API 제한 대기
             api_limiter.wait_if_needed()
             
-            objRq.SetInputValue(0, 'A005930')  # 삼성전자
-            objRq.SetInputValue(1, ord('1'))    # 기간 조회
-            objRq.SetInputValue(2, test_date_int)  # 종료일
-            objRq.SetInputValue(3, test_date_int)  # 시작일
-            objRq.SetInputValue(5, [0, 2, 3, 4, 5])  # 날짜, 시가, 고가, 저가, 종가
-            objRq.SetInputValue(6, ord('D'))    # 일봉
-            objRq.SetInputValue(9, ord('1'))    # 수정주가
+            # 삼성전자로 영업일 확인
+            objRq.SetInputValue(0, 'A005930')
+            objRq.SetInputValue(1, ord('1'))
+            objRq.SetInputValue(2, test_date_int)
+            objRq.SetInputValue(3, test_date_int)
+            objRq.SetInputValue(5, [0])  # 날짜만
+            objRq.SetInputValue(6, ord('D'))
+            objRq.SetInputValue(9, ord('1'))
             objRq.BlockRequest2(1)
             
             rqStatus = objRq.GetDibStatus()
             if rqStatus != 0:
-                logging.warning(f"{test_date_int}: API 조회 실패")
                 continue
             
             len_data = objRq.GetHeaderValue(3)
             
             if len_data > 0:
-                # 데이터가 있으면 영업일
                 actual_date = objRq.GetDataValue(0, 0)
-                logging.info(f"✅ 최근 영업일 찾음: {actual_date}")
+                logging.info(f"✅ 최근 영업일: {actual_date}")
                 return (True, actual_date)
-            else:
-                logging.debug(f"{test_date_int}: 데이터 없음 (휴일 또는 휴장일)")
         
-        # max_attempts 내에 영업일을 못 찾음
         logging.warning(f"최근 {max_attempts}일 내 영업일을 찾지 못했습니다")
         return (False, None)
         
     except Exception as ex:
-        logging.error(f"get_last_trading_date -> {ex}")
+        logging.error(f"get_last_trading_date: {ex}")
         return (False, None)
-
+    
 # ==================== 급등주 스캐너 (검증용으로만 사용) ====================
 class MomentumScanner(QObject):
     """급등주 검증 - 조건검색 편입 종목 재확인용"""
@@ -419,97 +448,94 @@ class GapUpScanner:
     def __init__(self, trader):
         self.trader = trader
         self.cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
+
+        # ===== ✅ 캐시 및 안전장치 추가 =====
+        self.verification_cache = {}
+        self.last_verification_time = {}
     
     def verify_gap_conditions(self, code):
-        """갭 상승 조건 재확인
-        
-        조건검색으로 들어온 종목이 실제로 갭 상승 조건을 만족하는지 검증
-        
-        HTS 조건검색: 간단한 조건만
-        - 갭 상승 1.5% ~ 4.0%
-        - 현재가 > 시가
-        
-        Python 재검증: 정밀한 조건 추가
-        - 현재가 >= 시가 * 0.99 (시가 대비 -1% 이내)
-        - 거래량 비율 >= 150%
+        """갭상승 조건 재확인 (안전성 강화)
         
         Returns:
             (is_valid, gap_pct, message): (검증 통과 여부, 갭 비율, 메시지)
         """
         try:
-            # 일봉 데이터 로드
-            if not self.trader.daydata.select_code(code):
-                return (False, 0, "일봉 데이터 로드 실패")
+            stock_name = cpCodeMgr.CodeToName(code)
             
-            day_data = self.trader.daydata.stockdata.get(code, {})
+            # ===== ✅ 캐시 확인 (5초 이내 재검증 방지) =====
+            now = time.time()
+            if code in self.last_verification_time:
+                if now - self.last_verification_time[code] < 5.0:
+                    cached = self.verification_cache.get(code)
+                    if cached:
+                        logging.debug(f"{code}: 캐시에서 조회 (5초 이내)")
+                        return cached
             
-            if len(day_data.get('C', [])) < 2:
-                return (False, 0, "데이터 부족")
-            
-            # 1️⃣ 갭 상승 비율 확인
-            prev_close = day_data['C'][-2]
-            today_open = day_data['O'][-1]
-            
-            if prev_close == 0:
-                return (False, 0, "전일 종가 0")
-            
-            gap_pct = (today_open - prev_close) / prev_close * 100
-            
-            # 갭 상승 1.5% ~ 4%
-            if not (1.5 <= gap_pct <= 4.0):
-                return (False, gap_pct, f"갭 범위 미달 ({gap_pct:.2f}%)")
-            
-            # 2️⃣ 시가 유지 확인 (HTS에서 못하는 정밀 조건)
-            # HTS: 현재가 > 시가
-            # Python: 현재가 >= 시가 * 0.99 (시가 대비 -1% 이내)
-            
-            # 현재가 조회
+            # ===== ✅ API 제한 대기 =====
             api_limiter.wait_if_needed()
             
-            self.cpStock.SetInputValue(0, code)
-            self.cpStock.BlockRequest2(1)
-            current_price = self.cpStock.GetHeaderValue(11)
-            
-            if current_price < today_open * 0.99:
-                return (False, gap_pct, f"시가 미유지 ({current_price}/{today_open}, {(current_price/today_open-1)*100:.2f}%)")
-            
-            # 3️⃣ 거래량 확인
-            if len(day_data.get('V', [])) >= 2:
-                today_vol = day_data['V'][-1]
-                prev_vol = day_data['V'][-2]
+            # ===== ✅ 현재가 정보 조회 (타임아웃 처리) =====
+            try:
+                self.cpStock.SetInputValue(0, code)
+                self.cpStock.BlockRequest2(1)
                 
-                if prev_vol > 0:
-                    volume_ratio = today_vol / prev_vol
-                    
-                    if volume_ratio < 1.5:
-                        return (False, gap_pct, f"거래량 부족 ({volume_ratio:.1f}배)")
-                    
-                    # ✅ 모든 조건 통과
-                    return (
-                        True, 
-                        gap_pct, 
-                        f"갭상승 {gap_pct:.2f}%, 거래량 {volume_ratio:.1f}배, "
-                        f"시가유지 {(current_price/today_open-1)*100:+.2f}%"
-                    )
+                rqStatus = self.cpStock.GetDibStatus()
+                if rqStatus != 0:
+                    logging.error(f"{stock_name}({code}): API 상태 오류 ({rqStatus})")
+                    return (False, 0, "API 오류")
+                
+            except Exception as ex:
+                logging.error(f"{stock_name}({code}): API 호출 실패: {ex}")
+                return (False, 0, "API 호출 실패")
+            
+            # ===== ✅ 데이터 안전하게 추출 =====
+            try:
+                current_price = self.cpStock.GetHeaderValue(11)  # 현재가
+                open_price = self.cpStock.GetHeaderValue(13)     # 시가
+                prev_close = self.cpStock.GetHeaderValue(20)     # 전일종가
+                
+                # 데이터 유효성 검증
+                if not all([current_price, open_price, prev_close]):
+                    logging.warning(f"{stock_name}({code}): 가격 데이터 없음")
+                    return (False, 0, "가격 데이터 없음")
+                
+                if prev_close <= 0:
+                    logging.warning(f"{stock_name}({code}): 전일종가 0 이하")
+                    return (False, 0, "전일종가 오류")
+                
+            except Exception as ex:
+                logging.error(f"{stock_name}({code}): 데이터 추출 실패: {ex}")
+                return (False, 0, "데이터 추출 실패")
+            
+            # ===== ✅ 갭 비율 계산 =====
+            gap_pct = (open_price - prev_close) / prev_close * 100
+            
+            # ===== ✅ 갭상승 조건 검증 =====
+            is_valid = False
+            message = ""
+            
+            # 조건 1: 시가가 전일종가 대비 2% 이상 상승
+            if gap_pct >= 2.0:
+                # 조건 2: 현재가가 시가 대비 하락하지 않음
+                if current_price >= open_price * 0.98:  # 2% 이내 허용
+                    is_valid = True
+                    message = f"갭상승 {gap_pct:.2f}%, 시가 유지"
                 else:
-                    # 거래량 정보 없어도 갭과 시가 조건만으로 통과
-                    return (
-                        True, 
-                        gap_pct, 
-                        f"갭상승 {gap_pct:.2f}%, 시가유지 {(current_price/today_open-1)*100:+.2f}%"
-                    )
+                    message = f"갭상승 {gap_pct:.2f}%이나 시가 대비 하락"
             else:
-                # 거래량 정보 없어도 갭과 시가 조건만으로 통과
-                return (
-                    True, 
-                    gap_pct, 
-                    f"갭상승 {gap_pct:.2f}%, 시가유지 {(current_price/today_open-1)*100:+.2f}%"
-                )
+                message = f"갭 비율 부족 ({gap_pct:.2f}%)"
+            
+            # ===== ✅ 결과 캐시 저장 =====
+            result = (is_valid, gap_pct, message)
+            self.verification_cache[code] = result
+            self.last_verification_time[code] = now
+            
+            return result
             
         except Exception as ex:
-            logging.error(f"verify_gap_conditions({code}): {ex}")
+            logging.error(f"verify_gap_conditions({code}): {ex}\n{traceback.format_exc()}")
             return (False, 0, f"검증 오류: {ex}")
-    
+        
     def check_gap_hold(self, code):
         """갭 유지 확인 (매수 조건)
         
@@ -809,15 +835,19 @@ class CpStrategy:
         self.stgname = {}
         self.objpb = CpPBCssAlert()
         
-        # ✅ 검증용 스캐너 (조건검색 편입 종목 재확인용)
         self.momentum_scanner = None
         self.gap_scanner = None
         
-        # ===== ✅ 종목 처리 큐 추가 =====
+        # ===== ✅ 큐 처리 강화 =====
         self.stock_queue = queue.Queue()
         self.is_processing = False
         self.processing_lock = threading.Lock()
         self.processing_thread = None
+        
+        # ===== ✅ 처리 제한 추가 =====
+        self.max_concurrent_stocks = 1  # 동시 처리 종목 수 제한
+        self.processing_stocks = set()  # 현재 처리 중인 종목
+        self.failed_stocks = {}  # 실패한 종목 기록
 
     def start_processing_queue(self):
         """큐 처리 스레드 시작"""
@@ -827,10 +857,10 @@ class CpStrategy:
             logging.info("✅ 종목 처리 큐 스레드 시작")
 
     def _process_stock_queue(self):
-        """큐에서 종목 순차 처리"""
+        """큐에서 종목 순차 처리 (안전성 강화)"""
         while True:
             try:
-                # 큐에서 종목 가져오기 (타임아웃 1초)
+                # 큐에서 종목 가져오기
                 try:
                     stock_data = self.stock_queue.get(timeout=1.0)
                 except queue.Empty:
@@ -839,21 +869,72 @@ class CpStrategy:
                 if stock_data is None:  # 종료 신호
                     break
                 
-                # 종목 처리
-                self._process_single_stock(stock_data)
+                code = stock_data.get('code')
                 
-                # 처리 완료 표시
-                self.stock_queue.task_done()
+                # ===== ✅ 중복 처리 방지 =====
+                if code in self.processing_stocks:
+                    logging.debug(f"{code}: 이미 처리 중, 스킵")
+                    self.stock_queue.task_done()
+                    continue
                 
-                # 다음 종목 전 대기 (안정성)
-                time.sleep(0.5)
+                # ===== ✅ 실패 이력 확인 (3회 실패 시 스킵) =====
+                if code in self.failed_stocks and self.failed_stocks[code] >= 3:
+                    logging.warning(f"{code}: 3회 실패, 더 이상 시도 안 함")
+                    self.stock_queue.task_done()
+                    continue
+                
+                # 처리 중 표시
+                self.processing_stocks.add(code)
+                
+                try:
+                    # ===== ✅ 타임아웃 적용 처리 =====
+                    self._process_single_stock_with_timeout(stock_data, timeout=60.0)
+                except Exception as ex:
+                    logging.error(f"{code} 처리 중 예외: {ex}")
+                    # 실패 카운트 증가
+                    self.failed_stocks[code] = self.failed_stocks.get(code, 0) + 1
+                finally:
+                    # 처리 완료 표시
+                    if code in self.processing_stocks:
+                        self.processing_stocks.remove(code)
+                    
+                    self.stock_queue.task_done()
+                
+                # ===== ✅ 다음 종목 전 더 긴 대기 =====
+                time.sleep(1.0)  # 0.5초 → 1.0초
                 
             except Exception as ex:
-                logging.error(f"_process_stock_queue: {ex}")
+                logging.error(f"_process_stock_queue: {ex}\n{traceback.format_exc()}")
                 continue
 
+    def _process_single_stock_with_timeout(self, stock_data, timeout=60.0):
+        """타임아웃이 있는 종목 처리"""
+        result = [None]
+        exception = [None]
+        
+        def worker():
+            try:
+                result[0] = self._process_single_stock(stock_data)
+            except Exception as ex:
+                exception[0] = ex
+        
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+        
+        if thread.is_alive():
+            code = stock_data.get('code')
+            logging.error(f"{code}: 처리 타임아웃 ({timeout}초)")
+            raise TimeoutError(f"{code} 처리 타임아웃")
+        
+        if exception[0]:
+            raise exception[0]
+        
+        return result[0]
+
     def _process_single_stock(self, stock_data):
-        """단일 종목 처리 (안전)"""
+        """단일 종목 처리 (안전성 강화)"""
+        code = None
         try:
             stgid = stock_data['stgid']
             stgmonid = stock_data['stgmonid']
@@ -864,34 +945,46 @@ class CpStrategy:
             
             stock_name = cpCodeMgr.CodeToName(code)
             
-            # 이미 모니터링 중이면 스킵
-            if code in self.trader.monistock_set:
-                logging.debug(f"{stock_name}({code}): 이미 모니터링 중")
-                return
+            logging.info(f"{'='*50}")
+            logging.info(f"📋 {stock_name}({code}) 처리 시작 - 전략: {stgname}")
+            logging.info(f"{'='*50}")
             
-            # API 제한 체크
+            # ===== ✅ 중복 확인 강화 =====
+            if code in self.trader.monistock_set:
+                logging.info(f"{stock_name}({code}): 이미 모니터링 중, 스킵")
+                return True
+            
+            if code in self.trader.bought_set:
+                logging.info(f"{stock_name}({code}): 이미 보유 중, 스킵")
+                return True
+            
+            # ===== ✅ API 제한 체크 =====
             remain_time0 = cpStatus.GetLimitRemainTime(0)
             remain_time1 = cpStatus.GetLimitRemainTime(1)
             if remain_time0 != 0 or remain_time1 != 0:
-                logging.warning(f"{code}: API 제한 대기 중")
-                time.sleep(max(remain_time0, remain_time1) / 1000 + 0.1)
+                wait_time = max(remain_time0, remain_time1) / 1000 + 0.5
+                logging.warning(f"{code}: API 제한 대기 ({wait_time:.1f}초)")
+                time.sleep(wait_time)
             
-            # 장 시작 후에만 처리
-            if datetime.now() < datetime.now().replace(hour=9, minute=3, second=0, microsecond=0):
-                logging.debug(f"{code}: 장 시작 전, 스킵")
-                return
+            # ===== ✅ 장 시작 후에만 처리 =====
+            now = datetime.now()
+            market_open = now.replace(hour=9, minute=3, second=0, microsecond=0)
+            if now < market_open:
+                logging.debug(f"{code}: 장 시작 전({now.strftime('%H:%M:%S')}), 스킵")
+                return False
             
             # 전략별 처리
             if stgname == '급등주':
-                self._process_momentum_stock(code, stgprice, time_str)
+                return self._process_momentum_stock(code, stgprice, time_str)
             elif stgname == '갭상승':
-                self._process_gap_stock(code, stgprice, time_str)
+                return self._process_gap_stock(code, stgprice, time_str)
             else:
-                self._process_other_stock(code, stgprice, time_str)
+                return self._process_other_stock(code, stgprice, time_str)
                 
         except Exception as ex:
             logging.error(f"_process_single_stock({code}): {ex}\n{traceback.format_exc()}")
-
+            return False
+        
     def _process_momentum_stock(self, code, stgprice, time_str):
         """급등주 처리 (안전)"""
         try:
@@ -965,64 +1058,120 @@ class CpStrategy:
             logging.error(f"_process_momentum_stock({code}): {ex}\n{traceback.format_exc()}")
 
     def _process_gap_stock(self, code, stgprice, time_str):
-        """갭상승 처리"""
+        """갭상승 처리 (안전성 대폭 강화)"""
+        stock_name = cpCodeMgr.CodeToName(code)
+        
         try:
-            stock_name = cpCodeMgr.CodeToName(code)
+            logging.info(f"🔍 {stock_name}({code}): 갭상승 검증 시작")
             
+            # ===== ✅ GapUpScanner 확인 =====
             if not self.gap_scanner:
-                logging.warning("GapUpScanner가 초기화되지 않음")
-                return
+                logging.error(f"{stock_name}({code}): GapUpScanner 미초기화")
+                return False
             
-            # 갭상승 조건 재확인
+            # ===== ✅ 일봉 데이터 먼저 로드 (검증 전) =====
+            logging.debug(f"{stock_name}({code}): 일봉 로드 중...")
+            
+            try:
+                if not self.trader.daydata.select_code(code):
+                    logging.warning(f"{stock_name}({code}): 일봉 로드 실패")
+                    return False
+                
+                # 일봉 로드 후 대기
+                time.sleep(0.3)
+            except Exception as ex:
+                logging.error(f"{stock_name}({code}): 일봉 로드 중 오류: {ex}")
+                return False
+            
+            # ===== ✅ 갭상승 조건 재확인 (타임아웃 15초) =====
+            logging.debug(f"{stock_name}({code}): 갭상승 조건 검증 중...")
+            
             try:
                 is_valid, gap_pct, message = self._verify_with_timeout(
                     self.gap_scanner.verify_gap_conditions,
                     code,
-                    timeout=10.0
+                    timeout=15.0
                 )
+            except TimeoutError:
+                logging.error(f"{stock_name}({code}): 검증 타임아웃")
+                self.trader.daydata.monitor_stop(code)
+                return False
             except Exception as ex:
                 logging.error(f"{stock_name}({code}): 검증 중 오류: {ex}")
                 self.trader.daydata.monitor_stop(code)
-                return
+                return False
             
             if not is_valid:
-                logging.debug(f"{stock_name}({code}): 갭상승 재검증 실패 - {message}")
+                logging.info(f"{stock_name}({code}): 갭상승 재검증 실패 - {message}")
                 self.trader.daydata.monitor_stop(code)
-                return
+                return False
             
-            logging.info(
-                f"{stock_name}({code}) -> 갭상승 조건검색 편입 "
-                f"(검증: {message})"
-            )
+            logging.info(f"✅ {stock_name}({code}): 갭상승 검증 통과 - {message}")
             
-            # 틱/분 데이터 로드
+            # ===== ✅ 틱/분 데이터 로드 (타임아웃 40초) =====
+            logging.debug(f"{stock_name}({code}): 틱/분 데이터 로드 중...")
+            
             try:
                 tick_ok = self._load_with_timeout(
                     self.trader.tickdata.monitor_code,
                     code,
-                    timeout=30.0
+                    timeout=40.0
                 )
+                
+                if not tick_ok:
+                    logging.warning(f"{stock_name}({code}): 틱 데이터 로드 실패")
+                    self.trader.daydata.monitor_stop(code)
+                    return False
+                
+                time.sleep(0.3)
+                
                 min_ok = self._load_with_timeout(
                     self.trader.mindata.monitor_code,
                     code,
-                    timeout=30.0
+                    timeout=40.0
                 )
+                
+                if not min_ok:
+                    logging.warning(f"{stock_name}({code}): 분 데이터 로드 실패")
+                    self.trader.daydata.monitor_stop(code)
+                    self.trader.tickdata.monitor_stop(code)
+                    return False
+                
+            except TimeoutError:
+                logging.error(f"{stock_name}({code}): 데이터 로드 타임아웃")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                return False
             except Exception as ex:
                 logging.error(f"{stock_name}({code}): 데이터 로드 중 오류: {ex}")
                 self.trader.daydata.monitor_stop(code)
-                return
+                self.trader.tickdata.monitor_stop(code)
+                return False
             
-            if not (tick_ok and min_ok):
-                logging.warning(f"{stock_name}({code}): 틱/분 로드 실패")
+            # ===== ✅ 투자대상 추가 =====
+            try:
+                self._add_to_monitoring(code, stgprice, time_str, f"갭상승 ({gap_pct:.2f}%)")
+                logging.info(f"✅ {stock_name}({code}): 투자대상 추가 완료")
+                return True
+            except Exception as ex:
+                logging.error(f"{stock_name}({code}): 투자대상 추가 실패: {ex}")
+                # 실패 시 정리
                 self.trader.daydata.monitor_stop(code)
-                return
-            
-            # 투자대상 추가
-            self._add_to_monitoring(code, stgprice, time_str, f"갭상승 ({gap_pct:.2f}%)")
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
             
         except Exception as ex:
             logging.error(f"_process_gap_stock({code}): {ex}\n{traceback.format_exc()}")
-
+            # 예외 발생 시 리소스 정리
+            try:
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+            except:
+                pass
+            return False
+        
     def _process_other_stock(self, code, stgprice, time_str):
         """기타 전략 처리"""
         try:
@@ -1819,22 +1968,22 @@ class CpData(QObject):
         self.indicator_update_interval = 1.0
         self.latest_snapshot = {}
         
-        # 체결강도 계산용
         self.buy_volumes = {}
         self.sell_volumes = {}
         self.strength_cache = {}
 
-        # ===== ✅ 영업일 자동 찾기 =====
+        # ===== ✅ 전역 영업일 한 번만 찾기 =====
         now = time.localtime()
         today_candidate = now.tm_year * 10000 + now.tm_mon * 100 + now.tm_mday
         
-        success, trading_date = get_last_trading_date(today_candidate)
+        success, trading_date = get_last_trading_date(today_candidate, max_attempts=5)
         
         if success:
             self.todayDate = trading_date
-            logging.info(f"📅 사용할 날짜: {self.todayDate} (최근 영업일)")
+            date_str = str(trading_date)
+            formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+            logging.info(f"📅 사용할 영업일: {formatted}")
         else:
-            # 실패 시 fallback (오늘 날짜 사용)
             self.todayDate = today_candidate
             logging.warning(f"⚠️ 영업일 찾기 실패, 오늘 날짜 사용: {self.todayDate}")
 
@@ -1955,79 +2104,58 @@ class CpData(QObject):
             logging.error(f"select_code -> {ex}")
             return False
 
-    def monitor_code(self, code, timeout=30):
-        """종목 모니터링 시작 (타임아웃 추가)"""
+    def monitor_code(self, code):
+        """종목 모니터링 시작"""
         try:
-            start_time = time.time()
-            
             if code in self.stockdata:
                 return True
             
-            # 기본 데이터 구조 초기화
+            # 데이터 구조 초기화
             self.stockdata[code] = {
-                'D': [], 'T': [], 'O': [], 'H': [], 'L': [], 'C': [], 'V': [], 'TV': [], 
-                
-                # 이동평균
-                'MAT5': [], 'MAT20': [], 'MAT60': [], 'MAT120': [], 
-                'MAM5': [], 'MAM10': [], 'MAM20': [], 
-                
-                # MACD
-                'MACDT': [], 'MACDT_SIGNAL': [], 'OSCT': [], 
-                'MACD': [], 'MACD_SIGNAL': [], 'OSC': [], 
-                
-                # RSI
-                'RSIT': [], 'RSIT_SIGNAL': [], 
-                'RSI': [], 'RSI_SIGNAL': [], 
-                
-                # Stochastic
-                'STOCHK': [], 'STOCHD': [], 
-                
-                # 기타
-                'ATR': [], 'CCI': [],  
-                'BB_UPPER': [], 'BB_MIDDLE': [], 'BB_LOWER': [], 
-                'BB_POSITION': [], 'BB_BANDWIDTH': [], 
+                'D': [], 'T': [], 'O': [], 'H': [], 'L': [], 'C': [], 'V': [], 'TV': [],
+                'MAT5': [], 'MAT20': [], 'MAT60': [], 'MAT120': [],
+                'MAM5': [], 'MAM10': [], 'MAM20': [],
+                'MACDT': [], 'MACDT_SIGNAL': [], 'OSCT': [],
+                'MACD': [], 'MACD_SIGNAL': [], 'OSC': [],
+                'RSIT': [], 'RSIT_SIGNAL': [],
+                'RSI': [], 'RSI_SIGNAL': [],
+                'STOCHK': [], 'STOCHD': [],
+                'ATR': [], 'CCI': [],
+                'BB_UPPER': [], 'BB_MIDDLE': [], 'BB_LOWER': [],
+                'BB_POSITION': [], 'BB_BANDWIDTH': [],
                 'VWAP': [],
-                
-                # 새로운 지표들
                 'WILLIAMS_R': [], 'ROC': [], 'OBV': [], 'OBV_MA20': [],
                 'VP_POC': 0, 'VP_POSITION': 0,
-                
-                # 기타
-                'TICKS': [], 
-                'MAT5_MAT20_DIFF': [], 'MAT20_MAT60_DIFF': [], 
-                'MAT60_MAT120_DIFF': [], 'C_MAT5_DIFF': [], 
-                'MAM5_MAM10_DIFF': [], 'MAM10_MAM20_DIFF': [], 
-                'C_MAM5_DIFF': [], 'C_ABOVE_MAM5': [], 
-                'MAT5_CHANGE': [], 'MAT20_CHANGE': [], 
+                'TICKS': [],
+                'MAT5_MAT20_DIFF': [], 'MAT20_MAT60_DIFF': [],
+                'MAT60_MAT120_DIFF': [], 'C_MAT5_DIFF': [],
+                'MAM5_MAM10_DIFF': [], 'MAM10_MAM20_DIFF': [],
+                'C_MAM5_DIFF': [], 'C_ABOVE_MAM5': [],
+                'MAT5_CHANGE': [], 'MAT20_CHANGE': [],
                 'MAT60_CHANGE': [], 'MAT120_CHANGE': []
             }
             
-            # 체결강도 초기화
             self.buy_volumes[code] = deque(maxlen=10)
             self.sell_volumes[code] = deque(maxlen=10)
 
-            # ===== ✅ 최근 영업일 데이터 로드 (자동 재시도) =====
-            success = self.update_chart_data_from_market_open(code, retry_days=5)
-            
-            # 타임아웃 체크
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                logging.warning(f"{code}: 로드 타임아웃 ({elapsed:.1f}초)")
-                return False
+            # ===== ✅ 영업일 데이터 로드 시도 =====
+            success = self.update_chart_data_from_market_open(code)
             
             if not success:
-                logging.warning(f"{code}: 데이터 로드 실패, 폴백")
+                # ===== ✅ 실패 시 개수 기준으로 폴백 =====
+                logging.warning(f"{code}: 영업일 데이터 로드 실패, 개수 기준 폴백")
                 self.update_chart_data(code, self.interval, self.number)
                 self.is_initial_loaded[code] = False
             else:
                 self.is_initial_loaded[code] = True
 
+            # 지표 계산
             with self.stockdata_lock:
                 if code not in self.objIndicators:
                     self.objIndicators[code] = CpIndicators(self.chart_type)
                     
                     indicator_types = [
-                        "MA", "MACD", "RSI", "STOCH", 
+                        "MA", "MACD", "RSI", "STOCH",
                         "ATR", "CCI", "BBANDS", "VWAP",
                         "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"
                     ]
@@ -2053,9 +2181,9 @@ class CpData(QObject):
             return True
             
         except Exception as ex:
-            logging.error(f"monitor_code -> {code}, {ex}")
+            logging.error(f"monitor_code({code}): {ex}")
             return False
-
+        
     def monitor_stop(self, code):
         try:
             if self.is_updating.get(code, False):
@@ -2212,71 +2340,62 @@ class CpData(QObject):
             self.is_updating[code] = False
             return False
 
-    def update_chart_data_from_market_open(self, code, retry_days=5):
-        """장 시작부터 전체 로딩 (최근 영업일 자동 찾기)
+    def update_chart_data_from_market_open(self, code):
+        """장 시작부터 전체 로딩 (영업일 사용)
         
-        Args:
-            code: 종목 코드
-            retry_days: 데이터 재시도 일수 (기본 5일)
+        ✅ 개선: 이미 찾은 영업일(self.todayDate) 사용
         """
         try:
             self.is_updating[code] = True
             
-            # ===== ✅ 최근 영업일부터 시도 =====
-            check_date = datetime.now()
+            # ===== ✅ 이미 찾은 영업일 사용 (중복 검색 제거) =====
+            date_str = str(self.todayDate)
+            formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
             
-            for i in range(retry_days):
-                test_date = check_date - timedelta(days=i)
-                test_date_str = test_date.strftime('%Y%m%d')
-                
-                # 주말 빠른 스킵
-                if test_date.weekday() >= 5:
-                    logging.debug(f"{code}: {test_date_str} 주말, 스킵")
-                    continue
-                
-                logging.info(f"{code}: {test_date_str} 데이터 조회 시도 ({i+1}/{retry_days})")
-                
-                new_data = self._request_chart_data(
-                    code, 
-                    request_type='period',
-                    start_date=test_date_str,
-                    end_date=test_date_str
-                )
-                
-                if new_data is None:
-                    logging.debug(f"{code}: {test_date_str} API 조회 실패")
-                    continue
-                
-                # 데이터가 있는지 확인
-                if len(new_data.get('D', [])) > 0:
-                    with self.stockdata_lock:
-                        if code not in self.stockdata:
-                            logging.debug(f"{code}: stockdata에 없음, 업데이트 중단")
-                            self.is_updating[code] = False
-                            return False
-                        
-                        for key in new_data:
-                            self.stockdata[code][key] = new_data[key]
-                    
-                    logging.info(
-                        f"✅ {code}: {test_date_str} 데이터 로드 완료 "
-                        f"({len(new_data['D'])}개, {self.chart_type})"
-                    )
+            logging.debug(f"{code}: {formatted_date} 데이터 로드 시도")
+            
+            # 데이터 조회
+            new_data = self._request_chart_data(
+                code,
+                request_type='period',
+                start_date=date_str,
+                end_date=date_str
+            )
+            
+            if new_data is None:
+                logging.warning(f"{code}: API 조회 실패")
+                self.is_updating[code] = False
+                return False
+            
+            # 데이터 확인
+            if len(new_data.get('D', [])) == 0:
+                logging.warning(f"{code}: {formatted_date} 데이터 없음")
+                self.is_updating[code] = False
+                return False
+            
+            # 데이터 적용
+            with self.stockdata_lock:
+                if code not in self.stockdata:
+                    logging.debug(f"{code}: stockdata에 없음, 중단")
                     self.is_updating[code] = False
-                    return True
-                else:
-                    logging.debug(f"{code}: {test_date_str} 데이터 없음 (휴일/휴장일)")
+                    return False
+                
+                for key in new_data:
+                    self.stockdata[code][key] = new_data[key]
             
-            # retry_days 내에 데이터를 못 찾음
-            logging.warning(f"{code}: 최근 {retry_days}일 내 데이터 없음")
+            logging.info(
+                f"✅ {code}: {formatted_date} 데이터 로드 완료 "
+                f"({len(new_data['D'])}개, {self.chart_type})"
+            )
+            
             self.is_updating[code] = False
-            return False
+            return True
             
         except Exception as ex:
-            logging.error(f"update_chart_data_from_market_open -> {code}, {ex}\n{traceback.format_exc()}")
+            logging.error(f"update_chart_data_from_market_open({code}): {ex}\n{traceback.format_exc()}")
             self.is_updating[code] = False
             return False
-
+        
     def verify_data_coverage(self, code):
         """데이터가 장 시작부터 커버하는지 확인"""
         try:
@@ -4818,6 +4937,42 @@ class LoginHandler:
         self.process = None
         self.slack = None
         self.slack_channel = '#stock'
+        
+        # ===== ✅ 자동 클릭 타이머 추가 =====
+        self.auto_click_timer = QTimer()
+        self.auto_click_timer.timeout.connect(self.check_and_click_popup)
+        self.auto_click_attempts = 0
+        self.max_auto_click_attempts = 50  # ✅ 30회 → 50회 (25초, 여유 확보)
+        self.window_found = False  # 창을 찾았는지 플래그
+
+        self.init_default_strategy_types()
+
+    def init_default_strategy_types(self):
+        """전략 타입 기본값 초기화 (settings.ini에 없으면 생성)"""
+        try:
+            # 설정 파일 읽기
+            if os.path.exists(self.config_file):
+                self.config.read(self.config_file, encoding='utf-8')
+            
+            # STRATEGY_TYPES 섹션이 없으면 생성
+            if not self.config.has_section('STRATEGY_TYPES'):
+                self.config.add_section('STRATEGY_TYPES')
+                
+                # 기본값 설정
+                self.config.set('STRATEGY_TYPES', 'static', 
+                    '전일상한가,전일급등,전일거래량급증,52주신고가,이격도상승,신고가돌파')
+                self.config.set('STRATEGY_TYPES', 'dynamic', 
+                    '급등주,갭상승,거래량급증,돌파,급등돌파')
+                self.config.set('STRATEGY_TYPES', 'max_static_load', '10')
+                
+                # 파일 저장
+                with open(self.config_file, 'w', encoding='utf-8') as configfile:
+                    self.config.write(configfile)
+                
+                logging.info("✅ 전략 타입 기본 설정 생성 완료")
+            
+        except Exception as ex:
+            logging.error(f"init_default_strategy_types: {ex}")
 
     def load_settings(self):
         """설정 로드"""
@@ -4872,6 +5027,274 @@ class LoginHandler:
             args.append('/autostart')
         self.process.start(creon_path, args)
         self.process.finished.connect(self.init_plus_check_and_continue)
+        
+        # ===== ✅ 창이 뜨는 시간(10초) 고려하여 지연 시작 =====
+        logging.info("로그인 프로세스 시작... 모의투자 창 대기 중...")
+        
+        # 5초 후에 타이머 시작 (창이 뜨기 시작할 때쯤)
+        QTimer.singleShot(5000, self.start_auto_click_timer)
+
+    def start_auto_click_timer(self):
+        """자동 클릭 타이머 시작 (지연 시작)"""
+        self.auto_click_attempts = 0
+        self.auto_click_timer.start(500)  # 0.5초마다 체크
+        logging.info("⏰ 모의투자 창 자동 클릭 감지 시작...")
+
+    def check_and_click_popup(self):
+        """모의투자 선택 창 감지 및 자동 클릭 (10초 지연 고려)"""
+        try:
+            self.auto_click_attempts += 1
+            
+            # 최대 시도 횟수 초과
+            if self.auto_click_attempts > self.max_auto_click_attempts:
+                self.auto_click_timer.stop()
+                logging.warning("⚠️ 모의투자 창 자동 클릭 타임아웃 (수동 클릭 필요)")
+                return
+            
+            # ===== ✅ 진행 상황 로그 (더 자세히) =====
+            elapsed_time = self.auto_click_attempts * 0.5
+            if self.auto_click_attempts == 1:
+                logging.info(f"🔍 모의투자 창 감지 시작... (최대 {self.max_auto_click_attempts * 0.5:.0f}초 대기)")
+            elif self.auto_click_attempts % 10 == 0:  # 5초마다
+                logging.info(f"🔍 감지 중... {elapsed_time:.0f}초 경과 ({self.auto_click_attempts}/{self.max_auto_click_attempts})")
+            
+            # ===== ✅ 창 찾기 =====
+            possible_titles = [
+                '모의투자 선택',
+                '모의투자',
+                'CREON',
+                'Creon',
+                'creon'
+            ]
+            
+            target_window = None
+            found_title = None
+            
+            for title in possible_titles:
+                try:
+                    windows = gw.getWindowsWithTitle(title)
+                    if windows and len(windows) > 0:
+                        # 창이 실제로 보이는지 확인
+                        for window in windows:
+                            if window.visible and window.width > 0 and window.height > 0:
+                                target_window = window
+                                found_title = title
+                                break
+                        if target_window:
+                            break
+                except Exception as ex:
+                    logging.debug(f"창 검색 중 오류 ({title}): {ex}")
+                    continue
+            
+            # 창을 못 찾으면 계속 시도
+            if not target_window:
+                if self.auto_click_attempts % 10 == 0:
+                    logging.debug(f"창을 아직 찾지 못함 ({elapsed_time:.0f}초 경과)")
+                return  # 타이머 계속 실행
+            
+            # ===== ✅ 창을 처음 찾았을 때 =====
+            if not self.window_found:
+                self.window_found = True
+                logging.info(f"✨ '{found_title}' 창 발견! ({elapsed_time:.0f}초 경과)")
+                # 창이 완전히 로드될 때까지 잠깐 대기
+                time.sleep(0.5)
+            
+            # ===== ✅ 클릭 시도 =====
+            logging.info(f"🎯 '{found_title}' 버튼 클릭 시도 중...")
+            
+            # 창 활성화
+            try:
+                target_window.activate()
+                time.sleep(0.3)
+            except Exception as ex:
+                logging.debug(f"창 활성화 실패: {ex}")
+            
+            # 여러 방법으로 클릭 시도
+            success = False
+            
+            # 방법 1: 화면 중앙 클릭
+            if not success:
+                success = self._click_screen_center(target_window)
+            
+            # 방법 2: 상대 좌표 여러 위치 클릭
+            if not success:
+                success = self._click_by_relative_position_direct(target_window)
+            
+            # 방법 3: 키보드 (Enter/Space)
+            if not success:
+                success = self._click_by_keyboard()
+            
+            # 방법 4: 절대 좌표
+            if not success:
+                success = self._click_by_absolute_position()
+            
+            # ===== ✅ 성공 확인 =====
+            if success:
+                self.auto_click_timer.stop()
+                logging.info(f"✅ 모의투자 접속 버튼 자동 클릭 성공! (총 {elapsed_time:.0f}초 소요)")
+                self.window_found = False  # 플래그 리셋
+            else:
+                # 실패 시 다음 타이머에서 재시도
+                if self.auto_click_attempts % 5 == 0:
+                    logging.debug(f"클릭 실패, 재시도 중... ({self.auto_click_attempts}회)")
+            
+        except Exception as ex:
+            logging.error(f"check_and_click_popup: {ex}\n{traceback.format_exc()}")
+
+    def _click_screen_center(self, window):
+        """방법 1: 화면 중앙 클릭"""
+        try:
+            # 창 정보
+            left = window.left
+            top = window.top
+            width = window.width
+            height = window.height
+            
+            # ===== ✅ 창 크기 검증 =====
+            if width < 100 or height < 100:
+                logging.debug(f"창 크기가 너무 작음 ({width}x{height})")
+                return False
+            
+            # 창의 정중앙
+            center_x = left + width // 2
+            center_y = top + height // 2
+            
+            logging.info(f"🎯 화면 중앙 클릭: ({center_x}, {center_y}) [창 크기: {width}x{height}]")
+            
+            # 마우스 이동
+            pyautogui.moveTo(center_x, center_y, duration=0.3)
+            time.sleep(0.2)
+            
+            # 클릭
+            pyautogui.click()
+            time.sleep(0.5)  # ✅ 클릭 후 대기 시간 증가
+            
+            # ===== ✅ 클릭 성공 확인 (창이 사라졌는지) =====
+            try:
+                windows = gw.getWindowsWithTitle(window.title)
+                if not windows:
+                    logging.info("✅ 창이 사라짐 - 클릭 성공")
+                    return True
+                
+                # 창이 여전히 있는지 확인
+                for w in windows:
+                    if w.visible and w.width > 0:
+                        logging.debug("창이 여전히 존재 - 클릭 실패 또는 미반응")
+                        return False
+                
+                logging.info("✅ 창이 사라짐 - 클릭 성공")
+                return True
+                
+            except Exception as ex:
+                logging.debug(f"창 확인 중 오류: {ex}")
+                # 확인 실패 시 성공으로 간주
+                return True
+            
+        except Exception as ex:
+            logging.debug(f"_click_screen_center 실패: {ex}")
+            return False
+    
+    def _click_by_relative_position_direct(self, window):
+        """방법 2: 상대 좌표로 클릭 (직접 실행)"""
+        try:
+            left = window.left
+            top = window.top
+            width = window.width
+            height = window.height
+            
+            # 여러 위치 시도 (중앙, 중앙 하단, 중앙 약간 아래)
+            positions = [
+                (left + width // 2, top + height // 2),           # 정중앙
+                (left + width // 2, top + int(height * 0.4)),     # 중앙보다 약간 아래
+                (left + width // 2, top + int(height * 0.3)),     # 하단
+            ]
+            
+            for idx, (x, y) in enumerate(positions, 1):
+                logging.info(f"🎯 상대 좌표 클릭 시도 {idx}: ({x}, {y})")
+                
+                # 마우스 이동
+                pyautogui.moveTo(x, y, duration=0.3)
+                time.sleep(0.1)
+                
+                # 클릭
+                pyautogui.click()
+                time.sleep(0.3)
+                
+                # 창이 사라졌는지 확인
+                try:
+                    windows = gw.getWindowsWithTitle(window.title)
+                    if not windows or not windows[0].visible:
+                        logging.info(f"✅ 위치 {idx} 클릭 성공")
+                        return True
+                except:
+                    pass
+            
+            logging.debug("모든 상대 좌표 클릭 실패")
+            return False
+            
+        except Exception as ex:
+            logging.debug(f"_click_by_relative_position_direct 실패: {ex}")
+            return False
+
+    def _click_by_absolute_position(self):
+        """방법 3: 절대 좌표로 클릭"""
+        try:
+            # 저장된 좌표 확인
+            if self.config.has_section('AUTO_CLICK'):
+                button_x = self.config.getint('AUTO_CLICK', 'button_x', fallback=None)
+                button_y = self.config.getint('AUTO_CLICK', 'button_y', fallback=None)
+                
+                if button_x and button_y:
+                    logging.info(f"🎯 저장된 좌표 클릭 시도: ({button_x}, {button_y})")
+                    
+                    pyautogui.moveTo(button_x, button_y, duration=0.3)
+                    time.sleep(0.1)
+                    pyautogui.click()
+                    time.sleep(0.2)
+                    
+                    return True
+            
+            # 기본 좌표
+            default_x, default_y = 960, 540  # Full HD 기준 중앙
+            
+            logging.info(f"🎯 기본 좌표 클릭 시도: ({default_x}, {default_y})")
+            
+            pyautogui.moveTo(default_x, default_y, duration=0.3)
+            time.sleep(0.1)
+            pyautogui.click()
+            time.sleep(0.2)
+            
+            return True
+            
+        except Exception as ex:
+            logging.debug(f"_click_by_absolute_position 실패: {ex}")
+            return False
+
+    def _click_by_keyboard(self):
+        """방법 4: 키보드로 클릭 (Tab + Enter)"""
+        try:
+            logging.info("⌨️ 키보드 입력 시도 (Enter)")
+            
+            # Space나 Enter로 버튼 클릭
+            pyautogui.press('space')
+            time.sleep(0.2)
+            
+            pyautogui.press('enter')
+            time.sleep(0.2)
+            
+            # Tab으로 포커스 이동 후 Enter
+            for i in range(3):
+                pyautogui.press('tab')
+                time.sleep(0.1)
+            
+            pyautogui.press('enter')
+            time.sleep(0.2)
+            
+            return True
+            
+        except Exception as ex:
+            logging.debug(f"_click_by_keyboard 실패: {ex}")
+            return False
        
     def buycount_setting(self):
         if not self.config.has_section('BUYCOUNT'):
@@ -4888,7 +5311,8 @@ class LoginHandler:
             exit()
         self.parent.post_login_setup()
 
-    def auto_select_creon_popup(self):       
+    def auto_select_creon_popup(self):
+        """기존 메서드 (호환성 유지)"""
         try:
             button_x, button_y = 960, 500
             pyautogui.moveTo(button_x, button_y, duration=0.5)
@@ -4897,6 +5321,167 @@ class LoginHandler:
             logging.info("모의투자 접속 버튼 클릭 완료")
         except Exception as e:
             logging.error(f"모의투자 접속 버튼 클릭 실패: {e}")
+
+class StockLoaderThread(QThread):
+    """종목 로딩 백그라운드 스레드"""
+    
+    # 시그널 정의
+    progress_updated = pyqtSignal(int, int, str)  # (현재, 전체, 메시지)
+    stock_loaded = pyqtSignal(str, bool)  # (종목코드, 성공여부)
+    loading_completed = pyqtSignal(int, int)  # (성공, 실패)
+    error_occurred = pyqtSignal(str)  # 에러 메시지
+    
+    def __init__(self, parent, stock_list, loader_func):
+        """
+        Args:
+            parent: 부모 위젯
+            stock_list: 로드할 종목 리스트
+            loader_func: 단일 종목 로드 함수
+        """
+        super().__init__()
+        self.parent = parent
+        self.stock_list = stock_list
+        self.loader_func = loader_func
+        self.is_cancelled = False
+        self.loaded_count = 0
+        self.failed_count = 0
+    
+    def run(self):
+        """스레드 실행"""
+        try:
+            total = len(self.stock_list)
+            
+            for idx, stock_item in enumerate(self.stock_list, 1):
+                # 취소 확인
+                if self.is_cancelled:
+                    logging.info("종목 로딩 취소됨")
+                    break
+                
+                try:
+                    code = stock_item.get('code')
+                    if not code:
+                        continue
+                    
+                    stock_name = cpCodeMgr.CodeToName(code)
+                    
+                    # 진행 상황 업데이트
+                    self.progress_updated.emit(idx, total, f"{stock_name}({code}) 로딩 중...")
+                    
+                    # API 제한 대기
+                    api_limiter.wait_if_needed()
+                    
+                    # 종목 로드
+                    success = self.loader_func(code)
+                    
+                    if success:
+                        self.loaded_count += 1
+                        self.stock_loaded.emit(code, True)
+                    else:
+                        self.failed_count += 1
+                        self.stock_loaded.emit(code, False)
+                    
+                    # 3개마다 더 긴 대기
+                    if idx % 3 == 0:
+                        time.sleep(2.0)
+                    else:
+                        time.sleep(1.0)
+                    
+                except Exception as ex:
+                    logging.error(f"{code} 로드 실패: {ex}")
+                    self.failed_count += 1
+                    self.stock_loaded.emit(code, False)
+            
+            # 완료 시그널
+            self.loading_completed.emit(self.loaded_count, self.failed_count)
+            
+        except Exception as ex:
+            logging.error(f"StockLoaderThread: {ex}\n{traceback.format_exc()}")
+            self.error_occurred.emit(str(ex))
+    
+    def cancel(self):
+        """로딩 취소"""
+        self.is_cancelled = True
+
+class StockLoadingProgressDialog(QDialog):
+    """종목 로딩 진행 상황 다이얼로그"""
+    
+    def __init__(self, parent, total_count):
+        super().__init__(parent)
+        self.setWindowTitle("종목 로딩 중")
+        self.setModal(True)
+        self.resize(500, 200)
+        self.setWindowFlags(Qt.Dialog | Qt.WindowTitleHint)
+        
+        layout = QVBoxLayout()
+        
+        # 상태 레이블
+        self.status_label = QLabel("종목 로딩을 시작합니다...")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        
+        # 프로그레스 바
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximum(total_count)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+        
+        # 상세 정보
+        info_layout = QHBoxLayout()
+        self.success_label = QLabel("성공: 0")
+        self.failed_label = QLabel("실패: 0")
+        self.remaining_label = QLabel(f"남은 종목: {total_count}")
+        info_layout.addWidget(self.success_label)
+        info_layout.addWidget(self.failed_label)
+        info_layout.addWidget(self.remaining_label)
+        info_layout.addStretch()
+        layout.addLayout(info_layout)
+        
+        # 취소 버튼
+        button_layout = QHBoxLayout()
+        self.cancel_button = QPushButton("취소")
+        self.close_button = QPushButton("닫기")
+        self.close_button.setEnabled(False)
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addWidget(self.close_button)
+        layout.addLayout(button_layout)
+        
+        self.setLayout(layout)
+        
+        # 변수
+        self.total_count = total_count
+        self.success_count = 0
+        self.failed_count = 0
+    
+    def update_progress(self, current, total, message):
+        """진행 상황 업데이트"""
+        self.progress_bar.setValue(current)
+        self.status_label.setText(message)
+        self.remaining_label.setText(f"남은 종목: {total - current}")
+        QApplication.processEvents()
+    
+    def on_stock_loaded(self, code, success):
+        """종목 로드 완료"""
+        if success:
+            self.success_count += 1
+            self.success_label.setText(f"✅ 성공: {self.success_count}")
+        else:
+            self.failed_count += 1
+            self.failed_label.setText(f"❌ 실패: {self.failed_count}")
+        
+        QApplication.processEvents()
+    
+    def on_loading_completed(self, success, failed):
+        """로딩 완료"""
+        self.status_label.setText(
+            f"✅ 종목 로딩 완료!\n"
+            f"성공: {success}개, 실패: {failed}개"
+        )
+        self.cancel_button.setEnabled(False)
+        self.close_button.setEnabled(True)
+        
+        # 자동 닫기 (3초 후)
+        QTimer.singleShot(3000, self.accept)
 
 # ==================== MyWindow ====================
 class MyWindow(QWidget):
@@ -4990,6 +5575,54 @@ class MyWindow(QWidget):
         self.trader_thread.connect_bar_signals()
 
         self.trader_thread.start()
+
+    def get_strategy_type(self, strategy_name):
+        """전략 타입 확인
+        
+        Args:
+            strategy_name: 전략명 (예: '전일상한가', '급등주')
+        
+        Returns:
+            'static' or 'dynamic'
+        """
+        try:
+            # 설정 파일에서 읽기
+            if self.login_handler.config.has_section('STRATEGY_TYPES'):
+                static_str = self.login_handler.config.get('STRATEGY_TYPES', 'static', fallback='')
+                dynamic_str = self.login_handler.config.get('STRATEGY_TYPES', 'dynamic', fallback='')
+                
+                # 리스트로 변환 (공백 제거)
+                static_list = [s.strip() for s in static_str.split(',') if s.strip()]
+                dynamic_list = [s.strip() for s in dynamic_str.split(',') if s.strip()]
+                
+                # 전략명 확인
+                if strategy_name in static_list:
+                    return 'static'
+                elif strategy_name in dynamic_list:
+                    return 'dynamic'
+            
+            # ===== ✅ 설정에 없으면 이름으로 자동 판단 =====
+            static_keywords = ['전일', '전날', '52주', '이격도', '신고가']
+            if any(keyword in strategy_name for keyword in static_keywords):
+                logging.debug(f"'{strategy_name}' → 정적 전략으로 자동 분류")
+                return 'static'
+            else:
+                logging.debug(f"'{strategy_name}' → 동적 전략으로 자동 분류")
+                return 'dynamic'
+                
+        except Exception as ex:
+            logging.error(f"get_strategy_type({strategy_name}): {ex}")
+            return 'static'  # 안전하게 정적으로 처리
+
+    def get_max_static_load(self):
+        """정적 전략 최대 로드 개수"""
+        try:
+            if self.login_handler.config.has_section('STRATEGY_TYPES'):
+                return self.login_handler.config.getint('STRATEGY_TYPES', 'max_static_load', fallback=10)
+            return 10
+        except Exception as ex:
+            logging.error(f"get_max_static_load: {ex}")
+            return 10
 
     def _background_initialization(self):
         """백그라운드 초기화 (무거운 작업들)"""
@@ -5481,7 +6114,7 @@ class MyWindow(QWidget):
             logging.error(f"load_strategy -> {ex}")
 
     def stgChanged(self, *args):
-        """전략 변경 시 안전한 종목 로드"""
+        """전략 변경 시 안전한 종목 로드 (설정 파일 기반)"""
         try:
             stgName = self.comboStg.currentText()
             self.save_last_stg()
@@ -5490,7 +6123,6 @@ class MyWindow(QWidget):
                 self.sell_all_item()
                 self.trader.clear_list_db('mylist.db')
             
-            # 기존 전략 객체 정리
             if hasattr(self, 'momentum_scanner') and self.momentum_scanner:
                 self.momentum_scanner = None
             
@@ -5515,15 +6147,20 @@ class MyWindow(QWidget):
                     self.pb9619.Unsubscribe()
                 self.objstg.Clear()
                 
-                logging.info(f"=== 통합 전략 시작 (조건검색 기반) ===")
+                logging.info(f"=== 통합 전략 시작 ===")
                 self.trader.init_stock_balance()
                 
-                # 검증용 스캐너 초기화
+                # 스캐너 초기화
                 self.objstg.momentum_scanner = MomentumScanner(self.trader)
                 self.objstg.gap_scanner = GapUpScanner(self.trader)
                 
-                # 조건검색 시작
+                # 기존 DB 종목만 복원
+                self._load_stocks_from_db_safely('mylist.db')
+                
+                # 조건검색 시작 (실시간만)
+                time.sleep(1.0)
                 self._start_condition_search("급등주")
+                time.sleep(0.5)
                 self._start_condition_search("갭상승")
                 
                 # 변동성 돌파 전략
@@ -5531,14 +6168,11 @@ class MyWindow(QWidget):
                 self.trader_thread.set_volatility_strategy(self.volatility_strategy)
                 logging.info("✅ 변동성 돌파 전략 활성화")
                 
-                # 갭 상승 유지 체커
                 self.gap_scanner = self.objstg.gap_scanner
                 logging.info("✅ 갭 상승 유지 체커 활성화")
                 
-                # 기존 종목 복원
-                self._load_stocks_from_db_safely('mylist.db')
-                
                 logging.info(f"=== 통합 전략 초기화 완료 ===")
+                logging.info(f"📌 조건검색 실시간 감시 중 (새 종목 편입 시 자동 추가)")
 
             # ===== 기타 사용자 정의 전략 =====
             else:
@@ -5548,23 +6182,58 @@ class MyWindow(QWidget):
                 logging.info(f"전략 초기화: {stgName}")
                 self.trader.init_stock_balance()
                 
-                # 기존 종목 복원
+                # 기존 DB 종목 복원
                 self._load_stocks_from_db_safely('mylist.db')
                 
-                # 조건검색 종목 로드
+                # ===== ✅ 설정 파일 기반 전략 타입 확인 =====
                 item = self.data8537.get(stgName)
                 if item:
                     id = item['ID']
                     name = item['전략명']
                     
-                    if name != '급등주':
+                    # 전략 타입 확인
+                    strategy_type = self.get_strategy_type(name)
+                    max_load = self.get_max_static_load()
+                    
+                    # ===== ✅ 정적 전략: 프로그램 시작 시 종목 로드 =====
+                    if strategy_type == 'static':
+                        logging.info(f"📋 정적 전략 '{name}' (프로그램 시작 시 로드)")
+                        
                         ret, self.dataStg = self.objstg.requestStgID(id)
                         if ret:
-                            self._load_stocks_from_list_safely(self.dataStg)
+                            stock_count = len(self.dataStg)
+                            if stock_count > 0:
+                                logging.info(f"✅ '{name}' 종목 {stock_count}개 발견")
+                                
+                                # API 제한 고려하여 로드
+                                if stock_count > max_load:
+                                    logging.warning(
+                                        f"⚠️ 종목 수({stock_count}개)가 제한({max_load}개)을 초과합니다."
+                                    )
+                                    logging.info(f"   → 상위 {max_load}개만 로드 (나머지는 실시간 편입)")
+                                    self._load_stocks_from_list_safely_with_limit(
+                                        self.dataStg, 
+                                        max_count=max_load
+                                    )
+                                else:
+                                    logging.info(f"   → {stock_count}개 종목 로드 시작")
+                                    self._load_stocks_from_list_safely(self.dataStg)
+                            else:
+                                logging.info(f"'{name}' 조건 만족 종목 없음")
                         else:
-                            logging.warning(f"{stgName}: 조건검색 종목 로드 실패")
+                            logging.warning(f"'{name}' 종목 조회 실패")
                     
-                    # 조건검색 시작
+                    # ===== ✅ 동적 전략: 실시간 편입만 처리 =====
+                    elif strategy_type == 'dynamic':
+                        ret, self.dataStg = self.objstg.requestStgID(id)
+                        if ret:
+                            stock_count = len(self.dataStg)
+                            logging.info(f"📊 동적 전략 '{name}' - 현재 {stock_count}개 종목 조건 만족")
+                            logging.info(f"   → 프로그램 시작 시에는 로드 안 함 (실시간 편입만 처리)")
+                        else:
+                            logging.warning(f"'{name}' 종목 조회 실패")
+                    
+                    # 조건검색 시작 (실시간 감시)
                     self._start_condition_search(stgName)
             
             logging.info(f"{stgName} 전략 감시 시작")
@@ -5590,9 +6259,40 @@ class MyWindow(QWidget):
                     self.sellStgChanged()
                     
         except Exception as ex:
-            logging.error(f"stgChanged -> {ex}\n{traceback.format_exc()}")
-            QMessageBox.critical(self, "오류", f"전략 변경 중 오류 발생:\n{str(ex)}")
+            logging.error(f"stgChanged: {ex}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "오류", f"전략 변경 중 오류:\n{str(ex)}")
 
+    def _load_stocks_from_list_safely_with_limit(self, stock_list, max_count=10):
+        """리스트에서 종목 안전하게 로드 (개수 제한 + 백그라운드)"""
+        try:
+            if not stock_list:
+                logging.info("로드할 종목 리스트 없음")
+                return
+            
+            total_codes = len(stock_list)
+            actual_count = min(total_codes, max_count)
+            
+            if total_codes > max_count:
+                logging.warning(
+                    f"⚠️ 종목 수({total_codes}개)가 제한({max_count}개)을 초과합니다. "
+                    f"상위 {max_count}개만 로드합니다."
+                )
+            
+            # 제한된 리스트로 백그라운드 로드
+            limited_list = stock_list[:actual_count]
+            
+            if actual_count > 3:
+                self._load_stocks_in_background(limited_list)
+            else:
+                self._load_stocks_from_list_safely_sync(limited_list)
+            
+            if total_codes > max_count:
+                remaining = total_codes - max_count
+                logging.info(f"💡 나머지 {remaining}개 종목은 실시간 편입으로 추가됩니다.")
+            
+        except Exception as ex:
+            logging.error(f"_load_stocks_from_list_safely_with_limit: {ex}")
+            
     def _start_condition_search(self, strategy_name):
         """조건검색 시작 (안전)"""
         try:
@@ -5622,7 +6322,7 @@ class MyWindow(QWidget):
             return False
 
     def _load_stocks_from_db_safely(self, db_file='mylist.db'):
-        """DB에서 종목 안전하게 로드 (순차 처리)"""
+        """DB에서 종목 안전하게 로드 (백그라운드)"""
         try:
             self.trader.load_from_list_db(db_file)
             
@@ -5633,34 +6333,41 @@ class MyWindow(QWidget):
                 logging.info("DB에 저장된 종목 없음")
                 return
             
-            logging.info(f"DB에서 {total_codes}개 종목 로드 시작...")
+            logging.info(f"DB에서 {total_codes}개 종목 로드...")
             
+            # ===== ✅ 종목이 많으면 백그라운드로 =====
+            if total_codes > 3:
+                # 종목 리스트를 딕셔너리 형태로 변환
+                stock_list = [{'code': code} for code in codes_to_load]
+                self._load_stocks_in_background(stock_list)
+            else:
+                # 동기 처리
+                self._load_stocks_from_db_safely_sync(codes_to_load)
+            
+        except Exception as ex:
+            logging.error(f"_load_stocks_from_db_safely: {ex}")
+
+    def _load_stocks_from_db_safely_sync(self, codes_to_load):
+        """DB에서 종목 동기 로드 (적은 종목용)"""
+        try:
+            total_codes = len(codes_to_load)
             loaded_count = 0
             failed_count = 0
             
             for idx, code in enumerate(codes_to_load, 1):
                 try:
-                    # 이미 모니터링 중이면 스킵
                     if code in self.trader.monistock_set:
                         logging.debug(f"{code}: 이미 모니터링 중")
                         continue
                     
-                    # 진행 상황 표시
-                    if idx % 5 == 0 or idx == total_codes:
-                        logging.info(f"진행: {idx}/{total_codes} ({idx/total_codes*100:.0f}%)")
-                    
-                    # API 제한 대기
                     api_limiter.wait_if_needed()
                     
-                    # 종목 로드
                     if self._load_single_stock_safely(code):
                         loaded_count += 1
                     else:
                         failed_count += 1
                     
-                    # 5개마다 짧은 대기 (안정성)
-                    if idx % 5 == 0:
-                        time.sleep(0.5)
+                    time.sleep(1.0)
                     
                 except Exception as ex:
                     logging.error(f"{code} 로드 실패: {ex}")
@@ -5673,15 +6380,30 @@ class MyWindow(QWidget):
             )
             
         except Exception as ex:
-            logging.error(f"_load_stocks_from_db_safely -> {ex}")
+            logging.error(f"_load_stocks_from_db_safely_sync: {ex}")
 
     def _load_stocks_from_list_safely(self, stock_list):
-        """리스트에서 종목 안전하게 로드 (순차 처리)"""
+        """리스트에서 종목 안전하게 로드 (백그라운드)"""
         try:
             if not stock_list:
                 logging.info("로드할 종목 리스트 없음")
                 return
             
+            total_count = len(stock_list)
+            
+            # ===== ✅ 종목이 많으면 백그라운드로 처리 =====
+            if total_count > 3:
+                self._load_stocks_in_background(stock_list)
+            else:
+                # 종목이 적으면 동기 처리
+                self._load_stocks_from_list_safely_sync(stock_list)
+            
+        except Exception as ex:
+            logging.error(f"_load_stocks_from_list_safely: {ex}")
+
+    def _load_stocks_from_list_safely_sync(self, stock_list):
+        """리스트에서 종목 동기 로드 (적은 종목용)"""
+        try:
             total_codes = len(stock_list)
             logging.info(f"조건검색에서 {total_codes}개 종목 로드 시작...")
             
@@ -5694,10 +6416,6 @@ class MyWindow(QWidget):
                     if not code:
                         continue
                     
-                    # 진행 상황 표시
-                    if idx % 5 == 0 or idx == total_codes:
-                        logging.info(f"진행: {idx}/{total_codes} ({idx/total_codes*100:.0f}%)")
-                    
                     # API 제한 대기
                     api_limiter.wait_if_needed()
                     
@@ -5707,9 +6425,7 @@ class MyWindow(QWidget):
                     else:
                         failed_count += 1
                     
-                    # 5개마다 짧은 대기
-                    if idx % 5 == 0:
-                        time.sleep(0.5)
+                    time.sleep(1.0)
                     
                 except Exception as ex:
                     logging.error(f"{code} 로드 실패: {ex}")
@@ -5722,7 +6438,42 @@ class MyWindow(QWidget):
             )
             
         except Exception as ex:
-            logging.error(f"_load_stocks_from_list_safely -> {ex}")
+            logging.error(f"_load_stocks_from_list_safely_sync: {ex}")
+
+    def _load_stocks_in_background(self, stock_list):
+        """백그라운드에서 종목 로드"""
+        try:
+            total_count = len(stock_list)
+            logging.info(f"📦 {total_count}개 종목을 백그라운드에서 로드합니다...")
+            
+            # 프로그레스 다이얼로그 생성
+            self.progress_dialog = StockLoadingProgressDialog(self, total_count)
+            
+            # 로딩 스레드 생성
+            self.loader_thread = StockLoaderThread(
+                self,
+                stock_list,
+                self._load_single_stock_safely
+            )
+            
+            # 시그널 연결
+            self.loader_thread.progress_updated.connect(self.progress_dialog.update_progress)
+            self.loader_thread.stock_loaded.connect(self.progress_dialog.on_stock_loaded)
+            self.loader_thread.loading_completed.connect(self.on_background_loading_completed)
+            self.loader_thread.error_occurred.connect(self.on_background_loading_error)
+            
+            # 취소 버튼 연결
+            self.progress_dialog.cancel_button.clicked.connect(self.loader_thread.cancel)
+            self.progress_dialog.close_button.clicked.connect(self.progress_dialog.accept)
+            
+            # 스레드 시작
+            self.loader_thread.start()
+            
+            # 다이얼로그 표시 (모달)
+            self.progress_dialog.exec_()
+            
+        except Exception as ex:
+            logging.error(f"_load_stocks_in_background: {ex}")
 
     def _load_single_stock_safely(self, code, max_retries=2):
         """단일 종목 안전하게 로드 (재시도 포함)"""
@@ -5783,6 +6534,27 @@ class MyWindow(QWidget):
         except Exception as ex:
             logging.error(f"_load_single_stock_safely({code}) -> {ex}")
             return False
+        
+    def on_background_loading_completed(self, success, failed):
+        """백그라운드 로딩 완료"""
+        try:
+            total = success + failed
+            logging.info(f"✅ 백그라운드 종목 로딩 완료: 성공 {success}개, 실패 {failed}개 / 전체 {total}개")
+            
+            # 프로그레스 다이얼로그 업데이트
+            if hasattr(self, 'progress_dialog'):
+                self.progress_dialog.on_loading_completed(success, failed)
+            
+        except Exception as ex:
+            logging.error(f"on_background_loading_completed: {ex}")
+
+    def on_background_loading_error(self, error_msg):
+        """백그라운드 로딩 에러"""
+        logging.error(f"백그라운드 로딩 에러: {error_msg}")
+        QMessageBox.critical(self, "로딩 오류", f"종목 로딩 중 오류 발생:\n{error_msg}")
+        
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.reject()
         
     @pyqtSlot(dict)
     def on_momentum_stock_found(self, stock):
