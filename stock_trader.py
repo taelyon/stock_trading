@@ -763,6 +763,7 @@ class CpStrategy:
         self.is_processing = False
         self.processing_lock = threading.Lock()
         self.processing_thread = None
+        self.is_thread_started = False
         
         # ===== ✅ 처리 제한 추가 =====
         self.max_concurrent_stocks = 1  # 동시 처리 종목 수 제한
@@ -770,10 +771,15 @@ class CpStrategy:
         self.failed_stocks = {}  # 실패한 종목 기록
 
     def start_processing_queue(self):
-        """큐 처리 스레드 시작"""
+        """큐 처리 스레드 시작 (한 번만)"""
+        if self.is_thread_started:
+            logging.debug("큐 스레드는 이미 실행 중")
+            return
+        
         if self.processing_thread is None or not self.processing_thread.is_alive():
             self.processing_thread = threading.Thread(target=self._process_stock_queue, daemon=True)
             self.processing_thread.start()
+            self.is_thread_started = True  # ✅ 플래그 설정
             logging.info("✅ 종목 처리 큐 스레드 시작")
 
     def _process_stock_queue(self):
@@ -1949,8 +1955,8 @@ class CpData(QObject):
                     code not in self.trader.bought_set):
                     continue
                 
-                # ✅ API 제한 방지: 간격을 늘림 (보유 종목: 20초, 모니터링: 30초)
-                interval = 20 if code in self.trader.bought_set else 30
+                # ✅ API 제한 방지: 간격을 늘림 (보유 종목: 10초, 모니터링: 20초)
+                interval = 10 if code in self.trader.bought_set else 20
 
                 last_time = self.last_update_time.get(code, 0)
                 if current_time - last_time < interval:
@@ -5038,18 +5044,6 @@ class LoginHandler:
             if not success:
                 success = self._click_screen_center(target_window)
             
-            # 방법 2: 상대 좌표 여러 위치 클릭
-            if not success:
-                success = self._click_by_relative_position_direct(target_window)
-            
-            # 방법 3: 키보드 (Enter/Space)
-            if not success:
-                success = self._click_by_keyboard()
-            
-            # 방법 4: 절대 좌표
-            if not success:
-                success = self._click_by_absolute_position()
-            
             # ===== ✅ 성공 확인 =====
             if success:
                 self.auto_click_timer.stop()
@@ -5114,106 +5108,6 @@ class LoginHandler:
             
         except Exception as ex:
             logging.debug(f"_click_screen_center 실패: {ex}")
-            return False
-    
-    def _click_by_relative_position_direct(self, window):
-        """방법 2: 상대 좌표로 클릭 (직접 실행)"""
-        try:
-            left = window.left
-            top = window.top
-            width = window.width
-            height = window.height
-            
-            # 여러 위치 시도 (중앙, 중앙 하단, 중앙 약간 아래)
-            positions = [
-                (left + width // 2, top + height // 2),           # 정중앙
-            ]
-            
-            for idx, (x, y) in enumerate(positions, 1):
-                logging.info(f"🎯 상대 좌표 클릭 시도 {idx}: ({x}, {y})")
-                
-                # 마우스 이동
-                pyautogui.moveTo(x, y, duration=0.3)
-                time.sleep(0.1)
-                
-                # 클릭
-                pyautogui.click()
-                time.sleep(0.3)
-                
-                # 창이 사라졌는지 확인
-                try:
-                    windows = gw.getWindowsWithTitle(window.title)
-                    if not windows or not windows[0].visible:
-                        logging.info(f"✅ 위치 {idx} 클릭 성공")
-                        return True
-                except:
-                    pass
-            
-            logging.debug("모든 상대 좌표 클릭 실패")
-            return False
-            
-        except Exception as ex:
-            logging.debug(f"_click_by_relative_position_direct 실패: {ex}")
-            return False
-
-    def _click_by_absolute_position(self):
-        """방법 3: 절대 좌표로 클릭"""
-        try:
-            # 저장된 좌표 확인
-            if self.config.has_section('AUTO_CLICK'):
-                button_x = self.config.getint('AUTO_CLICK', 'button_x', fallback=None)
-                button_y = self.config.getint('AUTO_CLICK', 'button_y', fallback=None)
-                
-                if button_x and button_y:
-                    logging.info(f"🎯 저장된 좌표 클릭 시도: ({button_x}, {button_y})")
-                    
-                    pyautogui.moveTo(button_x, button_y, duration=0.3)
-                    time.sleep(0.1)
-                    pyautogui.click()
-                    time.sleep(0.2)
-                    
-                    return True
-            
-            # 기본 좌표
-            default_x, default_y = 960, 540  # Full HD 기준 중앙
-            
-            logging.info(f"🎯 기본 좌표 클릭 시도: ({default_x}, {default_y})")
-            
-            pyautogui.moveTo(default_x, default_y, duration=0.3)
-            time.sleep(0.1)
-            pyautogui.click()
-            time.sleep(0.2)
-            
-            return True
-            
-        except Exception as ex:
-            logging.debug(f"_click_by_absolute_position 실패: {ex}")
-            return False
-
-    def _click_by_keyboard(self):
-        """방법 4: 키보드로 클릭 (Tab + Enter)"""
-        try:
-            logging.info("⌨️ 키보드 입력 시도 (Enter)")
-            
-            # Space나 Enter로 버튼 클릭
-            pyautogui.press('space')
-            time.sleep(0.2)
-            
-            pyautogui.press('enter')
-            time.sleep(0.2)
-            
-            # Tab으로 포커스 이동 후 Enter
-            for i in range(3):
-                pyautogui.press('tab')
-                time.sleep(0.1)
-            
-            pyautogui.press('enter')
-            time.sleep(0.2)
-            
-            return True
-            
-        except Exception as ex:
-            logging.debug(f"_click_by_keyboard 실패: {ex}")
             return False
        
     def buycount_setting(self):
@@ -5454,18 +5348,18 @@ class MyWindow(QWidget):
     def post_login_setup(self):
         """로그인 후 설정"""
         
-        # ===== 1. 모의투자 접속 후 안정화 대기 =====
+        # 1. 모의투자 접속 후 안정화 대기
         logging.info("📡 모의투자 서버 연결 대기 중...")
         time.sleep(3.0)
         
-        # ===== 2. 로거 초기화 =====
+        # 2. 로거 초기화
         logger = logging.getLogger()
         if not any(isinstance(handler, QTextEditLogger) for handler in logger.handlers):
             text_edit_logger = QTextEditLogger(self.terminalOutput)
             text_edit_logger.setLevel(logging.INFO)
             logger.addHandler(text_edit_logger)
         
-        # ===== 3. 트레이더 객체 생성 =====
+        # 3. 트레이더 객체 생성
         buycount = int(self.buycountEdit.text())
         self.trader = CTrader(cpTrade, cpBalance, cpCodeMgr, cpCash, cpOrder, cpStock, buycount, self)
         self.objstg = CpStrategy(self.trader)
@@ -5477,20 +5371,24 @@ class MyWindow(QWidget):
         self.stocks = []
         self.counter = 0
 
-        # ===== 4. 계좌 정보 조회 =====
+        # ===== ✅ 4. 큐 스레드 먼저 시작 (한 번만) =====
+        self.objstg.start_processing_queue()
+        logging.info("✅ 종목 처리 큐 스레드 시작 완료")
+
+        # 5. 계좌 정보 조회
         self.trader.get_stock_balance('START', 'post_login_setup')
         logging.info(f"시작 시간: {datetime.now().strftime('%m/%d %H:%M:%S')}")
 
-        # ===== 5. 팝업 닫기 =====
+        # 6. 팝업 닫기
         self.close_external_popup()
 
-        # ===== 6. 전략 로드 =====
+        # 7. 전략 로드
         self.load_strategy()
 
-        # ===== 7. 타이머 시작 =====
+        # 8. 타이머 시작
         self.start_timers()
         
-        # ===== 8. 시그널 연결 =====
+        # 9. 시그널 연결
         self.trader.stock_added_to_monitor.connect(self.on_stock_added)
         self.trader.stock_bought.connect(self.on_stock_bought)
         self.trader.stock_sold.connect(self.on_stock_sold)
@@ -5506,7 +5404,7 @@ class MyWindow(QWidget):
         self.trader_thread.connect_bar_signals()
         
         self.trader_thread.start()
-
+        
     def get_strategy_type(self, strategy_name):
         """전략 타입 확인
         
@@ -6148,12 +6046,15 @@ class MyWindow(QWidget):
                 self.sell_all_item()
                 self.trader.clear_list_db('mylist.db')
             
-            # ===== 조건검색 리스트 지연 로드 =====
-            if not self.data8537:
+            # ===== ✅ 조건검색 리스트 캐싱 =====
+            if not hasattr(self, '_condition_list_loaded'):
+                self._condition_list_loaded = False
+            
+            if not self._condition_list_loaded:
                 logging.info("📋 조건검색 리스트 로드 중...")
                 time.sleep(0.5)
                 
-                # ===== ✅ 대신증권 API 제한만 확인 =====
+                # 대신증권 API 제한 확인
                 remain_time = cpStatus.GetLimitRemainTime(0)
                 if remain_time > 0:
                     wait_sec = remain_time / 1000 + 0.1
@@ -6161,6 +6062,7 @@ class MyWindow(QWidget):
                     time.sleep(wait_sec)
                 
                 self.data8537 = self.objstg.requestList()
+                self._condition_list_loaded = True  # ✅ 플래그 설정
                 
                 # 새로운 전략 추가
                 existing_stgnames = set(self.login_handler.config['STRATEGIES'].values())
@@ -6180,12 +6082,16 @@ class MyWindow(QWidget):
                         existing_stgnames.add(stgname)
                         self.comboStg.addItem(stgname)
                 
-                if len(self.data8537) != len(existing_stgnames) - len([s for s in existing_stgnames if s == "통합 전략"]):
+                if len(self.data8537) != len(existing_stgnames) - 1:  # "통합 전략" 제외
                     with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
                         self.login_handler.config.write(configfile)
+                    logging.info("✅ 조건검색 리스트 로드 완료")
             
-            # 큐 처리 시작
-            self.objstg.start_processing_queue()
+            # ===== ❌ 큐 스레드 시작 제거 (이미 post_login_setup에서 시작됨) =====
+            # self.objstg.start_processing_queue()  # ← 삭제
+            
+            if hasattr(self, 'momentum_scanner') and self.momentum_scanner:
+                self.momentum_scanner = None
             
             # ===== VI 발동 전략 =====
             if stgName == 'VI 발동':
@@ -6198,7 +6104,7 @@ class MyWindow(QWidget):
                 if not hasattr(self, 'pb9619'):
                     self.pb9619 = CpPB9619()
                     self.pb9619.Subscribe("", self.trader)
-            
+
             # ===== 통합 전략 =====
             elif stgName == "통합 전략":
                 if hasattr(self, 'pb9619'):
@@ -6213,7 +6119,6 @@ class MyWindow(QWidget):
                 
                 self._load_stocks_from_db_safely('mylist.db')
                 
-                # ===== ✅ 조건검색 시작 전 대기 =====
                 time.sleep(1.0)
                 self._start_condition_search("급등주")
                 time.sleep(0.5)
@@ -6224,7 +6129,7 @@ class MyWindow(QWidget):
                 
                 self.gap_scanner = self.objstg.gap_scanner
                 logging.info("✅ 통합 전략 초기화 완료")
-            
+
             # ===== 기타 전략 =====
             else:
                 if hasattr(self, 'pb9619'):
@@ -6242,7 +6147,6 @@ class MyWindow(QWidget):
                     strategy_type = self.get_strategy_type(name)
                     
                     if strategy_type == 'static':
-                        # ===== ✅ 정적 전략: API 호출 전 대기 =====
                         time.sleep(1.0)
                         
                         ret, self.dataStg = self.objstg.requestStgID(id)
@@ -6258,7 +6162,6 @@ class MyWindow(QWidget):
                             else:
                                 self._load_stocks_from_list_safely(self.dataStg)
                     
-                    # 조건검색 시작
                     time.sleep(0.5)
                     self._start_condition_search(stgName)
             
@@ -6286,7 +6189,7 @@ class MyWindow(QWidget):
             
         except Exception as ex:
             logging.error(f"stgChanged: {ex}\n{traceback.format_exc()}")
-                        
+            
     def _load_stocks_from_list_safely_with_limit(self, stock_list, max_count=10):
         """리스트에서 종목 안전하게 로드 (개수 제한 + 백그라운드)"""
         try:
