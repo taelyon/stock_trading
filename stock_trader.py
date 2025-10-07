@@ -133,89 +133,6 @@ class SlackMessageSender(QRunnable):
         except Exception as ex:
             logging.error(f"Slack 메시지 전송 실패: {ex}")
 
-# ==================== API 제한 관리자 ====================
-class APILimiter:
-    """API 호출 제한 관리 (대신증권 제한 고려)"""
-    
-    def __init__(self):
-        # ===== ✅ 대신증권 제한 규칙 적용 =====
-        # 15초에 최대 60건 → 안전하게 15초에 50건으로 제한
-        self.max_requests_per_15sec = 50
-        self.request_times = deque(maxlen=50)  # 15초간 최대 50건
-        self.lock = threading.Lock()
-        self.last_request_time = 0
-        
-    def wait_if_needed(self):
-        """API 제한 대기"""
-        wait_time = 0
-        
-        with self.lock:
-            now = time.time()
-            
-            # ===== ✅ 대신증권 실시간 제한 확인 =====
-            try:
-                remain_time0 = cpStatus.GetLimitRemainTime(0)
-                remain_time1 = cpStatus.GetLimitRemainTime(1)
-                
-                if remain_time0 > 0 or remain_time1 > 0:
-                    creon_wait = max(remain_time0, remain_time1) / 1000 + 0.5
-                    if creon_wait > wait_time:
-                        wait_time = creon_wait
-                        logging.warning(f"🚨 대신증권 API 제한: {creon_wait:.1f}초 대기")
-            except Exception as ex:
-                logging.debug(f"API 제한 확인 실패: {ex}")
-            
-            # ===== ✅ 자체 15초당 50개 제한 =====
-            while len(self.request_times) >= self.max_requests_per_15sec:
-                oldest = self.request_times[0]
-                if now - oldest < 15:
-                    local_wait = 15 - (now - oldest) + 0.5
-                    if local_wait > wait_time:
-                        wait_time = local_wait
-                        logging.debug(f"⏳ 로컬 API 제한: {local_wait:.1f}초 대기")
-                    break
-                else:
-                    self.request_times.popleft()
-            
-            # ===== ✅ 최소 간격 0.5초 (대신증권 제한 고려) =====
-            if wait_time == 0 and len(self.request_times) > 0:
-                last_request = self.request_times[-1]
-                min_interval = 0.5  # 15초에 60건 = 평균 0.25초 간격, 안전하게 0.5초
-                if now - last_request < min_interval:
-                    interval_wait = min_interval - (now - last_request)
-                    if interval_wait > wait_time:
-                        wait_time = interval_wait
-        
-        # 락 밖에서 sleep
-        if wait_time > 0:
-            if wait_time > 10:
-                logging.warning(f"⏰ API 제한 대기: {wait_time:.1f}초")
-            else:
-                logging.debug(f"API 제한: {wait_time:.1f}초 대기")
-            time.sleep(wait_time)
-        
-        with self.lock:
-            self.request_times.append(time.time())
-            self.last_request_time = time.time()
-    
-    def get_status_info(self):
-        """API 상태 정보"""
-        try:
-            remain0 = cpStatus.GetLimitRemainTime(0)
-            remain1 = cpStatus.GetLimitRemainTime(1)
-            remaining_count = max(0, 12 - len(self.request_times))
-            
-            return {
-                'creon_limit_0': remain0,
-                'creon_limit_1': remain1,
-                'local_remaining': remaining_count
-            }
-        except Exception as ex:
-            return {'error': str(ex)}        
-
-# 전역 API 제한자
-api_limiter = APILimiter()
-
 # ==================== 데이터 캐시 ====================
 class DataCache:
     """종목 정보 캐싱"""
@@ -293,10 +210,7 @@ def get_last_trading_date(target_date=None, max_attempts=10):
             
             attempts += 1
             test_date_int = test_date.year * 10000 + test_date.month * 100 + test_date.day
-            
-            # API 제한 대기
-            api_limiter.wait_if_needed()
-            
+                      
             # 삼성전자로 영업일 확인
             objRq.SetInputValue(0, 'A005930')
             objRq.SetInputValue(1, ord('1'))
@@ -939,7 +853,7 @@ class CpStrategy:
         return result[0]
 
     def _process_single_stock(self, stock_data):
-        """단일 종목 처리 (안전성 강화)"""
+        """단일 종목 처리"""
         code = None
         try:
             stgid = stock_data['stgid']
@@ -955,7 +869,7 @@ class CpStrategy:
             logging.info(f"📋 {stock_name}({code}) 처리 시작 - 전략: {stgname}")
             logging.info(f"{'='*50}")
             
-            # ===== ✅ 중복 확인 강화 =====
+            # 중복 확인
             if code in self.trader.monistock_set:
                 logging.info(f"{stock_name}({code}): 이미 모니터링 중, 스킵")
                 return True
@@ -964,19 +878,18 @@ class CpStrategy:
                 logging.info(f"{stock_name}({code}): 이미 보유 중, 스킵")
                 return True
             
-            # ===== ✅ API 제한 체크 =====
-            remain_time0 = cpStatus.GetLimitRemainTime(0)
-            remain_time1 = cpStatus.GetLimitRemainTime(1)
-            if remain_time0 != 0 or remain_time1 != 0:
-                wait_time = max(remain_time0, remain_time1) / 1000 + 0.5
-                logging.warning(f"{code}: API 제한 대기 ({wait_time:.1f}초)")
-                time.sleep(wait_time)
+            # ===== ✅ 대신증권 API 제한만 확인 =====
+            remain_time = cpStatus.GetLimitRemainTime(0)
+            if remain_time > 0:
+                wait_sec = remain_time / 1000 + 0.1
+                logging.debug(f"{code}: API 제한 {wait_sec:.1f}초 대기")
+                time.sleep(wait_sec)
             
-            # ===== ✅ 장 시작 후에만 처리 =====
+            # 장 시작 후에만 처리
             now = datetime.now()
             market_open = now.replace(hour=9, minute=3, second=0, microsecond=0)
             if now < market_open:
-                logging.debug(f"{code}: 장 시작 전({now.strftime('%H:%M:%S')}), 스킵")
+                logging.debug(f"{code}: 장 시작 전, 스킵")
                 return False
             
             # 전략별 처리
@@ -2226,8 +2139,12 @@ class CpData(QObject):
     def _request_chart_data(self, code, request_type='count', count=None, start_date=None, end_date=None):
         """공통 차트 데이터 요청 로직"""
         try:
-            # API 제한 확인
-            api_limiter.wait_if_needed()
+            # ===== ✅ 대신증권 API 제한만 확인 =====
+            remain_time = cpStatus.GetLimitRemainTime(0)
+            if remain_time > 0:
+                wait_sec = remain_time / 1000 + 0.1
+                logging.debug(f"API 제한: {wait_sec:.1f}초 대기")
+                time.sleep(wait_sec)
             
             objRq = win32com.client.Dispatch("CpSysDib.StockChart")
             objRq.SetInputValue(0, code)
@@ -2288,7 +2205,7 @@ class CpData(QObject):
         except Exception as ex:
             logging.error(f"_request_chart_data -> {code}, {ex}")
             return None
-
+        
     def update_chart_data(self, code, interval, number):
         """실시간 증분 업데이트 (주기적 호출)"""
         try:
@@ -5310,8 +5227,15 @@ class LoginHandler:
         logging.info(f"최대투자 종목수가 업데이트되었습니다.")
 
     def init_plus_check_and_continue(self):
+        """PLUS 체크 후 초기화"""
         if not init_plus_check():
+            logging.error("PLUS 연결 실패")
             exit()
+    
+        # ===== ✅ 연결 안정화 대기 추가 =====
+        logging.info("🔗 PLUS 연결 안정화 대기 중...")
+        time.sleep(2.0)  # 2초 대기
+    
         self.parent.post_login_setup()
 
     def auto_select_creon_popup(self):
@@ -5369,9 +5293,6 @@ class StockLoaderThread(QThread):
                     
                     # 진행 상황 업데이트
                     self.progress_updated.emit(idx, total, f"{stock_name}({code}) 로딩 중...")
-                    
-                    # API 제한 대기
-                    api_limiter.wait_if_needed()
                     
                     # 종목 로드
                     success = self.loader_func(code)
@@ -5533,14 +5454,18 @@ class MyWindow(QWidget):
     def post_login_setup(self):
         """로그인 후 설정"""
         
-        # 로거 초기화
+        # ===== 1. 모의투자 접속 후 안정화 대기 =====
+        logging.info("📡 모의투자 서버 연결 대기 중...")
+        time.sleep(3.0)
+        
+        # ===== 2. 로거 초기화 =====
         logger = logging.getLogger()
         if not any(isinstance(handler, QTextEditLogger) for handler in logger.handlers):
             text_edit_logger = QTextEditLogger(self.terminalOutput)
             text_edit_logger.setLevel(logging.INFO)
             logger.addHandler(text_edit_logger)
         
-        # 트레이더 객체 생성
+        # ===== 3. 트레이더 객체 생성 =====
         buycount = int(self.buycountEdit.text())
         self.trader = CTrader(cpTrade, cpBalance, cpCodeMgr, cpCash, cpOrder, cpStock, buycount, self)
         self.objstg = CpStrategy(self.trader)
@@ -5552,19 +5477,23 @@ class MyWindow(QWidget):
         self.stocks = []
         self.counter = 0
 
+        # ===== 4. 계좌 정보 조회 =====
         self.trader.get_stock_balance('START', 'post_login_setup')
-        logging.info(f"시작 시간 : {datetime.now().strftime('%m/%d %H:%M:%S')}")
+        logging.info(f"시작 시간: {datetime.now().strftime('%m/%d %H:%M:%S')}")
 
-        # 시그널 연결
+        # ===== 5. 팝업 닫기 =====
+        self.close_external_popup()
+
+        # ===== 6. 전략 로드 =====
+        self.load_strategy()
+
+        # ===== 7. 타이머 시작 =====
+        self.start_timers()
+        
+        # ===== 8. 시그널 연결 =====
         self.trader.stock_added_to_monitor.connect(self.on_stock_added)
         self.trader.stock_bought.connect(self.on_stock_bought)
         self.trader.stock_sold.connect(self.on_stock_sold)
-
-        self.close_external_popup()         
-
-        self.load_strategy()
-
-        self.start_timers()
         
         self.trader_thread.buy_signal.connect(self.trader.buy_stock)
         self.trader_thread.sell_signal.connect(self.trader.sell_stock)
@@ -5574,9 +5503,8 @@ class MyWindow(QWidget):
         self.trader_thread.counter_updated.connect(self.update_counter_label)
         self.trader_thread.stock_data_updated.connect(self.update_stock_table)
         
-        # 봉 완성 signal 연결
         self.trader_thread.connect_bar_signals()
-
+        
         self.trader_thread.start()
 
     def get_strategy_type(self, strategy_name):
@@ -6116,8 +6044,102 @@ class MyWindow(QWidget):
         except Exception as ex:
             logging.error(f"load_strategy -> {ex}")
 
+    def load_strategy(self):
+        """전략 로드 (API 호출 최소화 버전)"""
+        try:
+            # ===== 1. 초기화 =====
+            self.dataStg = []
+            self.data8537 = {}  # 일단 빈 딕셔너리로 초기화
+            self.strategies = {}
+
+            self.comboStg.clear()
+            self.comboBuyStg.clear()
+            self.buystgInputWidget.clear()
+
+            # ===== 2. 설정 파일에서 전략 목록 읽기 (API 호출 없음) =====
+            if self.login_handler.config.has_section('STRATEGIES'):
+                existing_stgnames = set(self.login_handler.config['STRATEGIES'].values())
+            else:
+                existing_stgnames = set()
+                
+            logging.debug(f"설정 파일에서 {len(existing_stgnames)}개 전략 로드")
+
+            # ===== 3. 설정 파일에서 전략별 매수/매도 조건 읽기 =====
+            for investment_strategy in existing_stgnames:
+                if self.login_handler.config.has_section(investment_strategy):
+                    self.strategies[investment_strategy] = []
+                    
+                    # 매수 전략 로드
+                    buy_keys = sorted(
+                        [k for k in self.login_handler.config[investment_strategy] if k.startswith('buy_stg_')],
+                        key=lambda x: int(x.split('_')[-1])
+                    )
+                    for buy_key in buy_keys:
+                        try:
+                            buy_strategy = json.loads(self.login_handler.config.get(investment_strategy, buy_key))
+                            buy_strategy['key'] = buy_key
+                            self.strategies[investment_strategy].append(buy_strategy)
+                        except json.JSONDecodeError as ex:
+                            logging.warning(f"{investment_strategy} - {buy_key} 파싱 실패: {ex}")
+
+                    # 매도 전략 로드
+                    sell_keys = sorted(
+                        [k for k in self.login_handler.config[investment_strategy] if k.startswith('sell_stg_')],
+                        key=lambda x: int(x.split('_')[-1])
+                    )
+                    for sell_key in sell_keys:
+                        try:
+                            sell_strategy = json.loads(self.login_handler.config.get(investment_strategy, sell_key))
+                            sell_strategy['key'] = sell_key
+                            self.strategies[investment_strategy].append(sell_strategy)
+                        except json.JSONDecodeError as ex:
+                            logging.warning(f"{investment_strategy} - {sell_key} 파싱 실패: {ex}")
+
+            # ===== 4. "통합 전략"이 없으면 추가 (API 호출 없음) =====
+            if "통합 전략" not in existing_stgnames:
+                if not self.login_handler.config.has_section('STRATEGIES'):
+                    self.login_handler.config.add_section('STRATEGIES')
+                
+                self.login_handler.config.set('STRATEGIES', 'stg_integrated', "통합 전략")
+                existing_stgnames.add("통합 전략")
+                
+                with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
+                    self.login_handler.config.write(configfile)
+                
+                logging.debug("'통합 전략' 설정 파일에 추가")
+
+            # ===== 5. 전략 콤보박스 채우기 =====
+            self.comboStg.blockSignals(True)
+            for stgname in existing_stgnames:
+                self.comboStg.addItem(stgname)
+            
+            # ===== 6. 마지막 선택 전략 복원 =====
+            last_strategy = self.login_handler.config.get('SETTINGS', 'last_strategy', fallback='통합 전략')
+            index = self.comboStg.findText(last_strategy)
+            if index != -1:
+                self.comboStg.setCurrentIndex(index)
+            else:
+                # 마지막 전략을 찾을 수 없으면 "통합 전략" 선택
+                index = self.comboStg.findText("통합 전략")
+                if index != -1:
+                    self.comboStg.setCurrentIndex(index)
+            
+            self.comboStg.blockSignals(False)
+            
+            logging.info(f"✅ 전략 목록 로드 완료 ({len(existing_stgnames)}개)")
+
+            # ===== 7. 선택된 전략 활성화 (stgChanged 호출) =====
+            # 조건검색 리스트는 stgChanged()에서 필요할 때만 로드
+            self.is_loading_strategy = True
+            self.stgChanged()
+            self.is_loading_strategy = False
+
+        except Exception as ex:
+            logging.error(f"load_strategy -> {ex}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "오류", f"전략 로드 중 오류:\n{str(ex)}")
+
     def stgChanged(self, *args):
-        """전략 변경 시 안전한 종목 로드 (설정 파일 기반)"""
+        """전략 변경 시 처리"""
         try:
             stgName = self.comboStg.currentText()
             self.save_last_stg()
@@ -6126,10 +6148,43 @@ class MyWindow(QWidget):
                 self.sell_all_item()
                 self.trader.clear_list_db('mylist.db')
             
-            if hasattr(self, 'momentum_scanner') and self.momentum_scanner:
-                self.momentum_scanner = None
+            # ===== 조건검색 리스트 지연 로드 =====
+            if not self.data8537:
+                logging.info("📋 조건검색 리스트 로드 중...")
+                time.sleep(0.5)
+                
+                # ===== ✅ 대신증권 API 제한만 확인 =====
+                remain_time = cpStatus.GetLimitRemainTime(0)
+                if remain_time > 0:
+                    wait_sec = remain_time / 1000 + 0.1
+                    logging.debug(f"API 제한: {wait_sec:.1f}초 대기")
+                    time.sleep(wait_sec)
+                
+                self.data8537 = self.objstg.requestList()
+                
+                # 새로운 전략 추가
+                existing_stgnames = set(self.login_handler.config['STRATEGIES'].values())
+                
+                for stgname, v in self.data8537.items():
+                    if stgname not in existing_stgnames:
+                        existing_keys = self.login_handler.config['STRATEGIES'].keys()
+                        existing_numbers = []
+                        for k in existing_keys:
+                            match = re.match(r'stg_?(\d+)', k)
+                            if match:
+                                existing_numbers.append(int(match.group(1)))
+                        next_number = max(existing_numbers, default=0) + 1
+                        new_key = f'stg_{next_number}'
+                        
+                        self.login_handler.config.set('STRATEGIES', new_key, stgname)
+                        existing_stgnames.add(stgname)
+                        self.comboStg.addItem(stgname)
+                
+                if len(self.data8537) != len(existing_stgnames) - len([s for s in existing_stgnames if s == "통합 전략"]):
+                    with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
+                        self.login_handler.config.write(configfile)
             
-            # ===== ✅ 큐 처리 시작 =====
+            # 큐 처리 시작
             self.objstg.start_processing_queue()
             
             # ===== VI 발동 전략 =====
@@ -6143,7 +6198,7 @@ class MyWindow(QWidget):
                 if not hasattr(self, 'pb9619'):
                     self.pb9619 = CpPB9619()
                     self.pb9619.Subscribe("", self.trader)
-
+            
             # ===== 통합 전략 =====
             elif stgName == "통합 전략":
                 if hasattr(self, 'pb9619'):
@@ -6153,94 +6208,62 @@ class MyWindow(QWidget):
                 logging.info(f"=== 통합 전략 시작 ===")
                 self.trader.init_stock_balance()
                 
-                # 스캐너 초기화
                 self.objstg.momentum_scanner = MomentumScanner(self.trader)
                 self.objstg.gap_scanner = GapUpScanner(self.trader)
                 
-                # 기존 DB 종목만 복원
                 self._load_stocks_from_db_safely('mylist.db')
                 
-                # 조건검색 시작 (실시간만)
+                # ===== ✅ 조건검색 시작 전 대기 =====
                 time.sleep(1.0)
                 self._start_condition_search("급등주")
                 time.sleep(0.5)
                 self._start_condition_search("갭상승")
                 
-                # 변동성 돌파 전략
                 self.volatility_strategy = VolatilityBreakout(self.trader)
                 self.trader_thread.set_volatility_strategy(self.volatility_strategy)
-                logging.info("✅ 변동성 돌파 전략 활성화")
                 
                 self.gap_scanner = self.objstg.gap_scanner
-                logging.info("✅ 갭 상승 유지 체커 활성화")
-                
-                logging.info(f"=== 통합 전략 초기화 완료 ===")
-                logging.info(f"📌 조건검색 실시간 감시 중 (새 종목 편입 시 자동 추가)")
-
-            # ===== 기타 사용자 정의 전략 =====
+                logging.info("✅ 통합 전략 초기화 완료")
+            
+            # ===== 기타 전략 =====
             else:
                 if hasattr(self, 'pb9619'):
                     self.pb9619.Unsubscribe()
-
+                
                 logging.info(f"전략 초기화: {stgName}")
                 self.trader.init_stock_balance()
                 
-                # 기존 DB 종목 복원
                 self._load_stocks_from_db_safely('mylist.db')
                 
-                # ===== ✅ 설정 파일 기반 전략 타입 확인 =====
                 item = self.data8537.get(stgName)
                 if item:
                     id = item['ID']
                     name = item['전략명']
-                    
-                    # 전략 타입 확인
                     strategy_type = self.get_strategy_type(name)
-                    max_load = self.get_max_static_load()
                     
-                    # ===== ✅ 정적 전략: 프로그램 시작 시 종목 로드 =====
                     if strategy_type == 'static':
-                        logging.info(f"📋 정적 전략 '{name}' (프로그램 시작 시 로드)")
+                        # ===== ✅ 정적 전략: API 호출 전 대기 =====
+                        time.sleep(1.0)
                         
                         ret, self.dataStg = self.objstg.requestStgID(id)
-                        if ret:
+                        if ret and len(self.dataStg) > 0:
+                            max_load = self.get_max_static_load()
                             stock_count = len(self.dataStg)
-                            if stock_count > 0:
-                                logging.info(f"✅ '{name}' 종목 {stock_count}개 발견")
-                                
-                                # API 제한 고려하여 로드
-                                if stock_count > max_load:
-                                    logging.warning(
-                                        f"⚠️ 종목 수({stock_count}개)가 제한({max_load}개)을 초과합니다."
-                                    )
-                                    logging.info(f"   → 상위 {max_load}개만 로드 (나머지는 실시간 편입)")
-                                    self._load_stocks_from_list_safely_with_limit(
-                                        self.dataStg, 
-                                        max_count=max_load
-                                    )
-                                else:
-                                    logging.info(f"   → {stock_count}개 종목 로드 시작")
-                                    self._load_stocks_from_list_safely(self.dataStg)
+                            
+                            if stock_count > max_load:
+                                self._load_stocks_from_list_safely_with_limit(
+                                    self.dataStg, 
+                                    max_count=max_load
+                                )
                             else:
-                                logging.info(f"'{name}' 조건 만족 종목 없음")
-                        else:
-                            logging.warning(f"'{name}' 종목 조회 실패")
+                                self._load_stocks_from_list_safely(self.dataStg)
                     
-                    # ===== ✅ 동적 전략: 실시간 편입만 처리 =====
-                    elif strategy_type == 'dynamic':
-                        ret, self.dataStg = self.objstg.requestStgID(id)
-                        if ret:
-                            stock_count = len(self.dataStg)
-                            logging.info(f"📊 동적 전략 '{name}' - 현재 {stock_count}개 종목 조건 만족")
-                            logging.info(f"   → 프로그램 시작 시에는 로드 안 함 (실시간 편입만 처리)")
-                        else:
-                            logging.warning(f"'{name}' 종목 조회 실패")
-                    
-                    # 조건검색 시작 (실시간 감시)
+                    # 조건검색 시작
+                    time.sleep(0.5)
                     self._start_condition_search(stgName)
             
             logging.info(f"{stgName} 전략 감시 시작")
-
+            
             # 콤보박스 업데이트
             self.comboBuyStg.clear()
             self.comboSellStg.clear()
@@ -6252,19 +6275,18 @@ class MyWindow(QWidget):
                         self.comboBuyStg.addItem(strategy_name, strategy_key)
                     elif strategy_key.startswith('sell'):
                         self.comboSellStg.addItem(strategy_name, strategy_key)
-
+                
                 if self.comboBuyStg.count() > 0:
                     self.comboBuyStg.setCurrentIndex(0)
                     self.buyStgChanged()
-
+                
                 if self.comboSellStg.count() > 0:
                     self.comboSellStg.setCurrentIndex(0)
                     self.sellStgChanged()
-                    
+            
         except Exception as ex:
             logging.error(f"stgChanged: {ex}\n{traceback.format_exc()}")
-            QMessageBox.critical(self, "오류", f"전략 변경 중 오류:\n{str(ex)}")
-
+                        
     def _load_stocks_from_list_safely_with_limit(self, stock_list, max_count=10):
         """리스트에서 종목 안전하게 로드 (개수 제한 + 백그라운드)"""
         try:
@@ -6363,8 +6385,6 @@ class MyWindow(QWidget):
                         logging.debug(f"{code}: 이미 모니터링 중")
                         continue
                     
-                    api_limiter.wait_if_needed()
-                    
                     if self._load_single_stock_safely(code):
                         loaded_count += 1
                     else:
@@ -6418,9 +6438,6 @@ class MyWindow(QWidget):
                     code = stock_item.get('code')
                     if not code:
                         continue
-                    
-                    # API 제한 대기
-                    api_limiter.wait_if_needed()
                     
                     # 종목 로드
                     if self._load_single_stock_safely(code):
@@ -6479,12 +6496,19 @@ class MyWindow(QWidget):
             logging.error(f"_load_stocks_in_background: {ex}")
 
     def _load_single_stock_safely(self, code, max_retries=2):
-        """단일 종목 안전하게 로드 (재시도 포함)"""
+        """단일 종목 안전하게 로드"""
         try:
             stock_name = cpCodeMgr.CodeToName(code)
             
             for attempt in range(max_retries):
                 try:
+                    # ===== ✅ 대신증권 API 제한만 확인 =====
+                    remain_time = cpStatus.GetLimitRemainTime(0)
+                    if remain_time > 0:
+                        wait_sec = remain_time / 1000 + 0.1
+                        logging.debug(f"{code}: API 제한 {wait_sec:.1f}초 대기")
+                        time.sleep(wait_sec)
+                    
                     # 일봉 로드
                     if not self.trader.daydata.select_code(code):
                         if attempt < max_retries - 1:
@@ -6526,7 +6550,6 @@ class MyWindow(QWidget):
                         time.sleep(0.3)
                     else:
                         logging.error(f"{stock_name}({code}): 로드 중 오류: {ex}")
-                        # 정리
                         self.trader.daydata.monitor_stop(code)
                         self.trader.tickdata.monitor_stop(code)
                         self.trader.mindata.monitor_stop(code)
