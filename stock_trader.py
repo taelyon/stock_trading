@@ -15,10 +15,6 @@ import pandas as pd
 import win32com.client
 import time
 import numpy as np
-import win32gui
-import win32con
-import win32api
-
 import re
 import mplfinance as mpf
 import sqlite3
@@ -142,8 +138,10 @@ class APILimiter:
     """API 호출 제한 관리 (대신증권 제한 고려)"""
     
     def __init__(self):
-        # ===== ✅ 1분당 12개로 안전하게 제한 (15개 → 12개) =====
-        self.request_times = deque(maxlen=12)  # 여유 확보
+        # ===== ✅ 대신증권 제한 규칙 적용 =====
+        # 15초에 최대 60건 → 안전하게 15초에 50건으로 제한
+        self.max_requests_per_15sec = 50
+        self.request_times = deque(maxlen=50)  # 15초간 최대 50건
         self.lock = threading.Lock()
         self.last_request_time = 0
         
@@ -167,11 +165,11 @@ class APILimiter:
             except Exception as ex:
                 logging.debug(f"API 제한 확인 실패: {ex}")
             
-            # ===== ✅ 자체 1분당 12개 제한 =====
-            while len(self.request_times) >= 12:
+            # ===== ✅ 자체 15초당 50개 제한 =====
+            while len(self.request_times) >= self.max_requests_per_15sec:
                 oldest = self.request_times[0]
-                if now - oldest < 60:
-                    local_wait = 60 - (now - oldest) + 1.0
+                if now - oldest < 15:
+                    local_wait = 15 - (now - oldest) + 0.5
                     if local_wait > wait_time:
                         wait_time = local_wait
                         logging.debug(f"⏳ 로컬 API 제한: {local_wait:.1f}초 대기")
@@ -179,10 +177,10 @@ class APILimiter:
                 else:
                     self.request_times.popleft()
             
-            # ===== ✅ 최소 간격 1초 =====
+            # ===== ✅ 최소 간격 0.5초 (대신증권 제한 고려) =====
             if wait_time == 0 and len(self.request_times) > 0:
                 last_request = self.request_times[-1]
-                min_interval = 1.0
+                min_interval = 0.5  # 15초에 60건 = 평균 0.25초 간격, 안전하게 0.5초
                 if now - last_request < min_interval:
                     interval_wait = min_interval - (now - last_request)
                     if interval_wait > wait_time:
@@ -249,8 +247,12 @@ class DataCache:
 stock_info_cache = DataCache(expire_seconds=300)  # 5분
 
 # ==================== 영업일 찾기 유틸리티 ==================== ✅ 여기에 추가
+# 전역 영업일 캐시
+_global_trading_date = None
+_global_trading_date_lock = threading.Lock()
+
 def get_last_trading_date(target_date=None, max_attempts=10):
-    """가장 최근 영업일 찾기 (삼성전자 기준)
+    """가장 최근 영업일 찾기 (삼성전자 기준) - 전역 캐시 사용
     
     Args:
         target_date: 검색 시작일 (datetime 또는 YYYYMMDD 정수)
@@ -259,6 +261,14 @@ def get_last_trading_date(target_date=None, max_attempts=10):
     Returns:
         (success, trading_date): (성공 여부, 영업일 YYYYMMDD 정수)
     """
+    global _global_trading_date
+    
+    # ✅ 전역 캐시 확인 (API 호출 방지)
+    with _global_trading_date_lock:
+        if _global_trading_date is not None:
+            logging.info(f"✅ 캐시된 영업일 사용: {_global_trading_date}")
+            return (True, _global_trading_date)
+    
     try:
         if target_date is None:
             check_date = datetime.now()
@@ -306,6 +316,11 @@ def get_last_trading_date(target_date=None, max_attempts=10):
             if len_data > 0:
                 actual_date = objRq.GetDataValue(0, 0)
                 logging.info(f"✅ 최근 영업일: {actual_date}")
+                
+                # ✅ 전역 캐시에 저장
+                with _global_trading_date_lock:
+                    _global_trading_date = actual_date
+                
                 return (True, actual_date)
         
         logging.warning(f"최근 {max_attempts}일 내 영업일을 찾지 못했습니다")
@@ -1963,11 +1978,11 @@ class CpData(QObject):
         self.sell_volumes = {}
         self.strength_cache = {}
 
-        # ===== ✅ 전역 영업일 한 번만 찾기 =====
+        # ===== ✅ 전역 영업일 한 번만 찾기 (캐시 사용) =====
         now = time.localtime()
         today_candidate = now.tm_year * 10000 + now.tm_mon * 100 + now.tm_mday
         
-        success, trading_date = get_last_trading_date(today_candidate, max_attempts=5)
+        success, trading_date = get_last_trading_date(today_candidate, max_attempts=10)
         
         if success:
             self.todayDate = trading_date
@@ -2021,7 +2036,8 @@ class CpData(QObject):
                     code not in self.trader.bought_set):
                     continue
                 
-                interval = 10 if code in self.trader.bought_set else 15
+                # ✅ API 제한 방지: 간격을 늘림 (보유 종목: 20초, 모니터링: 30초)
+                interval = 20 if code in self.trader.bought_set else 30
 
                 last_time = self.last_update_time.get(code, 0)
                 if current_time - last_time < interval:
@@ -5194,8 +5210,6 @@ class LoginHandler:
             # 여러 위치 시도 (중앙, 중앙 하단, 중앙 약간 아래)
             positions = [
                 (left + width // 2, top + height // 2),           # 정중앙
-                (left + width // 2, top + int(height * 0.4)),     # 중앙보다 약간 아래
-                (left + width // 2, top + int(height * 0.3)),     # 하단
             ]
             
             for idx, (x, y) in enumerate(positions, 1):
