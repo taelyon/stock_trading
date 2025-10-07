@@ -5373,7 +5373,6 @@ class MyWindow(QWidget):
 
         # ===== ✅ 4. 큐 스레드 먼저 시작 (한 번만) =====
         self.objstg.start_processing_queue()
-        logging.info("✅ 종목 처리 큐 스레드 시작 완료")
 
         # 5. 계좌 정보 조회
         self.trader.get_stock_balance('START', 'post_login_setup')
