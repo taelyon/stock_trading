@@ -13,6 +13,10 @@ datas = [
 
 # ===== 숨겨진 import 모듈 =====
 hiddenimports = [
+    # 자체 모듈 (리팩토링으로 추가됨)
+    'strategy_utils',
+    'backtester',
+    
     # PyQt5
     'PyQt5.QtWidgets',
     'PyQt5.QtCore',
@@ -80,6 +84,11 @@ hiddenimports = [
     'collections',
     'traceback',
     'copy',
+    'datetime',
+    're',
+    'os',
+    'sys',
+    'time',
     
     # pyparsing 의존성
     'html',
@@ -102,7 +111,7 @@ excludes = [
 ]
 
 a = Analysis(
-    ['stock_trader.py'],
+    ['stock_trader.py', 'strategy_utils.py', 'backtester.py'],  # 메인 스크립트 + 추가 모듈
     pathex=[],
     binaries=[],
     datas=datas,

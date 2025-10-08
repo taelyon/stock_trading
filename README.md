@@ -60,8 +60,11 @@ dist\stock_trader.exe 우클릭 → 관리자 권한으로 실행
 
 ## 🏗️ 빌드
 
-### 빌드 방법
+### 간단 빌드
 ```bash
+# 0. 환경 진단 (권장)
+빌드_진단.bat
+
 # 1. 정리 (선택사항)
 정리.bat
 
@@ -72,29 +75,37 @@ dist\stock_trader.exe 우클릭 → 관리자 권한으로 실행
 dist\stock_trader.exe
 ```
 
-### 디버그 빌드 (오류 확인)
-```bash
-디버그빌드.bat
-```
+### 자세한 빌드 가이드
+📖 **[BUILD.md](BUILD.md) 참조** - 상세한 빌드 방법, 문제 해결, 최적화 팁
 
 ## 📁 프로젝트 구조
 
 ```
 stock_trading/
 ├── stock_trader.py              # 메인 프로그램
+├── strategy_utils.py            # 전략 유틸리티 (리팩토링됨) ✨
+├── backtester.py               # 백테스팅 엔진
 ├── stock_trader.spec            # 빌드 설정
-├── stock_trader_debug.spec      # 디버그 빌드 설정
 ├── stock_trader.ico             # 아이콘
 ├── settings.ini.example         # 설정 예제
-├── backtester.py               # 백테스터
 ├── vi_stock_data.db            # 데이터베이스
+├── README.md                   # 이 문서
+├── BUILD.md                    # 빌드 가이드 ✨
 ├── 빌드.bat                     # 빌드 스크립트
-├── 디버그빌드.bat                # 디버그 빌드
+├── 빌드_진단.bat                 # 빌드 환경 진단 ✨
 ├── 정리.bat                     # 정리 스크립트
 ├── log/                        # 로그 폴더
+│   └── trading_YYYYMMDD.log
 └── dist/                       # 빌드 결과
-    └── stock_trader.exe
+    ├── stock_trader.exe
+    └── settings.ini
 ```
+
+### 최근 변경사항 (2025-10-08)
+- ✅ **중복 코드 리팩토링** - 266줄 감소, 코드 활용률 100%
+- ✅ **strategy_utils.py 추가** - 공통 유틸리티 모듈
+- ✅ **불필요한 메서드 제거** - 82줄 레거시 코드 정리
+- ✅ **빌드 설정 업데이트** - 새 모듈 포함
 
 ## 🎯 사용 방법
 
@@ -119,16 +130,21 @@ stock_trading/
 
 ## 🐛 문제 해결
 
-### 실행 안 됨
+### 빌드 실패
 ```bash
-# 디버그 모드로 확인
-디버그빌드.bat
-→ Y 선택
-→ 콘솔 창 오류 확인
+# 1. 환경 진단
+빌드_진단.bat
+
+# 2. 수동 빌드 시도
+pyinstaller stock_trader.spec
+
+# 3. 상세 가이드 참조
+BUILD.md 문서의 "문제 해결" 섹션
 ```
 
-### 로그 확인
-```
+### 실행 안 됨
+```bash
+# 로그 확인
 log\trading_YYYYMMDD.log
 ```
 
