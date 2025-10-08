@@ -229,7 +229,6 @@ def get_last_trading_date(target_date=None, max_attempts=10):
             
             if len_data > 0:
                 actual_date = objRq.GetDataValue(0, 0)
-                logging.info(f"✅ 최근 영업일: {actual_date}")
                 
                 # ✅ 전역 캐시에 저장
                 with _global_trading_date_lock:
@@ -771,16 +770,13 @@ class CpStrategy:
         self.failed_stocks = {}  # 실패한 종목 기록
 
     def start_processing_queue(self):
-        """큐 처리 스레드 시작 (한 번만)"""
+        """큐 처리 시작 (메인 스레드에서 직접 처리)"""
         if self.is_thread_started:
-            logging.debug("큐 스레드는 이미 실행 중")
+            logging.debug("큐 처리는 이미 시작됨")
             return
         
-        if self.processing_thread is None or not self.processing_thread.is_alive():
-            self.processing_thread = threading.Thread(target=self._process_stock_queue, daemon=True)
-            self.processing_thread.start()
-            self.is_thread_started = True  # ✅ 플래그 설정
-            logging.info("✅ 종목 처리 큐 스레드 시작")
+        self.is_thread_started = True  # ✅ 플래그 설정
+        logging.info("✅ 종목 처리 큐 시작 (메인 스레드)")
 
     def _process_stock_queue(self):
         """큐에서 종목 순차 처리 (안전성 강화)"""
@@ -834,29 +830,14 @@ class CpStrategy:
                 continue
 
     def _process_single_stock_with_timeout(self, stock_data, timeout=60.0):
-        """타임아웃이 있는 종목 처리"""
-        result = [None]
-        exception = [None]
-        
-        def worker():
-            try:
-                result[0] = self._process_single_stock(stock_data)
-            except Exception as ex:
-                exception[0] = ex
-        
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        thread.join(timeout=timeout)
-        
-        if thread.is_alive():
+        """종목 처리 (메인 스레드에서 직접 실행)"""
+        try:
+            # 메인 스레드에서 직접 처리
+            return self._process_single_stock(stock_data)
+        except Exception as ex:
             code = stock_data.get('code')
-            logging.error(f"{code}: 처리 타임아웃 ({timeout}초)")
-            raise TimeoutError(f"{code} 처리 타임아웃")
-        
-        if exception[0]:
-            raise exception[0]
-        
-        return result[0]
+            logging.error(f"{code}: 처리 실패 - {ex}")
+            raise ex
 
     def _process_single_stock(self, stock_data):
         """단일 종목 처리"""
@@ -1119,52 +1100,22 @@ class CpStrategy:
             logging.error(f"_process_other_stock({code}): {ex}")
 
     def _verify_with_timeout(self, func, code, timeout=10.0):
-        """타임아웃이 있는 검증"""
-        result = [None]
-        exception = [None]
-        
-        def worker():
-            try:
-                result[0] = func(code)
-            except Exception as ex:
-                exception[0] = ex
-        
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        thread.join(timeout=timeout)
-        
-        if thread.is_alive():
-            logging.warning(f"{code}: 검증 타임아웃 ({timeout}초)")
-            return (False, 0, "타임아웃")
-        
-        if exception[0]:
-            raise exception[0]
-        
-        return result[0]
+        """검증 (메인 스레드에서 직접 실행)"""
+        try:
+            # 메인 스레드에서 직접 실행
+            return func(code)
+        except Exception as ex:
+            logging.warning(f"{code}: 검증 실패 - {ex}")
+            return (False, 0, str(ex))
 
     def _load_with_timeout(self, func, code, timeout=30.0):
-        """타임아웃이 있는 로드"""
-        result = [None]
-        exception = [None]
-        
-        def worker():
-            try:
-                result[0] = func(code)
-            except Exception as ex:
-                exception[0] = ex
-        
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-        thread.join(timeout=timeout)
-        
-        if thread.is_alive():
-            logging.warning(f"{code}: 로드 타임아웃 ({timeout}초)")
+        """로드 (메인 스레드에서 직접 실행)"""
+        try:
+            # 메인 스레드에서 직접 실행
+            return func(code)
+        except Exception as ex:
+            logging.warning(f"{code}: 로드 실패 - {ex}")
             return False
-        
-        if exception[0]:
-            raise exception[0]
-        
-        return result[0]
 
     def _add_to_monitoring(self, code, price, time_str, reason):
         """투자대상 종목 추가"""
@@ -1174,7 +1125,13 @@ class CpStrategy:
             self.trader.starting_time[code] = time_str
             self.trader.starting_price[code] = price
             self.trader.monistock_set.add(code)
+            
+            logging.info(f"📋 {stock_name}({code}) 모니터링 세트에 추가 완료")
+            logging.info(f"📋 현재 모니터링 종목 수: {len(self.trader.monistock_set)}")
+            
             self.trader.stock_added_to_monitor.emit(code)
+            logging.info(f"📋 {stock_name}({code}) UI 업데이트 시그널 발송 완료")
+            
             self.trader.save_list_db(code, time_str, price, 1)
             
             logging.info(f"{stock_name}({code}) -> 투자 대상 추가: {reason}")
@@ -1897,20 +1854,9 @@ class CpData(QObject):
         self.sell_volumes = {}
         self.strength_cache = {}
 
-        # ===== ✅ 전역 영업일 한 번만 찾기 (캐시 사용) =====
+        # ===== ✅ 영업일은 start_timers()에서 설정 =====
         now = time.localtime()
-        today_candidate = now.tm_year * 10000 + now.tm_mon * 100 + now.tm_mday
-        
-        success, trading_date = get_last_trading_date(today_candidate, max_attempts=10)
-        
-        if success:
-            self.todayDate = trading_date
-            date_str = str(trading_date)
-            formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
-            logging.info(f"📅 사용할 영업일: {formatted}")
-        else:
-            self.todayDate = today_candidate
-            logging.warning(f"⚠️ 영업일 찾기 실패, 오늘 날짜 사용: {self.todayDate}")
+        self.todayDate = now.tm_year * 10000 + now.tm_mon * 100 + now.tm_mday
 
         self.update_data_timer = QTimer()
         self.update_data_timer.timeout.connect(self.periodic_update_data)
@@ -2711,7 +2657,7 @@ class CTrader(QObject):
         # combined_tick_data 저장 주기만 사용
         self.combined_save_interval = config.getint('DATA_SAVING', 'interval_seconds', fallback=5)
         
-        logging.info(f"데이터 저장 설정: combined_tick_data 간격={self.combined_save_interval}초")
+        logging.debug(f"데이터 저장 설정: combined_tick_data 간격={self.combined_save_interval}초")
 
     def init_database(self):
         """데이터베이스 초기화 (combined_tick_data 단일 테이블)"""
@@ -3004,8 +2950,13 @@ class CTrader(QObject):
             return False
 
     def init_stock_balance(self):
-        """시작 시 계좌 잔고 초기화"""
+        """시작 시 계좌 잔고 초기화 (중복 방지)"""
         try:
+            # 중복 호출 방지 플래그 확인
+            if hasattr(self, '_stock_balance_initialized') and self._stock_balance_initialized:
+                logging.info("계좌 잔고 이미 초기화됨, 스킵")
+                return
+                
             stocks = self.get_stock_balance('ALL', 'init_stock_balance')
 
             for s in stocks:
@@ -3028,6 +2979,9 @@ class CTrader(QObject):
             logging.info(f"주문 가능 금액 : {self.total_cash}")
             logging.info(f"종목별 주문 비율 : {self.buy_percent}")
             logging.info(f"종목별 주문 금액 : {self.buy_amount}")
+            
+            # 초기화 완료 플래그 설정
+            self._stock_balance_initialized = True
 
         except Exception as ex:
             logging.error(f"init_stock_balance -> {ex}")
@@ -3695,7 +3649,7 @@ class AutoTraderThread(QThread):
         self.event_based_evaluation = config.getboolean('TRADING', 'event_based_evaluation', fallback=True)
         self.min_evaluation_gap = config.getfloat('TRADING', 'min_evaluation_gap', fallback=3.0)
         
-        logging.info(
+        logging.debug(
             f"매매 평가 설정: 주기={self.evaluation_interval}초, "
             f"이벤트기반={self.event_based_evaluation}, "
             f"최소간격={self.min_evaluation_gap}초"
@@ -4328,6 +4282,29 @@ class AutoTraderThread(QThread):
         tick_data_full = self.trader.tickdata.get_recent_data(code, 10)
         min_data_full = self.trader.mindata.get_recent_data(code, 10)
         
+        # ===== 매도 조건용 변수들 계산 =====
+        tick_close = tick_latest.get('C', 0)
+        buy_price = self.trader.buy_price.get(code, 0)
+        current_profit_pct = (tick_close / buy_price - 1) * 100 if buy_price > 0 else 0
+        
+        highest_price = self.trader.highest_price.get(code, buy_price)
+        from_peak_pct = (tick_close / highest_price - 1) * 100 if highest_price > 0 else 0
+        
+        # 보유 시간 계산
+        buy_time_str = self.trader.starting_time.get(code)
+        if buy_time_str:
+            try:
+                from datetime import datetime
+                buy_time = datetime.strptime(
+                    f"{datetime.now().year}/{buy_time_str}", 
+                    '%Y/%m/%d %H:%M:%S'
+                )
+                hold_minutes = (datetime.now() - buy_time).total_seconds() / 60
+            except:
+                hold_minutes = 0
+        else:
+            hold_minutes = 0
+        
         tick_close_price = tick_data_full.get('C', [0])
         MAT5 = tick_data_full.get('MAT5', [0])
         MAT20 = tick_data_full.get('MAT20', [0])
@@ -4350,16 +4327,182 @@ class AutoTraderThread(QThread):
             for i in range(min(2, len(min_close_recent), len(min_open_recent)))
         )
         
+        # ===== safe_locals 변수 정의 =====
+        safe_locals = {
+            # 틱 데이터 변수들
+            'tick_close_price': tick_close_price,
+            'MAT5': MAT5,
+            'MAT20': MAT20,
+            'MAT60': MAT60,
+            'RSIT': RSIT,
+            'OSCT': OSCT,
+            'bb_upper': bb_upper,
+            
+            # 분봉 데이터 변수들
+            'min_close_price': min_close_price,
+            'MAM5': MAM5,
+            'MAM10': MAM10,
+            'RSI': RSI,
+            'OSC': OSC,
+            'VWAP': VWAP,
+            
+            # 최신 데이터 변수들 (전략에서 사용)
+            'C': tick_latest.get('C', 0),  # 현재 틱 종가
+            'MAT5': tick_latest.get('MAT5', 0),  # 현재 MAT5
+            'MAT20': tick_latest.get('MAT20', 0),  # 현재 MAT20
+            'MAT60': tick_latest.get('MAT60', 0),  # 현재 MAT60
+            'MAM5': min_latest.get('MAM5', 0),  # 현재 MAM5
+            'MAM10': min_latest.get('MAM10', 0),  # 현재 MAM10
+            'RSIT': tick_latest.get('RSIT', 50),  # 현재 RSIT
+            'RSI': min_latest.get('RSI', 50),  # 현재 RSI
+            'OSCT': tick_latest.get('OSCT', 0),  # 현재 OSCT
+            'OSC': min_latest.get('OSC', 0),  # 현재 OSC
+            'VWAP': min_latest.get('VWAP', 0),  # 현재 VWAP
+            'strength': tick_latest.get('strength', 0),  # 체결강도
+            
+            # 추가 변수들
+            'positive_candle': positive_candle,
+            'tick_VWAP': tick_latest.get('VWAP', 0),  # 틱 VWAP
+            'STOCHK': tick_latest.get('STOCHK', 50),  # 스토캐스틱 K
+            'STOCHD': tick_latest.get('STOCHD', 50),  # 스토캐스틱 D
+            
+            # 갭상승 전략 변수들
+            'gap_hold': self._check_gap_hold(code, tick_latest),  # 갭 유지 확인
+            'BB_MIDDLE': tick_latest.get('BB_MIDDLE', 0),  # 볼린저 밴드 중간선
+            'BB_POSITION': tick_latest.get('BB_POSITION', 0),  # 볼린저 밴드 위치
+            
+            # 추가 지표들
+            'min_close': min_latest.get('C', 0),  # 분봉 종가
+            'tick_close_price': tick_latest.get('C', 0),  # 틱 종가 (배열이 아닌 현재값)
+            
+            # 신호 변수들
+            'RSIT_SIGNAL': tick_data_full.get('RSIT_SIGNAL', [0])[-1] if tick_data_full.get('RSIT_SIGNAL') else 0,  # RSIT 신호
+            'tick_C_recent': tick_data_full.get('C', [0])[-3:] if tick_data_full.get('C') else [0],  # 최근 3개 틱 종가
+            
+            # 추가 배열 변수들 (전략에서 사용할 수 있는)
+            'tick_H_recent': tick_data_full.get('H', [0])[-3:] if tick_data_full.get('H') else [0],  # 최근 3개 틱 고가
+            'tick_L_recent': tick_data_full.get('L', [0])[-3:] if tick_data_full.get('L') else [0],  # 최근 3개 틱 저가
+            'tick_high_price': tick_data_full.get('H', [0])[-3:] if tick_data_full.get('H') else [0],  # 틱 고가 배열
+            'tick_low_price': tick_data_full.get('L', [0])[-3:] if tick_data_full.get('L') else [0],  # 틱 저가 배열
+            
+            # 누락된 변수들 추가
+            'bb_upper': tick_data_full.get('BB_UPPER', [0])[-1:] if tick_data_full.get('BB_UPPER') else [0],  # 볼린저 상단선 (배열)
+            'min_VWAP': min_data_full.get('VWAP', [0])[-1:] if min_data_full.get('VWAP') else [0],  # 분봉 VWAP (배열)
+            'MACDT_SIGNAL': tick_data_full.get('MACDT_SIGNAL', [0])[-1:] if tick_data_full.get('MACDT_SIGNAL') else [0],  # MACDT 신호 (배열)
+            'min_OSC': min_data_full.get('OSC', [0])[-1:] if min_data_full.get('OSC') else [0],  # 분봉 OSC (배열)
+            
+            # 통합 전략용 추가 변수들
+            'WILLIAMS_R': tick_latest.get('WILLIAMS_R', -50),  # Williams %R
+            'min_WILLIAMS_R': min_latest.get('WILLIAMS_R', -50),  # 분봉 Williams %R
+            'ROC': tick_latest.get('ROC', 0),  # Rate of Change
+            'min_ROC': min_latest.get('ROC', 0),  # 분봉 ROC
+            'OBV': tick_latest.get('OBV', 0),  # On Balance Volume
+            'OBV_MA20': tick_latest.get('OBV_MA20', 0),  # OBV 20일 이동평균
+            'min_OBV': min_latest.get('OBV', 0),  # 분봉 OBV
+            'min_OBV_MA20': min_latest.get('OBV_MA20', 0),  # 분봉 OBV MA20
+            'VP_POC': tick_latest.get('VP_POC', 0),  # Volume Profile POC
+            'VP_POSITION': tick_latest.get('VP_POSITION', 0),  # Volume Profile Position
+            'volume_profile_breakout': self._check_volume_profile_breakout(code, tick_latest),  # Volume Profile 돌파
+            'volatility_breakout': self._check_volatility_breakout(code, tick_latest),  # 변동성 돌파
+            'BB_BANDWIDTH': tick_latest.get('BB_BANDWIDTH', 0),  # 볼린저 밴드폭
+            'ATR': tick_latest.get('ATR', 0),  # Average True Range
+            
+            # 매도 조건용 변수들
+            'current_profit_pct': current_profit_pct,  # 현재 수익률 (%)
+            'from_peak_pct': from_peak_pct,  # 고점 대비 수익률 (%)
+            'hold_minutes': hold_minutes,  # 보유 시간 (분)
+            
+            # 특수 변수들 (매도 조건용)
+            'self': self,  # self 객체 접근용
+            'code': code,  # 종목 코드
+            'after_market_close': self._is_after_market_close(),  # 장 마감 후 여부
+        }
+        
+        # ===== safe_globals 정의 =====
+        safe_globals = {
+            '__builtins__': {
+                'min': min, 'max': max, 'abs': abs, 'round': round,
+                'int': int, 'float': float, 'bool': bool, 'str': str,
+                'len': len, 'sum': sum, 'all': all, 'any': any,
+                'True': True, 'False': False, 'None': None
+            }
+        }
+        
         for strategy in strategies:
             try:
                 condition = strategy.get('content', '')
-                if eval(condition):
+                if eval(condition, safe_globals, safe_locals):
                     logging.debug(f"{code}: {strategy.get('name')} 조건 만족")
                     return True
             except Exception as ex:
                 logging.error(f"{code} 전략 평가 오류: {ex}")
         
         return False
+
+    def _check_gap_hold(self, code, tick_latest):
+        """갭 유지 확인 (매수 조건)"""
+        try:
+            # 전일 종가 가져오기
+            day_data = self.trader.daydata.stockdata.get(code, {})
+            if not day_data or 'C' not in day_data:
+                return False
+            
+            # 전일 종가 (마지막 값)
+            prev_close = day_data['C'][-1] if day_data['C'] else 0
+            
+            if prev_close == 0:
+                return False
+            
+            # 현재가
+            current_price = tick_latest.get('C', 0)
+            
+            if current_price == 0:
+                return False
+            
+            # 갭 유지 확인 (시가 대비 -0.3% 이내면 갭 유지로 판단)
+            gap_ratio = (current_price - prev_close) / prev_close
+            gap_hold = gap_ratio >= -0.003  # -0.3% 이상이면 갭 유지
+            
+            return gap_hold
+            
+        except Exception as ex:
+            logging.error(f"_check_gap_hold({code}): {ex}")
+            return False
+
+    def _is_after_market_close(self):
+        """장 마감 후 여부 확인 (14:45 이후)"""
+        try:
+            from datetime import datetime
+            now = datetime.now()
+            market_close_time = now.replace(hour=14, minute=45, second=0, microsecond=0)
+            return now >= market_close_time
+        except Exception as ex:
+            logging.error(f"_is_after_market_close: {ex}")
+            return False
+
+    def _check_volume_profile_breakout(self, code, tick_latest):
+        """Volume Profile 돌파 확인"""
+        try:
+            vp_position = tick_latest.get('VP_POSITION', 0)
+            return vp_position > 0  # 현재가가 POC 위에 있으면 돌파
+        except Exception as ex:
+            logging.error(f"_check_volume_profile_breakout({code}): {ex}")
+            return False
+
+    def _check_volatility_breakout(self, code, tick_latest):
+        """변동성 돌파 확인"""
+        try:
+            atr = tick_latest.get('ATR', 0)
+            current_price = tick_latest.get('C', 0)
+            if current_price == 0:
+                return False
+            
+            # ATR이 현재가의 1% 이상 5% 이하면 변동성 돌파로 판단
+            atr_ratio = atr / current_price
+            return 0.01 <= atr_ratio <= 0.05
+        except Exception as ex:
+            logging.error(f"_check_volatility_breakout({code}): {ex}")
+            return False
 
     # ===== 매도 조건 평가 =====
 
@@ -5348,18 +5491,42 @@ class MyWindow(QWidget):
     def post_login_setup(self):
         """로그인 후 설정"""
         
-        # 1. 모의투자 접속 후 안정화 대기
-        logging.info("📡 모의투자 서버 연결 대기 중...")
-        time.sleep(3.0)
+        # 1. 모의투자 서버 연결 확인 (PLUS 연결 체크에서 이미 검증됨)
+        logging.info("📡 모의투자 서버 연결 확인 중...")
+        time.sleep(0.5)  # 최소한의 안정화 대기
         
-        # 2. 로거 초기화
+        # 2. 로거 초기화 (계좌 조회 이전에 먼저 실행)
         logger = logging.getLogger()
         if not any(isinstance(handler, QTextEditLogger) for handler in logger.handlers):
             text_edit_logger = QTextEditLogger(self.terminalOutput)
             text_edit_logger.setLevel(logging.INFO)
             logger.addHandler(text_edit_logger)
         
-        # 3. 트레이더 객체 생성
+        # 3. 팝업 닫기 (로그인 직후 바로 실행)
+        self.close_external_popup()
+        
+        # 4. 계좌 정보 조회 (트레이더 객체 생성 전에 먼저 실행)
+        try:
+            acc = cpTrade.AccountNumber[0]
+            accFlag = cpTrade.GoodsList(acc, 1)
+            cpBalance.SetInputValue(0, acc)
+            cpBalance.SetInputValue(1, accFlag[0])
+            cpBalance.SetInputValue(2, 50)
+            ret = cpBalance.BlockRequest2(1)
+            if ret == 0:
+                logging.info(f"계좌명 : {str(cpBalance.GetHeaderValue(0))}")
+                logging.info(f"결제잔고수량 : {str(cpBalance.GetHeaderValue(1))}")
+                logging.info(f"평가금액 : {str(cpBalance.GetHeaderValue(3))}")
+                logging.info(f"평가손익 : {str(cpBalance.GetHeaderValue(4))}")
+                logging.info(f"종목수 : {str(cpBalance.GetHeaderValue(7))}")
+            else:
+                logging.warning(f"계좌 잔고 조회 실패, {ret}")
+        except Exception as ex:
+            logging.error(f"계좌 정보 조회 오류: {ex}")
+        
+        logging.info(f"시작 시간: {datetime.now().strftime('%m/%d %H:%M:%S')}")
+        
+        # 5. 트레이더 객체 생성
         buycount = int(self.buycountEdit.text())
         self.trader = CTrader(cpTrade, cpBalance, cpCodeMgr, cpCash, cpOrder, cpStock, buycount, self)
         self.objstg = CpStrategy(self.trader)
@@ -5371,18 +5538,11 @@ class MyWindow(QWidget):
         self.stocks = []
         self.counter = 0
 
-        # ===== ✅ 4. 큐 스레드 먼저 시작 (한 번만) =====
+        # 6. 전략 로드 (백그라운드 비동기)
+        self.load_strategy_async()
+
+        # ===== ✅ 7. 큐 스레드 시작 (백그라운드 로드와 동시에 시작) =====
         self.objstg.start_processing_queue()
-
-        # 5. 계좌 정보 조회
-        self.trader.get_stock_balance('START', 'post_login_setup')
-        logging.info(f"시작 시간: {datetime.now().strftime('%m/%d %H:%M:%S')}")
-
-        # 6. 팝업 닫기
-        self.close_external_popup()
-
-        # 7. 전략 로드
-        self.load_strategy()
 
         # 8. 타이머 시작
         self.start_timers()
@@ -5535,7 +5695,34 @@ class MyWindow(QWidget):
             self.trader.init_database()
             return
         
-        # ===== 평일 - 영업일 확인 =====
+        # ===== 평일 - 영업일 확인 (API 호출) =====
+        today_int = now.year * 10000 + now.month * 100 + now.day
+        
+        # 영업일 확인 API 호출
+        success, trading_date = get_last_trading_date(today_int, max_attempts=10)
+        
+        if success:
+            date_str = str(trading_date)
+            formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+            logging.info(f"📅 최근 영업일: {formatted}")
+            
+            # CpData 객체들의 todayDate 설정
+            if hasattr(self.trader, 'daydata') and self.trader.daydata:
+                self.trader.daydata.todayDate = trading_date
+            if hasattr(self.trader, 'mindata') and self.trader.mindata:
+                self.trader.mindata.todayDate = trading_date
+            if hasattr(self.trader, 'tickdata') and self.trader.tickdata:
+                self.trader.tickdata.todayDate = trading_date
+            
+            # 오늘이 영업일이 아니면 (공휴일)
+            if today_int > trading_date:
+                logging.info(f"오늘은 공휴일입니다. 최근 영업일({formatted}) 데이터를 표시합니다.")
+                self.trader.init_database()
+                return
+        else:
+            logging.warning(f"⚠️ 영업일 찾기 실패, 오늘 날짜 사용: {today_int}")
+        
+        # ===== 영업일 - 장 시간 확인 =====
         start_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
         end_time = now.replace(hour=15, minute=20, second=0, microsecond=0)
         
@@ -6035,37 +6222,111 @@ class MyWindow(QWidget):
             logging.error(f"load_strategy -> {ex}\n{traceback.format_exc()}")
             QMessageBox.critical(self, "오류", f"전략 로드 중 오류:\n{str(ex)}")
 
-    def stgChanged(self, *args):
-        """전략 변경 시 처리"""
+    def load_strategy_async(self):
+        """전략 로드 (백그라운드 비동기 - API 제한 회피)"""
         try:
-            stgName = self.comboStg.currentText()
-            self.save_last_stg()
+            # ===== 1. 기본 설정만 먼저 로드 (즉시) =====
+            self.dataStg = []
+            self.data8537 = {}
+            self.strategies = {}
 
-            if not self.is_loading_strategy:
-                self.sell_all_item()
-                self.trader.clear_list_db('mylist.db')
-            
-            # ===== ✅ 조건검색 리스트 캐싱 =====
-            if not hasattr(self, '_condition_list_loaded'):
-                self._condition_list_loaded = False
-            
-            if not self._condition_list_loaded:
-                logging.info("📋 조건검색 리스트 로드 중...")
-                time.sleep(0.5)
+            self.comboStg.clear()
+            self.comboBuyStg.clear()
+            self.buystgInputWidget.clear()
+
+            # ===== 2. 설정 파일에서 전략 목록 읽기 (API 호출 없음) =====
+            if self.login_handler.config.has_section('STRATEGIES'):
+                existing_stgnames = set(self.login_handler.config['STRATEGIES'].values())
+            else:
+                existing_stgnames = set()
                 
-                # 대신증권 API 제한 확인
+            logging.debug(f"설정 파일에서 {len(existing_stgnames)}개 전략 로드")
+
+            # ===== 3. 설정 파일에서 전략별 매수/매도 조건 읽기 =====
+            for investment_strategy in existing_stgnames:
+                if self.login_handler.config.has_section(investment_strategy):
+                    self.strategies[investment_strategy] = []
+                    
+                    # 매수 전략 로드
+                    buy_keys = sorted(
+                        [k for k in self.login_handler.config[investment_strategy] if k.startswith('buy_stg_')],
+                        key=lambda x: int(x.split('_')[-1])
+                    )
+                    for buy_key in buy_keys:
+                        try:
+                            buy_strategy = json.loads(self.login_handler.config.get(investment_strategy, buy_key))
+                            buy_strategy['key'] = buy_key
+                            self.strategies[investment_strategy].append(buy_strategy)
+                        except json.JSONDecodeError as ex:
+                            logging.warning(f"{investment_strategy} - {buy_key} 파싱 실패: {ex}")
+
+                    # 매도 전략 로드
+                    sell_keys = sorted(
+                        [k for k in self.login_handler.config[investment_strategy] if k.startswith('sell_stg_')],
+                        key=lambda x: int(x.split('_')[-1])
+                    )
+                    for sell_key in sell_keys:
+                        try:
+                            sell_strategy = json.loads(self.login_handler.config.get(investment_strategy, sell_key))
+                            sell_strategy['key'] = sell_key
+                            self.strategies[investment_strategy].append(sell_strategy)
+                        except json.JSONDecodeError as ex:
+                            logging.warning(f"{investment_strategy} - {sell_key} 파싱 실패: {ex}")
+
+            # ===== 4. 콤보박스에 전략 추가 =====
+            self.comboStg.blockSignals(True)
+            for stgname in existing_stgnames:
+                self.comboStg.addItem(stgname)
+            
+            # 마지막 선택 전략 복원
+            if self.login_handler.config.has_option('GENERAL', 'last_stg'):
+                last_stg = self.login_handler.config.get('GENERAL', 'last_stg')
+                index = self.comboStg.findText(last_stg)
+                if index != -1:
+                    self.comboStg.setCurrentIndex(index)
+                else:
+                    # 마지막 전략을 찾을 수 없으면 "통합 전략" 선택
+                    index = self.comboStg.findText("통합 전략")
+                    if index != -1:
+                        self.comboStg.setCurrentIndex(index)
+            
+            self.comboStg.blockSignals(False)
+            
+            logging.info(f"✅ 전략 목록 로드 완료 ({len(existing_stgnames)}개)")
+
+            # ===== 5. 초기 전략 설정 (백그라운드 로드 전에 먼저 실행) =====
+            self.is_loading_strategy = True
+            self.stgChanged()
+            self.is_loading_strategy = False
+
+            # ===== 6. 조건검색 리스트는 메인 스레드에서 로드 =====
+            self._load_condition_list_background(existing_stgnames)
+            
+        except Exception as ex:
+            logging.error(f"load_strategy_async -> {ex}\n{traceback.format_exc()}")
+
+    def _load_condition_list_background(self, existing_stgnames):
+        """조건검색 리스트 백그라운드 로드 (COM 초기화 포함)"""
+        def worker():
+            try:
+                # COM 초기화 (백그라운드 스레드에서 필요)
+                import pythoncom
+                pythoncom.CoInitialize()
+                
+                logging.info("📋 조건검색 리스트 로드 중... (백그라운드)")
+                
+                # API 제한 확인
                 remain_time = cpStatus.GetLimitRemainTime(0)
                 if remain_time > 0:
                     wait_sec = remain_time / 1000 + 0.1
                     logging.debug(f"API 제한: {wait_sec:.1f}초 대기")
                     time.sleep(wait_sec)
                 
+                # 조건검색 리스트 로드
                 self.data8537 = self.objstg.requestList()
-                self._condition_list_loaded = True  # ✅ 플래그 설정
+                self._condition_list_loaded = True
                 
                 # 새로운 전략 추가
-                existing_stgnames = set(self.login_handler.config['STRATEGIES'].values())
-                
                 for stgname, v in self.data8537.items():
                     if stgname not in existing_stgnames:
                         existing_keys = self.login_handler.config['STRATEGIES'].keys()
@@ -6078,13 +6339,380 @@ class MyWindow(QWidget):
                         new_key = f'stg_{next_number}'
                         
                         self.login_handler.config.set('STRATEGIES', new_key, stgname)
-                        existing_stgnames.add(stgname)
                         self.comboStg.addItem(stgname)
+                        existing_stgnames.add(stgname)
                 
+                # 설정 파일 저장
                 if len(self.data8537) != len(existing_stgnames) - 1:  # "통합 전략" 제외
                     with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
                         self.login_handler.config.write(configfile)
-                    logging.info("✅ 조건검색 리스트 로드 완료")
+                
+                logging.info("✅ 조건검색 리스트 로드 완료")
+                
+                # 백그라운드 로드 완료 후 새로운 전략만 추가 (중복 실행 방지)
+                QTimer.singleShot(0, self._on_background_load_complete)
+                
+            except Exception as ex:
+                logging.error(f"백그라운드 조건검색 로드 실패: {ex}")
+            finally:
+                # COM 정리
+                try:
+                    pythoncom.CoUninitialize()
+                except:
+                    pass
+        
+        # 메인 스레드에서 직접 실행 (COM 초기화 불필요)
+        try:
+            logging.info("📋 조건검색 리스트 로드 중... (메인 스레드)")
+            
+            # API 제한 확인
+            remain_time = cpStatus.GetLimitRemainTime(0)
+            if remain_time > 0:
+                wait_sec = remain_time / 1000 + 0.1
+                logging.debug(f"API 제한: {wait_sec:.1f}초 대기")
+                time.sleep(wait_sec)
+            
+            # 조건검색 리스트 로드
+            self.data8537 = self.objstg.requestList()
+            self._condition_list_loaded = True
+            
+            # 새로운 전략 추가
+            for stgname, v in self.data8537.items():
+                if stgname not in existing_stgnames:
+                    existing_keys = self.login_handler.config['STRATEGIES'].keys()
+                    existing_numbers = []
+                    for k in existing_keys:
+                        match = re.match(r'stg_?(\d+)', k)
+                        if match:
+                            existing_numbers.append(int(match.group(1)))
+                    next_number = max(existing_numbers, default=0) + 1
+                    new_key = f'stg_{next_number}'
+                    
+                    self.login_handler.config.set('STRATEGIES', new_key, stgname)
+                    self.comboStg.addItem(stgname)
+                    existing_stgnames.add(stgname)
+            
+            # 설정 파일 저장
+            if len(self.data8537) != len(existing_stgnames) - 1:  # "통합 전략" 제외
+                with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
+                    self.login_handler.config.write(configfile)
+            
+            logging.info("✅ 조건검색 리스트 로드 완료")
+            
+            # 메인 스레드에서 직접 처리
+            self._on_background_load_complete()
+            
+        except Exception as ex:
+            logging.error(f"메인 스레드 조건검색 로드 실패: {ex}")
+
+    def _on_background_load_complete(self):
+        """백그라운드 로드 완료 후 메인 스레드에서 실행 (중복 방지)"""
+        try:
+            current_stg = self.comboStg.currentText()
+            
+            # 현재 전략이 조건검색 리스트에 있으면 조건검색만 시작 (전략 재초기화 방지)
+            if hasattr(self, 'data8537') and self.data8537 and current_stg in self.data8537:
+                logging.info(f"✅ 백그라운드 로드 완료 - {current_stg} 조건검색 시작")
+                
+                # 전략 재초기화 대신 조건검색만 시작 (중복 방지)
+                if current_stg == "통합 전략":
+                    # 통합 전략은 급등주, 갭상승 조건검색 시작
+                    self._start_condition_search("급등주")
+                    time.sleep(0.5)
+                    self._start_condition_search("갭상승")
+                elif current_stg not in ["VI 발동"]:
+                    # 기타 전략은 해당 전략 조건검색 시작
+                    self._start_condition_search(current_stg)
+                    
+                    # static 전략인 경우 종목 로드도 시작
+                    strategy_type = self.get_strategy_type(current_stg)
+                    if strategy_type == 'static':
+                        logging.info(f"🔍 static 전략 '{current_stg}' 종목 로드 시작")
+                        item = self.data8537.get(current_stg)
+                        if item:
+                            id = item['ID']
+                            name = item['전략명']
+                            self._load_static_strategy_background(id, name)
+                else:
+                    # VI 발동은 조건검색 없음
+                    logging.info(f"{current_stg} 전략은 조건검색 없음")
+            else:
+                logging.info("✅ 백그라운드 로드 완료 - 새로운 전략 없음")
+        except Exception as ex:
+            logging.error(f"백그라운드 로드 완료 후 처리 실패: {ex}")
+
+    def _load_static_strategy_background(self, id, name):
+        """static 전략 백그라운드 로드 (전일상한가 등)"""
+        def worker():
+            try:
+                # COM 초기화 (백그라운드 스레드에서 필요)
+                import pythoncom
+                pythoncom.CoInitialize()
+                
+                logging.info(f"📋 {name} 전략 로드 중... (백그라운드)")
+                
+                # API 제한 확인
+                remain_time = cpStatus.GetLimitRemainTime(0)
+                if remain_time > 0:
+                    wait_sec = remain_time / 1000 + 0.1
+                    logging.debug(f"{name}: API 제한 {wait_sec:.1f}초 대기")
+                    time.sleep(wait_sec)
+                
+                # static 전략 데이터 로드
+                ret, dataStg = self.objstg.requestStgID(id)
+                if ret and len(dataStg) > 0:
+                    max_load = self.get_max_static_load()
+                    stock_count = len(dataStg)
+                    
+                    logging.info(f"✅ {name} 전략 로드 완료 ({stock_count}개 종목)")
+                    
+                    # 메인 스레드에서 종목 로드 실행 (static 전략용) - QTimer로 안전하게 전달
+                    logging.info(f"🚀 메인 스레드로 종목 로드 전달 - {stock_count}개 종목")
+                    
+                    def load_stocks_safe():
+                        try:
+                            logging.info(f"🚀 load_stocks_safe 콜백 실행 시작 - {len(dataStg)}개 종목")
+                            self._load_static_stocks_complete(dataStg, max_load)
+                        except Exception as ex:
+                            logging.error(f"load_stocks_safe 콜백 실패: {ex}")
+                            import traceback
+                            logging.error(f"상세 오류: {traceback.format_exc()}")
+                    
+                    # 메인 스레드로 안전하게 전달
+                    QTimer.singleShot(100, load_stocks_safe)  # 100ms 지연으로 안전하게 전달
+                    logging.info(f"📅 QTimer.singleShot 예약 완료 (100ms 지연)")
+                else:
+                    logging.warning(f"{name} 전략 데이터 없음")
+                
+            except Exception as ex:
+                logging.error(f"{name} 백그라운드 로드 실패: {ex}")
+            finally:
+                # COM 정리
+                try:
+                    pythoncom.CoUninitialize()
+                except:
+                    pass
+        
+        # 메인 스레드에서 직접 실행 (COM 초기화 불필요)
+        try:
+            logging.info(f"📋 {name} 전략 로드 중... (메인 스레드)")
+            
+            # API 제한 확인
+            remain_time = cpStatus.GetLimitRemainTime(0)
+            if remain_time > 0:
+                wait_sec = remain_time / 1000 + 0.1
+                logging.debug(f"{name}: API 제한 {wait_sec:.1f}초 대기")
+                time.sleep(wait_sec)
+            
+            # static 전략 데이터 로드
+            ret, dataStg = self.objstg.requestStgID(id)
+            if ret and len(dataStg) > 0:
+                max_load = self.get_max_static_load()
+                stock_count = len(dataStg)
+                
+                logging.info(f"✅ {name} 전략 로드 완료 ({stock_count}개 종목)")
+                
+                # 메인 스레드에서 직접 처리
+                self._load_static_stocks_complete(dataStg, max_load)
+            else:
+                logging.warning(f"{name} 전략 데이터 없음")
+                
+        except Exception as ex:
+            logging.error(f"메인 스레드 {name} 전략 로드 실패: {ex}")
+
+    def _load_static_stocks_complete_direct(self, stock_list, max_load):
+        """static 전략 종목 로드 완료 (백그라운드 스레드에서 직접 실행)"""
+        try:
+            logging.info(f"🔍 _load_static_stocks_complete_direct 호출됨 - stock_list: {len(stock_list) if stock_list else 'None'}")
+            
+            if not stock_list:
+                logging.warning("static 전략 종목 리스트가 비어있음")
+                return
+            
+            stock_count = len(stock_list)
+            logging.info(f"📦 static 전략 종목 로드 시작 ({stock_count}개)")
+            
+            # 종목 리스트 내용 확인
+            for i, stock in enumerate(stock_list[:3]):  # 처음 3개만 로그
+                logging.info(f"  종목 {i+1}: {stock}")
+            
+            if stock_count > max_load:
+                logging.info(f"📦 제한 적용: {max_load}개만 로드")
+                self._load_stocks_from_list_safely_with_limit_direct(stock_list, max_count=max_load)
+            else:
+                logging.info(f"📦 전체 로드: {stock_count}개 모두 로드")
+                self._load_stocks_from_list_safely_direct(stock_list)
+                
+            logging.info(f"✅ static 전략 종목 로드 완료")
+            
+        except Exception as ex:
+            logging.error(f"static 전략 종목 로드 실패: {ex}")
+            import traceback
+            logging.error(f"상세 오류: {traceback.format_exc()}")
+
+    def _load_stocks_from_list_safely_direct(self, stock_list):
+        """리스트에서 종목 안전하게 로드 (백그라운드에서 직접 실행)"""
+        try:
+            logging.info(f"🔍 _load_stocks_from_list_safely_direct 호출됨")
+            
+            if not stock_list:
+                logging.warning("stock_list가 비어있음")
+                return
+                
+            total_count = len(stock_list)
+            logging.info(f"조건검색에서 {total_count}개 종목 로드 시작...")
+            
+            # stock_list 구조 확인
+            if total_count > 0:
+                logging.info(f"첫 번째 종목 구조: {stock_list[0]}")
+            
+            loaded_count = 0
+            failed_count = 0
+            
+            for idx, stock_item in enumerate(stock_list, 1):
+                try:
+                    # 다양한 키 시도
+                    code = stock_item.get('code') or stock_item.get('Code') or stock_item.get('CODE')
+                    if not code:
+                        logging.warning(f"종목 {idx}: 코드가 없음 - 키들: {list(stock_item.keys())}")
+                        failed_count += 1
+                        continue
+                    
+                    stock_name = cpCodeMgr.CodeToName(code)
+                    logging.info(f"종목 {idx}/{total_count}: {stock_name}({code}) 로드 중...")
+                    
+                    # 종목 로드 (메인 스레드에서 안전하게)
+                    if self._load_single_stock_safely(code):
+                        loaded_count += 1
+                        logging.info(f"✅ {stock_name}({code}) 로드 성공")
+                    else:
+                        failed_count += 1
+                        logging.warning(f"❌ {stock_name}({code}) 로드 실패")
+                    
+                    time.sleep(1.0)
+                    
+                except Exception as ex:
+                    logging.error(f"종목 {idx} 로드 실패: {ex}")
+                    failed_count += 1
+                    continue
+            
+            logging.info(
+                f"조건검색 종목 로드 완료: 성공 {loaded_count}개, "
+                f"실패 {failed_count}개 / 전체 {total_count}개"
+            )
+            
+        except Exception as ex:
+            logging.error(f"_load_stocks_from_list_safely_direct: {ex}")
+            import traceback
+            logging.error(f"상세 오류: {traceback.format_exc()}")
+
+    def _load_single_stock_safely_direct(self, code):
+        """단일 종목 로드 (백그라운드에서 직접 실행)"""
+        try:
+            # 모니터링 시작
+            if self.trader.daydata.monitor_code(code) and self.trader.mindata.monitor_code(code):
+                self.trader.monistock_set.add(code)
+                
+                # 백그라운드에서 직접 UI 업데이트 시도
+                logging.info(f"📋 {code} 모니터링 세트에 추가 완료")
+                logging.info(f"📋 현재 모니터링 종목 수: {len(self.trader.monistock_set)}")
+                
+                # UI 업데이트를 위한 직접 호출
+                try:
+                    self.trader.stock_added_to_monitor.emit(code)
+                    logging.info(f"📋 {code} UI 업데이트 시그널 발송 완료")
+                except Exception as ui_ex:
+                    logging.error(f"UI 업데이트 시그널 발송 실패: {ui_ex}")
+                
+                return True
+            else:
+                logging.warning(f"{code} 데이터 로드 실패")
+                return False
+        except Exception as ex:
+            logging.error(f"{code} 로드 실패: {ex}")
+            return False
+
+    def _load_stocks_from_list_safely_with_limit_direct(self, stock_list, max_count=10):
+        """리스트에서 종목 안전하게 로드 (개수 제한 + 메인 스레드 실행)"""
+        try:
+            if not stock_list:
+                logging.info("로드할 종목 리스트 없음")
+                return
+            
+            total_codes = len(stock_list)
+            actual_count = min(total_codes, max_count)
+            
+            if total_codes > max_count:
+                logging.info(f"종목 개수 제한: {total_codes}개 → {actual_count}개")
+                limited_list = stock_list[:actual_count]
+            else:
+                limited_list = stock_list
+            
+            # 메인 스레드에서 직접 로드
+            self._load_stocks_from_list_safely_sync(limited_list)
+            
+            if total_codes > max_count:
+                remaining = total_codes - max_count
+                logging.info(f"💡 나머지 {remaining}개 종목은 실시간 편입으로 추가됩니다.")
+            
+        except Exception as ex:
+            logging.error(f"_load_stocks_from_list_safely_with_limit_direct: {ex}")
+
+    def _load_static_stocks_complete(self, stock_list, max_load):
+        """static 전략 종목 로드 완료 (메인 스레드에서 실행)"""
+        try:
+            logging.info(f"🔍 _load_static_stocks_complete 호출됨 - stock_list: {len(stock_list) if stock_list else 'None'}")
+            
+            if not stock_list:
+                logging.warning("static 전략 종목 리스트가 비어있음")
+                return
+            
+            stock_count = len(stock_list)
+            logging.info(f"📦 static 전략 종목 로드 시작 ({stock_count}개)")
+            
+            # 종목 리스트 내용 확인
+            for i, stock in enumerate(stock_list[:3]):  # 처음 3개만 로그
+                logging.info(f"  종목 {i+1}: {stock}")
+            
+            if stock_count > max_load:
+                logging.info(f"📦 제한 적용: {max_load}개만 로드")
+                self._load_stocks_from_list_safely_with_limit(stock_list, max_count=max_load)
+            else:
+                logging.info(f"📦 전체 로드: {stock_count}개 모두 로드")
+                # 메인 스레드에서 안전하게 실행
+                self._load_stocks_from_list_safely_sync(stock_list)
+                
+            logging.info(f"✅ static 전략 종목 로드 완료")
+            
+        except Exception as ex:
+            logging.error(f"static 전략 종목 로드 실패: {ex}")
+            import traceback
+            logging.error(f"상세 오류: {traceback.format_exc()}")
+
+    def stgChanged(self, *args):
+        """전략 변경 시 처리"""
+        try:
+            stgName = self.comboStg.currentText()
+            self.save_last_stg()
+
+            if not self.is_loading_strategy:
+                self.sell_all_item()
+                self.trader.clear_list_db('mylist.db')
+                
+                # ===== 모니터링 데이터 초기화 =====
+                for code in list(self.trader.monistock_set):
+                    self.trader.tickdata.monitor_stop(code)
+                    self.trader.mindata.monitor_stop(code)
+                    self.trader.daydata.monitor_stop(code)
+                self.trader.monistock_set.clear()
+                
+                # ===== UI 리스트 박스 초기화 =====
+                self.firstListBox.clear()
+                self.secondListBox.clear()
+                logging.info(f"전략 변경: {stgName} - 모니터링 데이터 및 UI 초기화 완료")
+            
+            # ===== ✅ 조건검색 리스트는 백그라운드에서 로드됨 =====
+            # stgChanged에서는 조건검색 리스트 로드하지 않음 (중복 방지)
             
             # ===== ❌ 큐 스레드 시작 제거 (이미 post_login_setup에서 시작됨) =====
             # self.objstg.start_processing_queue()  # ← 삭제
@@ -6100,9 +6728,13 @@ class MyWindow(QWidget):
                 self.trader.init_stock_balance()
                 self._load_stocks_from_db_safely('mylist.db')
                 
-                if not hasattr(self, 'pb9619'):
+                # pb9619 중복 구독 방지
+                if not hasattr(self, 'pb9619') or self.pb9619 is None:
                     self.pb9619 = CpPB9619()
                     self.pb9619.Subscribe("", self.trader)
+                    logging.info("pb9619 구독 시작")
+                else:
+                    logging.info("pb9619 이미 구독 중")
 
             # ===== 통합 전략 =====
             elif stgName == "통합 전략":
@@ -6139,30 +6771,25 @@ class MyWindow(QWidget):
                 
                 self._load_stocks_from_db_safely('mylist.db')
                 
-                item = self.data8537.get(stgName)
-                if item:
-                    id = item['ID']
-                    name = item['전략명']
-                    strategy_type = self.get_strategy_type(name)
-                    
-                    if strategy_type == 'static':
-                        time.sleep(1.0)
+                # 조건검색 리스트가 로드되었는지 확인
+                if hasattr(self, 'data8537') and self.data8537:
+                    item = self.data8537.get(stgName)
+                    if item:
+                        id = item['ID']
+                        name = item['전략명']
+                        strategy_type = self.get_strategy_type(name)
                         
-                        ret, self.dataStg = self.objstg.requestStgID(id)
-                        if ret and len(self.dataStg) > 0:
-                            max_load = self.get_max_static_load()
-                            stock_count = len(self.dataStg)
-                            
-                            if stock_count > max_load:
-                                self._load_stocks_from_list_safely_with_limit(
-                                    self.dataStg, 
-                                    max_count=max_load
-                                )
-                            else:
-                                self._load_stocks_from_list_safely(self.dataStg)
-                    
-                    time.sleep(0.5)
-                    self._start_condition_search(stgName)
+                        if strategy_type == 'static':
+                            # static 전략은 백그라운드에서 로드
+                            self._load_static_strategy_background(id, name)
+                        
+                        time.sleep(0.5)
+                        self._start_condition_search(stgName)
+                    else:
+                        logging.warning(f"전략 '{stgName}'을 조건검색 리스트에서 찾을 수 없음")
+                else:
+                    logging.info(f"조건검색 리스트 로드 대기 중... ({stgName})")
+                    # 조건검색 리스트가 로드될 때까지 대기하지 않고 기본 처리만 수행
             
             logging.info(f"{stgName} 전략 감시 시작")
             
@@ -6329,28 +6956,46 @@ class MyWindow(QWidget):
     def _load_stocks_from_list_safely_sync(self, stock_list):
         """리스트에서 종목 동기 로드 (적은 종목용)"""
         try:
+            logging.info(f"🔍 _load_stocks_from_list_safely_sync 호출됨")
+            
+            if not stock_list:
+                logging.warning("stock_list가 비어있음")
+                return
+                
             total_codes = len(stock_list)
             logging.info(f"조건검색에서 {total_codes}개 종목 로드 시작...")
+            
+            # stock_list 구조 확인
+            if total_codes > 0:
+                logging.info(f"첫 번째 종목 구조: {stock_list[0]}")
             
             loaded_count = 0
             failed_count = 0
             
             for idx, stock_item in enumerate(stock_list, 1):
                 try:
-                    code = stock_item.get('code')
+                    # 다양한 키 시도
+                    code = stock_item.get('code') or stock_item.get('Code') or stock_item.get('CODE')
                     if not code:
+                        logging.warning(f"종목 {idx}: 코드가 없음 - 키들: {list(stock_item.keys())}")
+                        failed_count += 1
                         continue
+                    
+                    stock_name = cpCodeMgr.CodeToName(code)
+                    logging.info(f"종목 {idx}/{total_codes}: {stock_name}({code}) 로드 중...")
                     
                     # 종목 로드
                     if self._load_single_stock_safely(code):
                         loaded_count += 1
+                        logging.info(f"✅ {stock_name}({code}) 로드 성공")
                     else:
                         failed_count += 1
+                        logging.warning(f"❌ {stock_name}({code}) 로드 실패")
                     
                     time.sleep(1.0)
                     
                 except Exception as ex:
-                    logging.error(f"{code} 로드 실패: {ex}")
+                    logging.error(f"종목 {idx} 로드 실패: {ex}")
                     failed_count += 1
                     continue
             
@@ -6361,6 +7006,8 @@ class MyWindow(QWidget):
             
         except Exception as ex:
             logging.error(f"_load_stocks_from_list_safely_sync: {ex}")
+            import traceback
+            logging.error(f"상세 오류: {traceback.format_exc()}")
 
     def _load_stocks_in_background(self, stock_list):
         """백그라운드에서 종목 로드"""
