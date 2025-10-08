@@ -8,6 +8,12 @@ import logging
 import json
 import copy
 import configparser
+from strategy_utils import (
+    STRATEGY_SAFE_GLOBALS,
+    evaluate_strategies,
+    build_backtest_buy_locals,
+    build_backtest_sell_locals
+)
 
 plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
@@ -126,85 +132,20 @@ class Backtester:
         if not self.buy_strategies:
             return False
         
-        # ===== safe_locals 구성 (실시간과 동일) =====
-        safe_locals = {
-            # 틱 데이터
-            'MAT5': row.get('tick_MAT5', 0),
-            'MAT20': row.get('tick_MAT20', 0),
-            'MAT60': row.get('tick_MAT60', 0),
-            'MAT120': row.get('tick_MAT120', 0),
-            'C': row.get('tick_C', 0),
-            'VWAP': row.get('tick_VWAP', 0),
-            'tick_VWAP': row.get('tick_VWAP', 0),
-            'RSIT': row.get('tick_RSIT', 50),
-            'MACDT': row.get('tick_MACDT', 0),
-            'MACDT_SIGNAL': row.get('tick_MACDT_SIGNAL', 0),
-            'OSCT': row.get('tick_OSCT', 0),
-            'STOCHK': row.get('tick_STOCHK', 50),
-            'STOCHD': row.get('tick_STOCHD', 50),
-            'ATR': row.get('tick_ATR', 0),
-            'BB_UPPER': row.get('tick_BB_UPPER', 0),
-            'BB_MIDDLE': row.get('tick_BB_MIDDLE', 0),
-            'BB_LOWER': row.get('tick_BB_LOWER', 0),
-            'BB_POSITION': row.get('tick_BB_POSITION', 0),
-            'BB_BANDWIDTH': row.get('tick_BB_BANDWIDTH', 0),
-            
-            # 분봉 데이터
-            'MAM5': row.get('min_MAM5', 0),
-            'MAM10': row.get('min_MAM10', 0),
-            'MAM20': row.get('min_MAM20', 0),
-            'min_close': row.get('min_C', 0),
-            'RSI': row.get('min_RSI', 50),
-            'min_RSI': row.get('min_RSI', 50),
-            'MACD': row.get('min_MACD', 0),
-            'MACD_SIGNAL': row.get('min_MACD_SIGNAL', 0),
-            'OSC': row.get('min_OSC', 0),
-            'min_OSC': row.get('min_OSC', 0),
-            'min_STOCHK': row.get('min_STOCHK', 50),
-            'min_STOCHD': row.get('min_STOCHD', 50),
-            'min_VWAP': row.get('min_VWAP', 0),
-            
-            # 새로운 지표들
-            'WILLIAMS_R': row.get('tick_WILLIAMS_R', -50),
-            'min_WILLIAMS_R': row.get('min_WILLIAMS_R', -50),
-            'ROC': row.get('tick_ROC', 0),
-            'min_ROC': row.get('min_ROC', 0),
-            'OBV': row.get('tick_OBV', 0),
-            'OBV_MA20': row.get('tick_OBV_MA20', 0),
-            'min_OBV': row.get('min_OBV', 0),
-            'min_OBV_MA20': row.get('min_OBV_MA20', 0),
-            'VP_POC': row.get('tick_VP_POC', 0),
-            'VP_POSITION': row.get('tick_VP_POSITION', 0),
-            
-            # 기타
-            'strength': row.get('strength', 0),
-            'positive_candle': row.get('min_C', 0) > row.get('min_O', 0),
-            
-            # 추가 변수들 (전략에 따라 필요)
-            'gap_hold': True,  # 백테스팅에서는 기본값
-            'volatility_breakout': False,
-            'volume_profile_breakout': row.get('tick_VP_POSITION', 0) > 0,
-        }
+        # ===== safe_locals 구성 (공통 유틸리티 사용) =====
+        safe_locals = build_backtest_buy_locals(row)
         
-        # ===== safe_globals 정의 =====
-        safe_globals = {
-            '__builtins__': {
-                'min': min, 'max': max, 'abs': abs, 'round': round,
-                'int': int, 'float': float, 'bool': bool, 'str': str,
-                'len': len, 'sum': sum, 'all': all, 'any': any,
-                'True': True, 'False': False, 'None': None
-            }
-        }
+        # ===== 전략 조건 평가 (공통 함수 사용) =====
+        matched, strategy = evaluate_strategies(
+            self.buy_strategies, 
+            safe_locals, 
+            code=code, 
+            strategy_type="매수"
+        )
         
-        # ===== 전략 조건 평가 =====
-        for strategy in self.buy_strategies:
-            try:
-                condition = strategy['content']
-                if eval(condition, safe_globals, safe_locals):
-                    logging.debug(f"{code}: 매수 조건 충족 - {strategy['name']}")
-                    return True
-            except Exception as ex:
-                logging.error(f"{code}: 매수 전략 '{strategy['name']}' 평가 오류 - {ex}")
+        if matched:
+            logging.debug(f"{code}: 매수 조건 충족 - {strategy['name']}")
+            return True
         
         return False
     
@@ -226,65 +167,27 @@ class Backtester:
             self.highest_prices[code] = buy_price
         self.highest_prices[code] = max(self.highest_prices[code], current_price)
         
-        # 수익률 계산
-        profit_pct = (current_price / buy_price - 1) * 100 if buy_price > 0 else 0
-        from_peak_pct = (current_price / self.highest_prices[code] - 1) * 100 if self.highest_prices[code] > 0 else 0
+        # ===== safe_locals 구성 (공통 유틸리티 사용) =====
+        safe_locals = build_backtest_sell_locals(
+            row=row,
+            current_price=current_price,
+            buy_price=buy_price,
+            highest_price=self.highest_prices[code],
+            buy_time=self.buy_times[code]
+        )
         
-        # 보유 시간
-        hold_minutes = (row['timestamp'] - self.buy_times[code]).total_seconds() / 60
+        # ===== 전략 조건 평가 (공통 함수 사용) =====
+        matched, strategy = evaluate_strategies(
+            self.sell_strategies, 
+            safe_locals, 
+            code=code, 
+            strategy_type="매도"
+        )
         
-        # 장마감 여부
-        hour = row['timestamp'].hour
-        minute = row['timestamp'].minute
-        after_market_close = (hour >= 14 and minute >= 45)
-        
-        # ===== safe_locals 구성 (실시간과 동일) =====
-        safe_locals = {
-            # 틱 데이터
-            'MAT5': row.get('tick_MAT5', 0),
-            'MAT20': row.get('tick_MAT20', 0),
-            'MAT60': row.get('tick_MAT60', 0),
-            'C': row.get('tick_C', 0),
-            'OSCT': row.get('tick_OSCT', 0),
-            'STOCHK': row.get('tick_STOCHK', 50),
-            'STOCHD': row.get('tick_STOCHD', 50),
-            'RSIT': row.get('tick_RSIT', 50),
-            'WILLIAMS_R': row.get('tick_WILLIAMS_R', -50),
-            
-            # 분봉 데이터
-            'MAM5': row.get('min_MAM5', 0),
-            'MAM10': row.get('min_MAM10', 0),
-            
-            # 매도 조건용 변수들
-            'current_profit_pct': profit_pct,
-            'from_peak_pct': from_peak_pct,
-            'hold_minutes': hold_minutes,
-            'after_market_close': after_market_close,
-            
-            # 추가 변수
-            'gap_hold': True,
-        }
-        
-        # ===== safe_globals 정의 =====
-        safe_globals = {
-            '__builtins__': {
-                'min': min, 'max': max, 'abs': abs, 'round': round,
-                'int': int, 'float': float, 'bool': bool, 'str': str,
-                'len': len, 'sum': sum, 'all': all, 'any': any,
-                'True': True, 'False': False, 'None': None
-            }
-        }
-        
-        # ===== 전략 조건 평가 =====
-        for strategy in self.sell_strategies:
-            try:
-                condition = strategy['content']
-                if eval(condition, safe_globals, safe_locals):
-                    reason = strategy['name']
-                    logging.debug(f"{code}: 매도 조건 충족 - {reason}")
-                    return True, reason
-            except Exception as ex:
-                logging.error(f"{code}: 매도 전략 '{strategy['name']}' 평가 오류 - {ex}")
+        if matched:
+            reason = strategy['name']
+            logging.debug(f"{code}: 매도 조건 충족 - {reason}")
+            return True, reason
         
         return False, None
     
