@@ -14,6 +14,7 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from datetime import datetime, timedelta
 import pandas as pd
+# Windows 전용 의존성은 사용할 수 없는 환경이 있을 수 있으므로 지연 확인
 import win32com.client
 import time
 import numpy as np
@@ -39,7 +40,22 @@ import pyautogui
 from collections import deque
 
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
-ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+
+IS_WINDOWS = sys.platform.startswith('win')
+
+
+def _prevent_system_sleep():
+    """Windows 환경에서만 동작하는 절전 모드 해제 처리"""
+    if not IS_WINDOWS or not hasattr(ctypes, "windll"):
+        return
+
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+    except Exception as ex:
+        logging.warning(f"시스템 절전 방지 설정 실패: {ex}")
+
+
+_prevent_system_sleep()
 
 plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
@@ -72,6 +88,10 @@ def init_plus_objects():
 
 def init_plus_check():
     """크레온 PLUS 연결 및 권한 확인"""
+    if not IS_WINDOWS or not hasattr(ctypes, "windll"):
+        logging.error("크레온 PLUS 기능은 Windows 환경에서만 사용할 수 있습니다.")
+        return False
+
     # 관리자 권한 체크
     if not ctypes.windll.shell32.IsUserAnAdmin():
         logging.error(f"오류: 일반권한으로 실행됨. 관리자 권한으로 실행해 주세요")
