@@ -1,25 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-Stock Trader PyInstaller Spec File
-대신증권 크레온 자동매매 프로그램 빌드 설정
+Stock Trader PyInstaller Spec File (DEBUG VERSION)
+오류 확인을 위한 디버그 모드 빌드
 """
 
 block_cipher = None
 
-# ===== 데이터 파일 설정 =====
 datas = [
     ('settings.ini.example', '.'),
 ]
 
-# ===== 숨겨진 import 모듈 =====
 hiddenimports = [
-    # PyQt5
     'PyQt5.QtWidgets',
     'PyQt5.QtCore',
     'PyQt5.QtGui',
     'PyQt5.QtPrintSupport',
-    
-    # win32com (크레온 API)
     'win32com',
     'win32com.client',
     'win32com.client.gencache',
@@ -32,45 +27,29 @@ hiddenimports = [
     'win32process',
     'win32event',
     'win32file',
-    
-    # matplotlib
     'matplotlib',
     'matplotlib.pyplot',
     'matplotlib.figure',
     'matplotlib.backends',
     'matplotlib.backends.backend_qt5agg',
     'matplotlib.backends.backend_agg',
-    
-    # 차트 라이브러리
     'mplfinance',
     'mplfinance.plotting',
-    
-    # 데이터 분석
     'pandas',
     'pandas.io.formats.style',
     'numpy',
     'numpy.core._methods',
-    
-    # 기술적 지표
     'talib',
     'talib.stream',
     'talib.abstract',
-    
-    # 네트워크
     'requests',
     'urllib3',
     'slacker',
-    
-    # Excel
     'openpyxl',
     'openpyxl.styles',
-    
-    # 자동화
     'pyautogui',
     'pygetwindow',
     'psutil',
-    
-    # 기본 모듈
     'sqlite3',
     'configparser',
     'logging',
@@ -80,8 +59,6 @@ hiddenimports = [
     'collections',
     'traceback',
     'copy',
-    
-    # pyparsing 의존성
     'html',
     'html.parser',
     'xml',
@@ -92,7 +69,6 @@ hiddenimports = [
     'http',
 ]
 
-# ===== 제외할 모듈 =====
 excludes = [
     'tkinter',
     'IPython',
@@ -126,20 +102,20 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='stock_trader',
-    debug=False,
+    name='stock_trader_debug',
+    debug=True,           # 디버그 모드
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,           # 디버그 시 압축 비활성화
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,
+    console=True,        # 콘솔 창 표시
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon='stock_trader.ico',
-    uac_admin=True,  # 관리자 권한 필수
+    uac_admin=True,
 )
 

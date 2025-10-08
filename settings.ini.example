@@ -12,11 +12,11 @@ channel = #stock
 last_strategy = 
 
 [STRATEGIES]
+stg_integrated = 통합 전략
 stg_1 = VI 발동
 stg_2 = 전일상한가
 stg_3 = 급등주
 stg_4 = 갭상승
-stg_integrated = 통합 전략
 
 [STRATEGY_TYPES]
 static = 전일상한가,전일급등,전일거래량급증,52주신고가,이격도상승,신고가돌파

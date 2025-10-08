@@ -7,16 +7,27 @@ from matplotlib.figure import Figure
 import logging
 import json
 import copy
+import configparser
 
 plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
 
 class Backtester:
-    """백테스팅 엔진 (combined_tick_data 사용)"""
+    """백테스팅 엔진 (combined_tick_data 사용, settings.ini 전략 적용)"""
     
-    def __init__(self, db_path, initial_cash=10000000):
+    def __init__(self, db_path, config_file='settings.ini', initial_cash=10000000):
         self.db_path = db_path
+        self.config_file = config_file
         self.initial_cash = initial_cash
+        
+        # settings.ini 로드
+        self.config = configparser.ConfigParser()
+        if config_file:
+            try:
+                self.config.read(config_file, encoding='utf-8')
+                logging.info(f"✅ 설정 파일 로드: {config_file}")
+            except Exception as ex:
+                logging.error(f"설정 파일 로드 실패: {ex}")
         
         # 포트폴리오
         self.cash = initial_cash
@@ -36,6 +47,11 @@ class Backtester:
         # 전략 설정
         self.strategy_params = {}
         self.tick_interval = 30
+        
+        # 현재 전략
+        self.current_strategy_name = None
+        self.buy_strategies = []
+        self.sell_strategies = []
     
     def load_codes(self, start_date, end_date):
         """기간 내 거래된 종목 목록"""
@@ -73,8 +89,30 @@ class Backtester:
         
         return df
     
+    def load_strategies(self, strategy_name, strategy_type='buy'):
+        """settings.ini에서 전략 로드"""
+        strategies = []
+        
+        if not self.config.has_section(strategy_name):
+            logging.warning(f"전략 '{strategy_name}' 섹션이 설정 파일에 없음")
+            return strategies
+        
+        prefix = 'buy_stg_' if strategy_type == 'buy' else 'sell_stg_'
+        
+        for key in self.config[strategy_name]:
+            if key.startswith(prefix):
+                try:
+                    strategy_json = self.config[strategy_name][key]
+                    strategy_data = json.loads(strategy_json)
+                    strategies.append(strategy_data)
+                except Exception as ex:
+                    logging.error(f"전략 '{key}' 로드 실패: {ex}")
+        
+        logging.info(f"✅ {strategy_name} - {strategy_type} 전략 {len(strategies)}개 로드")
+        return strategies
+    
     def check_buy_condition(self, code, row, previous_rows):
-        """매수 조건 확인 (실시간과 동일한 로직)"""
+        """매수 조건 확인 (settings.ini 전략 사용)"""
         
         # 최대 보유 종목 수 체크
         if len(self.holdings) >= self.max_holdings:
@@ -84,49 +122,103 @@ class Backtester:
         if self.cash < self.initial_cash * self.position_size:
             return False
         
-        # ===== 통합 전략 조건 (실시간과 동일) =====
-        
-        # 1. 이평선 정배열
-        MAT5 = row['tick_MAT5']
-        MAT20 = row['tick_MAT20']
-        MAT60 = row['tick_MAT60']
-        MAT120 = row['tick_MAT120']
-        C = row['tick_C']
-        VWAP = row['tick_VWAP']
-        
-        if not (MAT5 > MAT20 and C > MAT5):
+        # 전략이 로드되지 않았으면 False
+        if not self.buy_strategies:
             return False
         
-        # 2. VWAP 위
-        if not (C > VWAP):
-            return False
+        # ===== safe_locals 구성 (실시간과 동일) =====
+        safe_locals = {
+            # 틱 데이터
+            'MAT5': row.get('tick_MAT5', 0),
+            'MAT20': row.get('tick_MAT20', 0),
+            'MAT60': row.get('tick_MAT60', 0),
+            'MAT120': row.get('tick_MAT120', 0),
+            'C': row.get('tick_C', 0),
+            'VWAP': row.get('tick_VWAP', 0),
+            'tick_VWAP': row.get('tick_VWAP', 0),
+            'RSIT': row.get('tick_RSIT', 50),
+            'MACDT': row.get('tick_MACDT', 0),
+            'MACDT_SIGNAL': row.get('tick_MACDT_SIGNAL', 0),
+            'OSCT': row.get('tick_OSCT', 0),
+            'STOCHK': row.get('tick_STOCHK', 50),
+            'STOCHD': row.get('tick_STOCHD', 50),
+            'ATR': row.get('tick_ATR', 0),
+            'BB_UPPER': row.get('tick_BB_UPPER', 0),
+            'BB_MIDDLE': row.get('tick_BB_MIDDLE', 0),
+            'BB_LOWER': row.get('tick_BB_LOWER', 0),
+            'BB_POSITION': row.get('tick_BB_POSITION', 0),
+            'BB_BANDWIDTH': row.get('tick_BB_BANDWIDTH', 0),
+            
+            # 분봉 데이터
+            'MAM5': row.get('min_MAM5', 0),
+            'MAM10': row.get('min_MAM10', 0),
+            'MAM20': row.get('min_MAM20', 0),
+            'min_close': row.get('min_C', 0),
+            'RSI': row.get('min_RSI', 50),
+            'min_RSI': row.get('min_RSI', 50),
+            'MACD': row.get('min_MACD', 0),
+            'MACD_SIGNAL': row.get('min_MACD_SIGNAL', 0),
+            'OSC': row.get('min_OSC', 0),
+            'min_OSC': row.get('min_OSC', 0),
+            'min_STOCHK': row.get('min_STOCHK', 50),
+            'min_STOCHD': row.get('min_STOCHD', 50),
+            'min_VWAP': row.get('min_VWAP', 0),
+            
+            # 새로운 지표들
+            'WILLIAMS_R': row.get('tick_WILLIAMS_R', -50),
+            'min_WILLIAMS_R': row.get('min_WILLIAMS_R', -50),
+            'ROC': row.get('tick_ROC', 0),
+            'min_ROC': row.get('min_ROC', 0),
+            'OBV': row.get('tick_OBV', 0),
+            'OBV_MA20': row.get('tick_OBV_MA20', 0),
+            'min_OBV': row.get('min_OBV', 0),
+            'min_OBV_MA20': row.get('min_OBV_MA20', 0),
+            'VP_POC': row.get('tick_VP_POC', 0),
+            'VP_POSITION': row.get('tick_VP_POSITION', 0),
+            
+            # 기타
+            'strength': row.get('strength', 0),
+            'positive_candle': row.get('min_C', 0) > row.get('min_O', 0),
+            
+            # 추가 변수들 (전략에 따라 필요)
+            'gap_hold': True,  # 백테스팅에서는 기본값
+            'volatility_breakout': False,
+            'volume_profile_breakout': row.get('tick_VP_POSITION', 0) > 0,
+        }
         
-        # 3. 분봉 이평선 정배열
-        MAM5 = row['min_MAM5']
-        MAM10 = row['min_MAM10']
+        # ===== safe_globals 정의 =====
+        safe_globals = {
+            '__builtins__': {
+                'min': min, 'max': max, 'abs': abs, 'round': round,
+                'int': int, 'float': float, 'bool': bool, 'str': str,
+                'len': len, 'sum': sum, 'all': all, 'any': any,
+                'True': True, 'False': False, 'None': None
+            }
+        }
         
-        if not (MAM5 > MAM10):
-            return False
+        # ===== 전략 조건 평가 =====
+        for strategy in self.buy_strategies:
+            try:
+                condition = strategy['content']
+                if eval(condition, safe_globals, safe_locals):
+                    logging.debug(f"{code}: 매수 조건 충족 - {strategy['name']}")
+                    return True
+            except Exception as ex:
+                logging.error(f"{code}: 매수 전략 '{strategy['name']}' 평가 오류 - {ex}")
         
-        # 4. RSI 조건
-        RSIT = row['tick_RSIT']
-        if not (40 < RSIT < 80):
-            return False
-        
-        # 5. 체결강도 조건 ✅ DB에서 바로 가져옴
-        strength = row['strength']
-        if not (strength >= 120):
-            return False
-        
-        return True
+        return False
     
     def check_sell_condition(self, code, row, previous_rows):
-        """매도 조건 확인"""
+        """매도 조건 확인 (settings.ini 전략 사용)"""
         
         if code not in self.holdings:
             return False, None
         
-        current_price = row['tick_C']
+        # 전략이 로드되지 않았으면 False
+        if not self.sell_strategies:
+            return False, None
+        
+        current_price = row.get('tick_C', 0)
         buy_price = self.buy_prices[code]
         
         # 최고가 업데이트
@@ -135,52 +227,64 @@ class Backtester:
         self.highest_prices[code] = max(self.highest_prices[code], current_price)
         
         # 수익률 계산
-        profit_pct = (current_price / buy_price - 1) * 100
-        from_peak_pct = (current_price / self.highest_prices[code] - 1) * 100
+        profit_pct = (current_price / buy_price - 1) * 100 if buy_price > 0 else 0
+        from_peak_pct = (current_price / self.highest_prices[code] - 1) * 100 if self.highest_prices[code] > 0 else 0
         
         # 보유 시간
         hold_minutes = (row['timestamp'] - self.buy_times[code]).total_seconds() / 60
         
-        # ===== 매도 조건 =====
-        
-        # 1. 목표 익절 (+3.0%)
-        if profit_pct >= 3.0:
-            return True, "목표 익절"
-        
-        # 2. 손절 (-0.7%)
-        if profit_pct < -0.7:
-            return True, "손절"
-        
-        # 3. 추적 손절
-        if profit_pct > 1.5 and from_peak_pct < -0.8:
-            return True, "추적 손절"
-        
-        # 4. 시간 손절 (90분)
-        if hold_minutes > 90 and profit_pct < 0.5:
-            return True, "시간 손절"
-        
-        # 5. 장마감 청산 (14:45 이후)
+        # 장마감 여부
         hour = row['timestamp'].hour
         minute = row['timestamp'].minute
-        if hour >= 14 and minute >= 45:
-            return True, "장마감 청산"
+        after_market_close = (hour >= 14 and minute >= 45)
         
-        # 6. 기술적 매도
-        MAT5 = row['tick_MAT5']
-        MAT20 = row['tick_MAT20']
-        MAM5 = row['min_MAM5']
-        MAM10 = row['min_MAM10']
-        OSCT = row['tick_OSCT']
+        # ===== safe_locals 구성 (실시간과 동일) =====
+        safe_locals = {
+            # 틱 데이터
+            'MAT5': row.get('tick_MAT5', 0),
+            'MAT20': row.get('tick_MAT20', 0),
+            'MAT60': row.get('tick_MAT60', 0),
+            'C': row.get('tick_C', 0),
+            'OSCT': row.get('tick_OSCT', 0),
+            'STOCHK': row.get('tick_STOCHK', 50),
+            'STOCHD': row.get('tick_STOCHD', 50),
+            'RSIT': row.get('tick_RSIT', 50),
+            'WILLIAMS_R': row.get('tick_WILLIAMS_R', -50),
+            
+            # 분봉 데이터
+            'MAM5': row.get('min_MAM5', 0),
+            'MAM10': row.get('min_MAM10', 0),
+            
+            # 매도 조건용 변수들
+            'current_profit_pct': profit_pct,
+            'from_peak_pct': from_peak_pct,
+            'hold_minutes': hold_minutes,
+            'after_market_close': after_market_close,
+            
+            # 추가 변수
+            'gap_hold': True,
+        }
         
-        if (MAT5 < MAT20 or MAM5 < MAM10) and OSCT < 0 and profit_pct < 1.0:
-            return True, "기술적 매도"
+        # ===== safe_globals 정의 =====
+        safe_globals = {
+            '__builtins__': {
+                'min': min, 'max': max, 'abs': abs, 'round': round,
+                'int': int, 'float': float, 'bool': bool, 'str': str,
+                'len': len, 'sum': sum, 'all': all, 'any': any,
+                'True': True, 'False': False, 'None': None
+            }
+        }
         
-        # 7. 과매수 청산
-        STOCHK = row['tick_STOCHK']
-        WILLIAMS_R = row['tick_WILLIAMS_R']
-        
-        if (STOCHK > 80 or WILLIAMS_R > -20) and profit_pct > 2.0 and from_peak_pct < -0.5:
-            return True, "과매수 청산"
+        # ===== 전략 조건 평가 =====
+        for strategy in self.sell_strategies:
+            try:
+                condition = strategy['content']
+                if eval(condition, safe_globals, safe_locals):
+                    reason = strategy['name']
+                    logging.debug(f"{code}: 매도 조건 충족 - {reason}")
+                    return True, reason
+            except Exception as ex:
+                logging.error(f"{code}: 매도 전략 '{strategy['name']}' 평가 오류 - {ex}")
         
         return False, None
     
@@ -264,9 +368,10 @@ class Backtester:
         return self.cash + holdings_value
     
     def run(self, start_date, end_date, strategy_name='통합 전략'):
-        """백테스팅 실행 (combined_tick_data 사용)"""
+        """백테스팅 실행 (combined_tick_data 사용, settings.ini 전략 적용)"""
         
         logging.info(f"=== 백테스팅 시작: {start_date} ~ {end_date} ===")
+        logging.info(f"전략: {strategy_name}")
         
         # 초기화
         self.cash = self.initial_cash
@@ -276,6 +381,26 @@ class Backtester:
         self.highest_prices = {}
         self.trades = []
         self.equity_curve = []
+        
+        # ===== 전략 로드 =====
+        self.current_strategy_name = strategy_name
+        self.buy_strategies = self.load_strategies(strategy_name, 'buy')
+        self.sell_strategies = self.load_strategies(strategy_name, 'sell')
+        
+        if not self.buy_strategies:
+            logging.error(f"매수 전략이 없습니다. 백테스팅을 중단합니다.")
+            return self.calculate_results(strategy_name, start_date, end_date)
+        
+        if not self.sell_strategies:
+            logging.warning(f"매도 전략이 없습니다. 기본 매도 조건만 사용합니다.")
+        
+        logging.info(f"매수 전략: {len(self.buy_strategies)}개")
+        for idx, stg in enumerate(self.buy_strategies, 1):
+            logging.info(f"  {idx}. {stg['name']}")
+        
+        logging.info(f"매도 전략: {len(self.sell_strategies)}개")
+        for idx, stg in enumerate(self.sell_strategies, 1):
+            logging.info(f"  {idx}. {stg['name']}")
         
         # 종목 목록
         codes = self.load_codes(start_date, end_date)

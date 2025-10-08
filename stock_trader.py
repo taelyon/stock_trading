@@ -1,5 +1,10 @@
 import sys
 import ctypes
+
+# ===== matplotlib 백엔드 설정 (PyInstaller 대응) =====
+import matplotlib
+matplotlib.use('Qt5Agg')  # tkinter 대신 Qt5 백엔드 사용
+
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import (
     QTimer, pyqtSignal, QProcess, QObject, QThread, Qt, 
@@ -42,25 +47,53 @@ ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
 plt.rcParams['font.family'] = 'Malgun Gothic'
 plt.rcParams['axes.unicode_minus'] = False
 
-# PLUS 공통 OBJECT
-cpCodeMgr = win32com.client.Dispatch('CpUtil.CpCodeMgr')
-cpStatus = win32com.client.Dispatch('CpUtil.CpCybos')
-cpTrade = win32com.client.Dispatch('CpTrade.CpTdUtil')
-cpBalance = win32com.client.Dispatch('CpTrade.CpTd6033')
-cpCash = win32com.client.Dispatch('CpTrade.CpTdNew5331A')
-cpOrder = win32com.client.Dispatch('CpTrade.CpTd0311')
-cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
+# PLUS 공통 OBJECT (전역 변수 선언만, 실제 초기화는 init_plus_objects()에서)
+cpCodeMgr = None
+cpStatus = None
+cpTrade = None
+cpBalance = None
+cpCash = None
+cpOrder = None
+cpStock = None
+
+def init_plus_objects():
+    """크레온 PLUS COM 객체 초기화 (지연 초기화)"""
+    global cpCodeMgr, cpStatus, cpTrade, cpBalance, cpCash, cpOrder, cpStock
+    
+    try:
+        cpCodeMgr = win32com.client.Dispatch('CpUtil.CpCodeMgr')
+        cpStatus = win32com.client.Dispatch('CpUtil.CpCybos')
+        cpTrade = win32com.client.Dispatch('CpTrade.CpTdUtil')
+        cpBalance = win32com.client.Dispatch('CpTrade.CpTd6033')
+        cpCash = win32com.client.Dispatch('CpTrade.CpTdNew5331A')
+        cpOrder = win32com.client.Dispatch('CpTrade.CpTd0311')
+        cpStock = win32com.client.Dispatch('DsCbo1.StockMst')
+        return True
+    except Exception as ex:
+        logging.error(f"크레온 PLUS COM 객체 초기화 실패: {ex}")
+        return False
 
 def init_plus_check():
+    """크레온 PLUS 연결 및 권한 확인"""
+    # 관리자 권한 체크
     if not ctypes.windll.shell32.IsUserAnAdmin():
         logging.error(f"오류: 일반권한으로 실행됨. 관리자 권한으로 실행해 주세요")
         return False
+    
+    # COM 객체 초기화
+    if not init_plus_objects():
+        return False
+    
+    # 연결 체크
     if (cpStatus.IsConnect == 0):
         logging.error(f"PLUS가 정상적으로 연결되지 않음")
         return False
+    
+    # 거래 초기화
     if (cpTrade.TradeInit(0) != 0):
         logging.error(f"주문 초기화 실패")
         return False
+    
     return True
 
 def setup_logging():
@@ -1122,12 +1155,28 @@ class CpStrategy:
         try:
             stock_name = cpCodeMgr.CodeToName(code)
             
+            # ===== ✅ 20개 종목 제한 체크 =====
+            # 보유 종목은 제외하고 순수 모니터링 종목만 카운트
+            monitoring_only = self.trader.monistock_set - self.trader.bought_set
+            MAX_MONITORING_STOCKS = 20
+            
+            if len(monitoring_only) >= MAX_MONITORING_STOCKS:
+                logging.warning(
+                    f"⚠️ {stock_name}({code}) 추가 거부: "
+                    f"모니터링 종목이 이미 {MAX_MONITORING_STOCKS}개 (보유 제외)"
+                )
+                # 리소스 정리
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return
+            
             self.trader.starting_time[code] = time_str
             self.trader.starting_price[code] = price
             self.trader.monistock_set.add(code)
             
             logging.info(f"📋 {stock_name}({code}) 모니터링 세트에 추가 완료")
-            logging.info(f"📋 현재 모니터링 종목 수: {len(self.trader.monistock_set)}")
+            logging.info(f"📋 현재 모니터링 종목 수: {len(self.trader.monistock_set)} (순수 모니터링: {len(monitoring_only)+1}/{MAX_MONITORING_STOCKS})")
             
             self.trader.stock_added_to_monitor.emit(code)
             logging.info(f"📋 {stock_name}({code}) UI 업데이트 시그널 발송 완료")
@@ -1860,7 +1909,7 @@ class CpData(QObject):
 
         self.update_data_timer = QTimer()
         self.update_data_timer.timeout.connect(self.periodic_update_data)
-        self.update_data_timer.start(10000)
+        self.update_data_timer.start(30000)  # 30초 - 20개 종목 최적화 (빠른 업데이트)
 
     def get_strength(self, code):
         """체결강도 반환 (매수세 / 매도세 * 100)"""
@@ -1901,8 +1950,8 @@ class CpData(QObject):
                     code not in self.trader.bought_set):
                     continue
                 
-                # ✅ API 제한 방지: 간격을 늘림 (보유 종목: 10초, 모니터링: 20초)
-                interval = 10 if code in self.trader.bought_set else 20
+                # ✅ 20개 종목 최적화: 빠른 업데이트 (보유: 15초, 모니터링: 30초)
+                interval = 15 if code in self.trader.bought_set else 30
 
                 last_time = self.last_update_time.get(code, 0)
                 if current_time - last_time < interval:
@@ -2259,7 +2308,7 @@ class CpData(QObject):
                 for key in new_data:
                     self.stockdata[code][key] = new_data[key]
             
-            logging.info(
+            logging.debug(
                 f"✅ {code}: {formatted_date} 데이터 로드 완료 "
                 f"({len(new_data['D'])}개, {self.chart_type})"
             )
@@ -2721,6 +2770,30 @@ class CTrader(QObject):
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_combined_date ON combined_tick_data(date)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_combined_timestamp ON combined_tick_data(timestamp)')
             
+            # ===== 오래된 데이터 자동 정리 (30일 이상 된 데이터 삭제) =====
+            try:
+                from datetime import datetime, timedelta
+                cutoff_date = (datetime.now() - timedelta(days=30)).strftime('%Y%m%d')
+                
+                # combined_tick_data 정리
+                cursor.execute('DELETE FROM combined_tick_data WHERE date < ?', (cutoff_date,))
+                deleted_rows = cursor.rowcount
+                if deleted_rows > 0:
+                    logging.info(f"🗑️ 오래된 데이터 정리: combined_tick_data {deleted_rows}개 레코드 삭제 (30일 이전)")
+                
+                # trades 정리 (선택적 - 거래 기록은 보관할 수도 있음)
+                # cursor.execute('DELETE FROM trades WHERE date < ?', (cutoff_date,))
+                
+                # ===== 트랜잭션 커밋 후 VACUUM 실행 =====
+                conn.commit()
+                
+                # VACUUM은 트랜잭션 외부에서 실행해야 함
+                cursor.execute('VACUUM')
+                logging.info(f"✅ DB 최적화 완료 (VACUUM)")
+                
+            except Exception as ex:
+                logging.warning(f"오래된 데이터 정리 중 오류 (무시): {ex}")
+            
             # ===== trades 테이블 (실거래 기록) =====
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS trades (
@@ -3066,7 +3139,13 @@ class CTrader(QObject):
     def monitor_vi(self, time, code, event2):
         """VI 발동 모니터링"""
         try:
-            if code in self.monistock_set or len(self.monistock_set) >= 10 or code in self.bought_set:
+            # ===== ✅ 20개 종목 제한 체크 (보유 종목 제외) =====
+            monitoring_only = self.monistock_set - self.bought_set
+            MAX_MONITORING_STOCKS = 20
+            
+            if code in self.monistock_set or len(monitoring_only) >= MAX_MONITORING_STOCKS or code in self.bought_set:
+                if len(monitoring_only) >= MAX_MONITORING_STOCKS and code not in self.monistock_set and code not in self.bought_set:
+                    logging.debug(f"{code}: 모니터링 종목 제한({MAX_MONITORING_STOCKS}개) 도달, VI 추가 거부")
                 return
 
             if not self.daydata.select_code(code):
@@ -5538,8 +5617,8 @@ class MyWindow(QWidget):
         self.stocks = []
         self.counter = 0
 
-        # 6. 전략 로드 (백그라운드 비동기)
-        self.load_strategy_async()
+        # 6. 전략 로드 (메인 스레드)
+        self.load_strategy()
 
         # ===== ✅ 7. 큐 스레드 시작 (백그라운드 로드와 동시에 시작) =====
         self.objstg.start_processing_queue()
@@ -6056,80 +6135,10 @@ class MyWindow(QWidget):
             logging.error(f"save_strategy -> {ex}")
             QMessageBox.critical(self, "수정 실패", f"전략 수정 중 오류가 발생했습니다:\n{str(ex)}")
 
-    def load_strategy(self):
-        """전략 로드 (최적화)"""
-        try:
-            self.dataStg = []
-            self.data8537 = {}
-            self.strategies = {}
-
-            self.comboStg.clear()
-            self.comboBuyStg.clear()
-            self.buystgInputWidget.clear()
-
-            if self.login_handler.config.has_section('STRATEGIES'):
-                existing_stgnames = set(self.login_handler.config['STRATEGIES'].values())
-            else:
-                existing_stgnames = set()
-
-            # ===== ✅ 조건검색 리스트 로드 (캐시 사용) =====
-            self.data8537 = self.objstg.requestList()
-            
-            # 나머지는 기존 로직과 동일...
-            for stgname, v in self.data8537.items():
-                if stgname not in existing_stgnames:
-                    existing_keys = self.login_handler.config['STRATEGIES'].keys()
-                    existing_numbers = []
-                    for k in existing_keys:
-                        match = re.match(r'stg_?(\d+)', k)
-                        if match:
-                            existing_numbers.append(int(match.group(1)))
-                    next_number = max(existing_numbers, default=0) + 1
-                    new_key = f'stg_{next_number}'
-
-                    self.login_handler.config.set('STRATEGIES', new_key, stgname)
-                    existing_stgnames.add(stgname)
-                    with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
-                        self.login_handler.config.write(configfile)
-
-            for investment_strategy in existing_stgnames:
-                if self.login_handler.config.has_section(investment_strategy):
-                    self.strategies[investment_strategy] = []
-                    for buy_key in sorted([k for k in self.login_handler.config[investment_strategy] if k.startswith('buy_stg_')], key=lambda x: int(x.split('_')[-1])):
-                        buy_strategy = json.loads(self.login_handler.config.get(investment_strategy, buy_key))
-                        buy_strategy['key'] = buy_key
-                        self.strategies[investment_strategy].append(buy_strategy)
-
-                    for sell_key in sorted([k for k in self.login_handler.config[investment_strategy] if k.startswith('sell_stg_')], key=lambda x: int(x.split('_')[-1])):
-                        sell_strategy = json.loads(self.login_handler.config.get(investment_strategy, sell_key))
-                        sell_strategy['key'] = sell_key
-                        self.strategies[investment_strategy].append(sell_strategy)
-
-            if "통합 전략" not in existing_stgnames:
-                self.login_handler.config.set('STRATEGIES', 'stg_integrated', "통합 전략")
-                existing_stgnames.add("통합 전략")
-                with open(self.login_handler.config_file, 'w', encoding='utf-8') as configfile:
-                    self.login_handler.config.write(configfile)
-
-            self.comboStg.blockSignals(True)
-            for stgname in existing_stgnames:
-                self.comboStg.addItem(stgname)
-            
-            last_strategy = self.login_handler.config.get('SETTINGS', 'last_strategy', fallback='통합 전략')
-            index = self.comboStg.findText(last_strategy)
-            if index != -1:
-                self.comboStg.setCurrentIndex(index)
-            self.comboStg.blockSignals(False)
-
-            self.is_loading_strategy = True
-            self.stgChanged()
-            self.is_loading_strategy = False
-
-        except Exception as ex:
-            logging.error(f"load_strategy -> {ex}")
+    # ===== load_strategy() 통합 (메인 스레드에서 실행) =====
 
     def load_strategy(self):
-        """전략 로드 (API 호출 최소화 버전)"""
+        """전략 로드 (메인 스레드, 순서 보장, API 호출 최소화)"""
         try:
             # ===== 1. 초기화 =====
             self.dataStg = []
@@ -6235,12 +6244,21 @@ class MyWindow(QWidget):
             self.buystgInputWidget.clear()
 
             # ===== 2. 설정 파일에서 전략 목록 읽기 (API 호출 없음) =====
+            # ✅ 순서 보장을 위해 list 사용 (set → list 변경)
             if self.login_handler.config.has_section('STRATEGIES'):
-                existing_stgnames = set(self.login_handler.config['STRATEGIES'].values())
+                # STRATEGIES 섹션의 키를 정렬하여 순서 보장
+                strategy_keys = sorted(self.login_handler.config['STRATEGIES'].keys())
+                existing_stgnames = []
+                seen = set()  # 중복 제거용
+                for key in strategy_keys:
+                    stg_value = self.login_handler.config['STRATEGIES'][key]
+                    if stg_value not in seen:
+                        existing_stgnames.append(stg_value)
+                        seen.add(stg_value)
             else:
-                existing_stgnames = set()
+                existing_stgnames = []
                 
-            logging.debug(f"설정 파일에서 {len(existing_stgnames)}개 전략 로드")
+            logging.debug(f"설정 파일에서 {len(existing_stgnames)}개 전략 로드 (순서 보장)")
 
             # ===== 3. 설정 파일에서 전략별 매수/매도 조건 읽기 =====
             for investment_strategy in existing_stgnames:
@@ -6278,17 +6296,37 @@ class MyWindow(QWidget):
             for stgname in existing_stgnames:
                 self.comboStg.addItem(stgname)
             
-            # 마지막 선택 전략 복원
-            if self.login_handler.config.has_option('GENERAL', 'last_stg'):
-                last_stg = self.login_handler.config.get('GENERAL', 'last_stg')
-                index = self.comboStg.findText(last_stg)
+            # ===== 4-1. 백테스팅 탭 전략 콤보박스에도 추가 =====
+            if hasattr(self, 'bt_strategy_combo'):
+                self.bt_strategy_combo.clear()
+                for stgname in existing_stgnames:
+                    self.bt_strategy_combo.addItem(stgname)
+                
+                # 기본값: 통합 전략
+                index = self.bt_strategy_combo.findText("통합 전략")
+                if index != -1:
+                    self.bt_strategy_combo.setCurrentIndex(index)
+                logging.info(f"✅ 백테스팅 전략 콤보박스 초기화 완료 ({len(existing_stgnames)}개)")
+            
+            # 마지막 선택 전략 복원 (SETTINGS 섹션에서 로드)
+            if self.login_handler.config.has_option('SETTINGS', 'last_strategy'):
+                last_strategy = self.login_handler.config.get('SETTINGS', 'last_strategy')
+                index = self.comboStg.findText(last_strategy)
                 if index != -1:
                     self.comboStg.setCurrentIndex(index)
+                    logging.info(f"✅ 마지막 전략 복원: {last_strategy}")
                 else:
                     # 마지막 전략을 찾을 수 없으면 "통합 전략" 선택
                     index = self.comboStg.findText("통합 전략")
                     if index != -1:
                         self.comboStg.setCurrentIndex(index)
+                        logging.info(f"⚠️ 마지막 전략 '{last_strategy}'을 찾을 수 없어 '통합 전략' 선택")
+            else:
+                # last_strategy 설정이 없으면 "통합 전략" 기본 선택
+                index = self.comboStg.findText("통합 전략")
+                if index != -1:
+                    self.comboStg.setCurrentIndex(index)
+                    logging.info(f"ℹ️ 저장된 전략 없음, 기본값 '통합 전략' 선택")
             
             self.comboStg.blockSignals(False)
             
@@ -6400,28 +6438,37 @@ class MyWindow(QWidget):
             logging.info("✅ 조건검색 리스트 로드 완료")
             
             # 메인 스레드에서 직접 처리
-            self._on_background_load_complete()
+            self._on_condition_list_loaded()
             
         except Exception as ex:
             logging.error(f"메인 스레드 조건검색 로드 실패: {ex}")
 
-    def _on_background_load_complete(self):
-        """백그라운드 로드 완료 후 메인 스레드에서 실행 (중복 방지)"""
+    def _on_condition_list_loaded(self):
+        """조건검색 리스트 로드 완료 후 조건검색 시작"""
         try:
             current_stg = self.comboStg.currentText()
             
-            # 현재 전략이 조건검색 리스트에 있으면 조건검색만 시작 (전략 재초기화 방지)
-            if hasattr(self, 'data8537') and self.data8537 and current_stg in self.data8537:
-                logging.info(f"✅ 백그라운드 로드 완료 - {current_stg} 조건검색 시작")
+            # ===== 조건검색 리스트 로드 완료 후 처리 =====
+            if not hasattr(self, 'data8537') or not self.data8537:
+                logging.warning("⚠️ 조건검색 리스트가 비어있음")
+                return
+            
+            logging.info(f"✅ 조건검색 리스트 로드 완료 - {current_stg} 조건검색 시작")
+            
+            # 전략별 조건검색 시작
+            if current_stg == "통합 전략":
+                # 통합 전략은 급등주, 갭상승 조건검색 시작
+                self._start_condition_search("급등주")
+                time.sleep(0.5)
+                self._start_condition_search("갭상승")
                 
-                # 전략 재초기화 대신 조건검색만 시작 (중복 방지)
-                if current_stg == "통합 전략":
-                    # 통합 전략은 급등주, 갭상승 조건검색 시작
-                    self._start_condition_search("급등주")
-                    time.sleep(0.5)
-                    self._start_condition_search("갭상승")
-                elif current_stg not in ["VI 발동"]:
-                    # 기타 전략은 해당 전략 조건검색 시작
+            elif current_stg == "VI 발동":
+                # VI 발동은 조건검색 없음 (실시간 VI 감시)
+                logging.info(f"{current_stg} 전략은 조건검색 없음 (VI 실시간 감시)")
+                
+            else:
+                # 기타 전략은 해당 전략 조건검색 시작
+                if current_stg in self.data8537:
                     self._start_condition_search(current_stg)
                     
                     # static 전략인 경우 종목 로드도 시작
@@ -6432,68 +6479,14 @@ class MyWindow(QWidget):
                         if item:
                             id = item['ID']
                             name = item['전략명']
-                            self._load_static_strategy_background(id, name)
+                            self._load_static_strategy(id, name)
                 else:
-                    # VI 발동은 조건검색 없음
-                    logging.info(f"{current_stg} 전략은 조건검색 없음")
-            else:
-                logging.info("✅ 백그라운드 로드 완료 - 새로운 전략 없음")
+                    logging.warning(f"⚠️ 조건검색 '{current_stg}'을 data8537에서 찾을 수 없음")
         except Exception as ex:
-            logging.error(f"백그라운드 로드 완료 후 처리 실패: {ex}")
+            logging.error(f"조건검색 시작 실패: {ex}")
 
-    def _load_static_strategy_background(self, id, name):
-        """static 전략 백그라운드 로드 (전일상한가 등)"""
-        def worker():
-            try:
-                # COM 초기화 (백그라운드 스레드에서 필요)
-                import pythoncom
-                pythoncom.CoInitialize()
-                
-                logging.info(f"📋 {name} 전략 로드 중... (백그라운드)")
-                
-                # API 제한 확인
-                remain_time = cpStatus.GetLimitRemainTime(0)
-                if remain_time > 0:
-                    wait_sec = remain_time / 1000 + 0.1
-                    logging.debug(f"{name}: API 제한 {wait_sec:.1f}초 대기")
-                    time.sleep(wait_sec)
-                
-                # static 전략 데이터 로드
-                ret, dataStg = self.objstg.requestStgID(id)
-                if ret and len(dataStg) > 0:
-                    max_load = self.get_max_static_load()
-                    stock_count = len(dataStg)
-                    
-                    logging.info(f"✅ {name} 전략 로드 완료 ({stock_count}개 종목)")
-                    
-                    # 메인 스레드에서 종목 로드 실행 (static 전략용) - QTimer로 안전하게 전달
-                    logging.info(f"🚀 메인 스레드로 종목 로드 전달 - {stock_count}개 종목")
-                    
-                    def load_stocks_safe():
-                        try:
-                            logging.info(f"🚀 load_stocks_safe 콜백 실행 시작 - {len(dataStg)}개 종목")
-                            self._load_static_stocks_complete(dataStg, max_load)
-                        except Exception as ex:
-                            logging.error(f"load_stocks_safe 콜백 실패: {ex}")
-                            import traceback
-                            logging.error(f"상세 오류: {traceback.format_exc()}")
-                    
-                    # 메인 스레드로 안전하게 전달
-                    QTimer.singleShot(100, load_stocks_safe)  # 100ms 지연으로 안전하게 전달
-                    logging.info(f"📅 QTimer.singleShot 예약 완료 (100ms 지연)")
-                else:
-                    logging.warning(f"{name} 전략 데이터 없음")
-                
-            except Exception as ex:
-                logging.error(f"{name} 백그라운드 로드 실패: {ex}")
-            finally:
-                # COM 정리
-                try:
-                    pythoncom.CoUninitialize()
-                except:
-                    pass
-        
-        # 메인 스레드에서 직접 실행 (COM 초기화 불필요)
+    def _load_static_strategy(self, id, name):
+        """static 전략 로드 (전일상한가 등) - 메인 스레드에서 실행"""
         try:
             logging.info(f"📋 {name} 전략 로드 중... (메인 스레드)")
             
@@ -6564,7 +6557,7 @@ class MyWindow(QWidget):
             
             # stock_list 구조 확인
             if total_count > 0:
-                logging.info(f"첫 번째 종목 구조: {stock_list[0]}")
+                logging.debug(f"첫 번째 종목 구조: {stock_list[0]}")
             
             loaded_count = 0
             failed_count = 0
@@ -6579,7 +6572,7 @@ class MyWindow(QWidget):
                         continue
                     
                     stock_name = cpCodeMgr.CodeToName(code)
-                    logging.info(f"종목 {idx}/{total_count}: {stock_name}({code}) 로드 중...")
+                    logging.debug(f"종목 {idx}/{total_count}: {stock_name}({code}) 로드 중...")
                     
                     # 종목 로드 (메인 스레드에서 안전하게)
                     if self._load_single_stock_safely(code):
@@ -6661,7 +6654,7 @@ class MyWindow(QWidget):
     def _load_static_stocks_complete(self, stock_list, max_load):
         """static 전략 종목 로드 완료 (메인 스레드에서 실행)"""
         try:
-            logging.info(f"🔍 _load_static_stocks_complete 호출됨 - stock_list: {len(stock_list) if stock_list else 'None'}")
+            logging.debug(f"🔍 _load_static_stocks_complete 호출됨 - stock_list: {len(stock_list) if stock_list else 'None'}")
             
             if not stock_list:
                 logging.warning("static 전략 종목 리스트가 비어있음")
@@ -6672,7 +6665,7 @@ class MyWindow(QWidget):
             
             # 종목 리스트 내용 확인
             for i, stock in enumerate(stock_list[:3]):  # 처음 3개만 로그
-                logging.info(f"  종목 {i+1}: {stock}")
+                logging.debug(f"  종목 {i+1}: {stock}")
             
             if stock_count > max_load:
                 logging.info(f"📦 제한 적용: {max_load}개만 로드")
@@ -6750,16 +6743,19 @@ class MyWindow(QWidget):
                 
                 self._load_stocks_from_db_safely('mylist.db')
                 
-                time.sleep(1.0)
-                self._start_condition_search("급등주")
-                time.sleep(0.5)
-                self._start_condition_search("갭상승")
+                # ===== 조건검색 시작은 조건검색 리스트 로드 이후로 연기 =====
+                # time.sleep(1.0)
+                # self._start_condition_search("급등주")
+                # time.sleep(0.5)
+                # self._start_condition_search("갭상승")
+                # → _on_condition_list_loaded()에서 처리됨
                 
                 self.volatility_strategy = VolatilityBreakout(self.trader)
                 self.trader_thread.set_volatility_strategy(self.volatility_strategy)
                 
                 self.gap_scanner = self.objstg.gap_scanner
                 logging.info("✅ 통합 전략 초기화 완료")
+                logging.info("📋 조건검색 리스트 로드 대기 중... (급등주, 갭상승)")
 
             # ===== 기타 전략 =====
             else:
@@ -6781,7 +6777,7 @@ class MyWindow(QWidget):
                         
                         if strategy_type == 'static':
                             # static 전략은 백그라운드에서 로드
-                            self._load_static_strategy_background(id, name)
+                            self._load_static_strategy(id, name)
                         
                         time.sleep(0.5)
                         self._start_condition_search(stgName)
@@ -6956,7 +6952,7 @@ class MyWindow(QWidget):
     def _load_stocks_from_list_safely_sync(self, stock_list):
         """리스트에서 종목 동기 로드 (적은 종목용)"""
         try:
-            logging.info(f"🔍 _load_stocks_from_list_safely_sync 호출됨")
+            logging.debug(f"🔍 _load_stocks_from_list_safely_sync 호출됨")
             
             if not stock_list:
                 logging.warning("stock_list가 비어있음")
@@ -7651,11 +7647,17 @@ class MyWindow(QWidget):
         self.bt_initial_cash.setFixedWidth(150)
         settings_layout.addWidget(self.bt_initial_cash, 1, 1)
         
+        # 전략 선택
+        settings_layout.addWidget(QLabel("투자 전략:"), 2, 0)
+        self.bt_strategy_combo = QComboBox()
+        self.bt_strategy_combo.setFixedWidth(150)
+        settings_layout.addWidget(self.bt_strategy_combo, 2, 1)
+        
         # 실행 버튼
         self.bt_run_button = QPushButton("백테스팅 실행")
         self.bt_run_button.setFixedWidth(150)
         self.bt_run_button.clicked.connect(self.run_backtest)
-        settings_layout.addWidget(self.bt_run_button, 1, 2)
+        settings_layout.addWidget(self.bt_run_button, 2, 2)
         
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
@@ -7720,13 +7722,16 @@ class MyWindow(QWidget):
             
             QApplication.processEvents()
             
-            # 백테스팅 실행
+            # 백테스팅 실행 (settings.ini 포함)
             bt = Backtester(
                 db_path=self.trader.db_name,
+                config_file=self.login_handler.config_file,
                 initial_cash=initial_cash
             )
             
-            strategy_name = self.comboStg.currentText() if hasattr(self, 'comboStg') else '통합 전략'
+            # 백테스팅 탭의 전략 선택 사용
+            strategy_name = self.bt_strategy_combo.currentText() if self.bt_strategy_combo.currentText() else '통합 전략'
+            logging.info(f"선택된 전략: {strategy_name}")
             results = bt.run(start_date, end_date, strategy_name=strategy_name)
             
             # 결과 표시
