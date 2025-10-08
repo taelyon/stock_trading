@@ -1,7 +1,7 @@
 import sys
 import ctypes
 import matplotlib
-matplotlib.use('Qt5Agg')  # tkinter 대신 Qt5 백엔드 사용
+matplotlib.use('Qt5Agg')
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import (
     QTimer, pyqtSignal, QProcess, QObject, QThread, Qt, 
