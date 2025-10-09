@@ -1,7 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
 Stock Trader PyInstaller Spec File
-대신증권 크레온 자동매매 프로그램 빌드 설정
+대신증권 크레온 초단타 매매 프로그램 v3.0
+
+기능:
+- 실시간 자동매매
+- 백테스팅 (일별 성과 포함)
+- 통합 전략 시스템
+- 기술적 지표 분석
 """
 
 block_cipher = None
@@ -44,6 +50,7 @@ hiddenimports = [
     'matplotlib.backends',
     'matplotlib.backends.backend_qt5agg',
     'matplotlib.backends.backend_agg',
+    'matplotlib.dates',  # 일별 성과 차트에서 사용
     
     # 차트 라이브러리
     'mplfinance',
@@ -108,6 +115,8 @@ excludes = [
     'jupyter',
     'notebook',
     'pytest',
+    'sphinx',
+    'docutils',
 ]
 
 a = Analysis(

@@ -7597,7 +7597,7 @@ class MyWindow(QWidget):
                 db_path = 'vi_stock_data.db'
                 if not os.path.exists(db_path):
                     QMessageBox.warning(self, "오류", f"데이터베이스 파일을 찾을 수 없습니다.\n경로: {db_path}")
-                    return
+                return
             else:
                 db_path = self.trader.db_name
             

@@ -13,10 +13,12 @@
 
 이 문서는 Stock Trader 자동매매 프로그램을 실행 파일(`.exe`)로 빌드하는 방법을 설명합니다.
 
-### 최근 업데이트 (2025-10-08)
-- ✅ 중복 코드 리팩토링 완료 (`strategy_utils.py` 추가)
-- ✅ 불필요한 메서드 제거 (코드 간소화)
-- ✅ spec 파일 업데이트 (새 모듈 포함)
+### 최근 업데이트 (2025-10-09)
+- ✅ 백테스팅 일별 성과 기능 추가
+- ✅ 실시간/백테스팅 변수 통합 (공통 함수 사용)
+- ✅ 백테스팅 UI 개선 (일별 성과 탭/테이블/차트)
+- ✅ ConfigParser → RawConfigParser (% 문자 이슈 해결)
+- ✅ matplotlib.dates 의존성 추가
 
 ---
 
@@ -364,6 +366,22 @@ pyinstaller --clean stock_trader.spec
 ---
 
 ## 변경 이력
+
+### 2025-10-09
+- ✅ 백테스팅 일별 성과 기능 추가
+  - `backtester.py`: `save_daily_result()`, `plot_daily_results()` 추가
+  - `stock_trader.py`: 일별 성과 탭, 테이블, 차트 UI 추가
+  - DB 테이블: `daily_summary` 컬럼 추가
+- ✅ 실시간/백테스팅 변수 통합
+  - `strategy_utils.py`: `build_realtime_buy_locals()`, `build_realtime_sell_locals()` 추가
+  - 공통 함수로 일관성 확보
+- ✅ 백테스팅 개선
+  - DB 기간 자동 로드 기능
+  - 전략 콤보박스 자동 초기화
+  - 거래 없을 때 에러 처리
+- ✅ ConfigParser → RawConfigParser 전환 (% 문자 이슈 해결)
+- ✅ matplotlib.dates 의존성 추가
+- ✅ pandas Series 인덱싱 오류 수정 (.values 사용)
 
 ### 2025-10-08
 - ✅ `strategy_utils.py` 모듈 추가 (중복 코드 리팩토링)
