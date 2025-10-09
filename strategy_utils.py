@@ -242,18 +242,184 @@ class SafeLocalsBuilder:
         return self
 
 
-# ==================== 백테스팅용 간소화 빌더 ====================
-def build_backtest_buy_locals(row):
-    """백테스팅 매수용 safe_locals 빌더 (간소화 버전)"""
+# ==================== 실시간 매매용 빌더 ====================
+def build_realtime_buy_locals(code, tick_latest, min_latest, trader, window=None):
+    """실시간 매매 매수용 safe_locals 빌더"""
     builder = SafeLocalsBuilder()
     
-    # 틱 데이터
-    tick_data = {
+    # 틱 데이터 기본 지표
+    builder.add_tick_indicators(tick_latest)
+    
+    # 분봉 데이터 기본 지표
+    builder.add_min_indicators(min_latest)
+    
+    # 최근 데이터 (실제 배열)
+    tick_recent = trader.tickdata.get_recent_data(code, 10)
+    min_recent = trader.mindata.get_recent_data(code, 10)
+    
+    # 동적 변수들
+    strength = trader.tickdata.get_strength(code)
+    
+    # 시간대별 임계값
+    from datetime import datetime
+    hour = datetime.now().hour
+    if hour == 9:
+        threshold = 65
+    elif hour >= 14:
+        threshold = 85
+    else:
+        threshold = 75
+    
+    # 변동성 돌파
+    volatility_breakout = False
+    if window and hasattr(window, 'volatility_strategy') and window.volatility_strategy:
+        try:
+            volatility_breakout = window.volatility_strategy.check_breakout(code)
+        except:
+            volatility_breakout = False
+    
+    # 갭 유지
+    gap_hold = False
+    if window and hasattr(window, 'gap_scanner') and window.gap_scanner:
+        try:
+            gap_hold = window.gap_scanner.check_gap_hold(code)
+        except:
+            gap_hold = False
+    
+    # ROC 최근 추이
+    ROC_recent = tick_recent.get('ROC', [0] * 5)
+    
+    # Volume Profile 돌파
+    VP_POSITION = tick_latest.get('VP_POSITION', 0)
+    volume_profile_breakout = (VP_POSITION > 0)
+    
+    # 최근 데이터 배열
+    recent_arrays = {
+        'tick_C_recent': tick_recent.get('C', [0])[-3:] if tick_recent.get('C') else [0],
+        'tick_H_recent': tick_recent.get('H', [0])[-3:] if tick_recent.get('H') else [0],
+        'tick_L_recent': tick_recent.get('L', [0])[-3:] if tick_recent.get('L') else [0],
+        'tick_V_recent': tick_recent.get('V', [0])[-3:] if tick_recent.get('V') else [0],
+        'ROC_recent': ROC_recent,
+        'min_C_recent': min_recent.get('C', [0])[-3:] if min_recent.get('C') else [0],
+        'min_H_recent': min_recent.get('H', [0])[-3:] if min_recent.get('H') else [0],
+        'min_L_recent': min_recent.get('L', [0])[-3:] if min_recent.get('L') else [0],
+        'OSCT_recent': tick_recent.get('OSCT', [0])[-3:] if tick_recent.get('OSCT') else [0],
+        'RSIT_SIGNAL': tick_recent.get('RSIT_SIGNAL', [0])[-1] if tick_recent.get('RSIT_SIGNAL') else 0,
+    }
+    
+    # 전략 변수들
+    builder.add_strategy_vars(
+        strength=strength,
+        gap_hold=gap_hold,
+        volatility_breakout=volatility_breakout,
+        volume_profile_breakout=volume_profile_breakout,
+        positive_candle=min_latest.get('C', 0) > min_latest.get('O', 0)
+    )
+    
+    # 기타 변수
+    builder.add_custom_vars(
+        threshold=threshold,
+        momentum_score=0,
+        code=code,
+        **recent_arrays
+    )
+    
+    # 파생 지표 추가
+    builder.add_derived_indicators(tick_latest, min_latest, tick_recent, min_recent)
+    
+    return builder.build()
+
+
+def build_realtime_sell_locals(code, tick_latest, min_latest, trader, buy_price, highest_price, buy_time_str, window=None):
+    """실시간 매매 매도용 safe_locals 빌더"""
+    from datetime import datetime
+    
+    builder = SafeLocalsBuilder()
+    
+    # 틱 데이터 기본 지표
+    builder.add_tick_indicators(tick_latest)
+    
+    # 분봉 데이터 기본 지표
+    builder.add_min_indicators(min_latest)
+    
+    # 수익률 계산
+    tick_close = tick_latest.get('C', 0)
+    current_profit_pct = (tick_close / buy_price - 1) * 100 if buy_price > 0 else 0
+    from_peak_pct = (tick_close / highest_price - 1) * 100 if highest_price > 0 else 0
+    
+    # 보유 시간 계산
+    if buy_time_str:
+        try:
+            buy_time = datetime.strptime(
+                f"{datetime.now().year}/{buy_time_str}", 
+                '%Y/%m/%d %H:%M:%S'
+            )
+            hold_minutes = (datetime.now() - buy_time).total_seconds() / 60
+        except:
+            hold_minutes = 0
+    else:
+        hold_minutes = 0
+    
+    # 장 마감 여부
+    now = datetime.now()
+    after_market_close = (now.hour == 15 and now.minute >= 15) or (now.hour > 15)
+    
+    # 최근 데이터
+    tick_recent = trader.tickdata.get_recent_data(code, 10)
+    min_recent = trader.mindata.get_recent_data(code, 10)
+    
+    # 최근 데이터 배열
+    recent_arrays = {
+        'ROC_recent': tick_recent.get('ROC', [0] * 5),
+        'OSCT_recent': tick_recent.get('OSCT', [0])[-3:] if tick_recent.get('OSCT') else [0],
+        'tick_C_recent': tick_recent.get('C', [0])[-3:] if tick_recent.get('C') else [0],
+        'min_C_recent': min_recent.get('C', [0])[-3:] if min_recent.get('C') else [0],
+        'min_H_recent': min_recent.get('H', [0])[-3:] if min_recent.get('H') else [0],
+        'min_L_recent': min_recent.get('L', [0])[-3:] if min_recent.get('L') else [0],
+    }
+    
+    # 수익률 변수 추가
+    builder.add_profit_vars(
+        current_profit_pct=current_profit_pct,
+        from_peak_pct=from_peak_pct,
+        hold_minutes=hold_minutes,
+        buy_price=buy_price,
+        highest_price=highest_price
+    )
+    
+    # 시간 변수 추가
+    builder.add_time_vars(after_market_close=after_market_close)
+    
+    # 기타 변수
+    builder.add_custom_vars(
+        code=code,
+        gap_hold=False,  # 매도 시점에는 gap_hold 불필요
+        **recent_arrays
+    )
+    
+    # 파생 지표 추가
+    builder.add_derived_indicators(tick_latest, min_latest, tick_recent, min_recent)
+    
+    return builder.build()
+
+
+# ==================== 백테스팅용 빌더 (실시간 매매와 최대한 일치) ====================
+def build_backtest_buy_locals(row):
+    """백테스팅 매수용 safe_locals 빌더
+    
+    주의: 백테스팅에서는 단일 시점 데이터만 있으므로
+         최근 데이터 배열은 같은 값으로 채워짐
+    """
+    builder = SafeLocalsBuilder()
+    
+    # 틱 데이터 (실시간과 동일한 변수명)
+    tick_indicators = {
         'MAT5': row.get('tick_MAT5', 0),
         'MAT20': row.get('tick_MAT20', 0),
         'MAT60': row.get('tick_MAT60', 0),
         'MAT120': row.get('tick_MAT120', 0),
         'C': row.get('tick_C', 0),
+        'tick_C': row.get('tick_C', 0),
         'VWAP': row.get('tick_VWAP', 0),
         'tick_VWAP': row.get('tick_VWAP', 0),
         'RSIT': row.get('tick_RSIT', 50),
@@ -274,13 +440,15 @@ def build_backtest_buy_locals(row):
         'OBV_MA20': row.get('tick_OBV_MA20', 0),
         'VP_POC': row.get('tick_VP_POC', 0),
         'VP_POSITION': row.get('tick_VP_POSITION', 0),
+        'CCI': row.get('tick_CCI', 0),
     }
     
-    # 분봉 데이터
-    min_data = {
+    # 분봉 데이터 (실시간과 동일한 변수명)
+    min_indicators = {
         'MAM5': row.get('min_MAM5', 0),
         'MAM10': row.get('min_MAM10', 0),
         'MAM20': row.get('min_MAM20', 0),
+        'min_C': row.get('min_C', 0),
         'min_close': row.get('min_C', 0),
         'RSI': row.get('min_RSI', 50),
         'min_RSI': row.get('min_RSI', 50),
@@ -295,26 +463,56 @@ def build_backtest_buy_locals(row):
         'min_ROC': row.get('min_ROC', 0),
         'min_OBV': row.get('min_OBV', 0),
         'min_OBV_MA20': row.get('min_OBV_MA20', 0),
+        'min_CCI': row.get('min_CCI', 0),
     }
     
-    # 추가 변수
-    extra_vars = {
+    # 전략 변수 (실시간과 동일하게)
+    strategy_vars = {
         'strength': row.get('strength', 0),
         'positive_candle': row.get('min_C', 0) > row.get('min_O', 0),
         'gap_hold': True,
         'volatility_breakout': False,
         'volume_profile_breakout': row.get('tick_VP_POSITION', 0) > 0,
+        'threshold': 75,
+        'momentum_score': 0,
+        'code': '',
     }
     
-    builder.locals.update(tick_data)
-    builder.locals.update(min_data)
-    builder.locals.update(extra_vars)
+    # 최근 데이터 배열 (실시간과 동일한 변수명, 단일값 복제)
+    recent_arrays = {
+        'tick_C_recent': [row.get('tick_C', 0)] * 3,
+        'tick_H_recent': [row.get('tick_H', 0)] * 3,
+        'tick_L_recent': [row.get('tick_L', 0)] * 3,
+        'tick_V_recent': [row.get('tick_V', 0)] * 3,
+        'ROC_recent': [row.get('tick_ROC', 0)] * 5,
+        'min_C_recent': [row.get('min_C', 0)] * 3,
+        'min_H_recent': [row.get('min_H', 0)] * 3,
+        'min_L_recent': [row.get('min_L', 0)] * 3,
+        'OSCT_recent': [row.get('tick_OSCT', 0)] * 3,
+        'RSIT_SIGNAL': row.get('tick_RSIT_SIGNAL', 0),
+    }
+    
+    # 파생 지표 (실시간과 동일하게)
+    derived_vars = {
+        'osct_negative': row.get('tick_OSCT', 0) < 0,
+        'obv_divergence': row.get('tick_OBV', 0) < row.get('tick_OBV_MA20', 0),
+        'min_obv_divergence': row.get('min_OBV', 0) < row.get('min_OBV_MA20', 0),
+        'williams_overbought': row.get('tick_WILLIAMS_R', -50) > -20,
+        'williams_oversold': row.get('tick_WILLIAMS_R', -50) < -80,
+    }
+    
+    # 모두 통합
+    builder.locals.update(tick_indicators)
+    builder.locals.update(min_indicators)
+    builder.locals.update(strategy_vars)
+    builder.locals.update(recent_arrays)
+    builder.locals.update(derived_vars)
     
     return builder.build()
 
 
 def build_backtest_sell_locals(row, current_price, buy_price, highest_price, buy_time):
-    """백테스팅 매도용 safe_locals 빌더"""
+    """백테스팅 매도용 safe_locals 빌더 (실시간과 최대한 일치)"""
     # 수익률 계산
     profit_pct = (current_price / buy_price - 1) * 100 if buy_price > 0 else 0
     from_peak_pct = (current_price / highest_price - 1) * 100 if highest_price > 0 else 0
@@ -327,36 +525,84 @@ def build_backtest_sell_locals(row, current_price, buy_price, highest_price, buy
     
     builder = SafeLocalsBuilder()
     
-    # 틱 데이터
-    tick_data = {
+    # 틱 데이터 (실시간과 동일)
+    tick_indicators = {
         'MAT5': row.get('tick_MAT5', 0),
         'MAT20': row.get('tick_MAT20', 0),
         'MAT60': row.get('tick_MAT60', 0),
+        'MAT120': row.get('tick_MAT120', 0),
         'C': row.get('tick_C', 0),
+        'tick_C': row.get('tick_C', 0),
+        'tick_close': row.get('tick_C', 0),
+        'VWAP': row.get('tick_VWAP', 0),
+        'tick_VWAP': row.get('tick_VWAP', 0),
         'OSCT': row.get('tick_OSCT', 0),
         'STOCHK': row.get('tick_STOCHK', 50),
         'STOCHD': row.get('tick_STOCHD', 50),
         'RSIT': row.get('tick_RSIT', 50),
         'WILLIAMS_R': row.get('tick_WILLIAMS_R', -50),
+        'ROC': row.get('tick_ROC', 0),
+        'MACDT': row.get('tick_MACDT', 0),
+        'MACDT_SIGNAL': row.get('tick_MACDT_SIGNAL', 0),
+        'CCI': row.get('tick_CCI', 0),
+        'OBV': row.get('tick_OBV', 0),
+        'OBV_MA20': row.get('tick_OBV_MA20', 0),
+        'ATR': row.get('tick_ATR', 0),
+        'BB_POSITION': row.get('tick_BB_POSITION', 0),
     }
     
-    # 분봉 데이터
-    min_data = {
+    # 분봉 데이터 (실시간과 동일)
+    min_indicators = {
         'MAM5': row.get('min_MAM5', 0),
         'MAM10': row.get('min_MAM10', 0),
+        'MAM20': row.get('min_MAM20', 0),
+        'min_C': row.get('min_C', 0),
+        'min_close': row.get('min_C', 0),
+        'min_RSI': row.get('min_RSI', 50),
+        'min_STOCHK': row.get('min_STOCHK', 50),
+        'min_STOCHD': row.get('min_STOCHD', 50),
+        'min_WILLIAMS_R': row.get('min_WILLIAMS_R', -50),
+        'min_ROC': row.get('min_ROC', 0),
+        'min_CCI': row.get('min_CCI', 0),
+        'min_OBV': row.get('min_OBV', 0),
+        'min_OBV_MA20': row.get('min_OBV_MA20', 0),
     }
     
-    # 매도 조건용 변수들
-    sell_vars = {
+    # 수익률 변수 (실시간과 동일)
+    profit_vars = {
         'current_profit_pct': profit_pct,
         'from_peak_pct': from_peak_pct,
         'hold_minutes': hold_minutes,
+        'buy_price': buy_price,
+        'highest_price': highest_price,
         'after_market_close': after_market_close,
         'gap_hold': True,
     }
     
-    builder.locals.update(tick_data)
-    builder.locals.update(min_data)
-    builder.locals.update(sell_vars)
+    # 최근 데이터 배열 (실시간과 동일한 변수명, 단일값 복제)
+    recent_arrays = {
+        'ROC_recent': [row.get('tick_ROC', 0)] * 5,
+        'OSCT_recent': [row.get('tick_OSCT', 0)] * 3,
+        'tick_C_recent': [row.get('tick_C', 0)] * 3,
+        'min_C_recent': [row.get('min_C', 0)] * 3,
+        'min_H_recent': [row.get('min_H', 0)] * 3,
+        'min_L_recent': [row.get('min_L', 0)] * 3,
+    }
+    
+    # 파생 지표 (실시간과 동일)
+    derived_vars = {
+        'osct_negative': row.get('tick_OSCT', 0) < 0,
+        'obv_divergence': row.get('tick_OBV', 0) < row.get('tick_OBV_MA20', 0),
+        'min_obv_divergence': row.get('min_OBV', 0) < row.get('min_OBV_MA20', 0),
+        'williams_overbought': row.get('tick_WILLIAMS_R', -50) > -20,
+        'williams_oversold': row.get('tick_WILLIAMS_R', -50) < -80,
+    }
+    
+    # 모두 통합
+    builder.locals.update(tick_indicators)
+    builder.locals.update(min_indicators)
+    builder.locals.update(profit_vars)
+    builder.locals.update(recent_arrays)
+    builder.locals.update(derived_vars)
     
     return builder.build()

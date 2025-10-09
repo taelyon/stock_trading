@@ -7,7 +7,7 @@ from PyQt5.QtCore import (
     QTimer, pyqtSignal, QProcess, QObject, QThread, Qt, 
     pyqtSlot, QRunnable, QThreadPool, QEventLoop
 )
-from PyQt5.QtGui import QIcon, QPainter, QFont
+from PyQt5.QtGui import QIcon, QPainter, QFont, QColor
 from PyQt5.QtPrintSupport import QPrintDialog, QPrinter
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
@@ -2716,7 +2716,7 @@ class CTrader(QObject):
         self.db_name = 'vi_stock_data.db'
 
         # ===== 설정 파일 읽기 (간소화) =====
-        config = configparser.ConfigParser(interpolation=None)
+        config = configparser.RawConfigParser()
         if os.path.exists('settings.ini'):
             config.read('settings.ini', encoding='utf-8')
         
@@ -2843,11 +2843,15 @@ class CTrader(QObject):
                     lose_trades INTEGER DEFAULT 0,
                     win_rate REAL DEFAULT 0,
                     total_profit REAL DEFAULT 0,
+                    total_return_pct REAL DEFAULT 0,
                     avg_profit_pct REAL DEFAULT 0,
                     max_profit_pct REAL DEFAULT 0,
                     max_loss_pct REAL DEFAULT 0,
                     total_buy_amount REAL DEFAULT 0,
                     final_cash REAL DEFAULT 0,
+                    portfolio_value REAL DEFAULT 0,
+                    cash REAL DEFAULT 0,
+                    holdings_value REAL DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -3736,7 +3740,7 @@ class AutoTraderThread(QThread):
 
     def load_trading_settings(self):
         """매매 평가 설정 로드"""
-        config = configparser.ConfigParser(interpolation=None)
+        config = configparser.RawConfigParser()
         if os.path.exists('settings.ini'):
             config.read('settings.ini', encoding='utf-8')
         
@@ -4123,131 +4127,46 @@ class AutoTraderThread(QThread):
             self.buy_signal.emit(code, "사용자 전략", "0", "03")
 
     def _evaluate_integrated_buy(self, code, buy_strategies, tick_latest, min_latest):
-        """매수 평가 - 새 지표 포함"""
+        """매수 평가 - 공통 함수 사용"""
+        from strategy_utils import (
+            STRATEGY_SAFE_GLOBALS,
+            evaluate_strategies,
+            build_realtime_buy_locals
+        )
         
-        safe_globals = {
-            '__builtins__': {
-                'min': min, 'max': max, 'abs': abs, 'round': round,
-                'int': int, 'float': float, 'bool': bool, 'str': str,
-                'len': len, 'sum': sum, 'all': all, 'any': any,
-                'True': True, 'False': False, 'None': None
-            }
-        }
+        # ===== 공통 함수로 변수 구성 =====
+        safe_locals = build_realtime_buy_locals(
+            code=code,
+            tick_latest=tick_latest,
+            min_latest=min_latest,
+            trader=self.trader,
+            window=self.window
+        )
         
-        # === 기존 변수들 ===
-        MAT5 = tick_latest.get('MAT5', 0)
-        MAT20 = tick_latest.get('MAT20', 0)
-        MAT60 = tick_latest.get('MAT60', 0)
-        MAT120 = tick_latest.get('MAT120', 0)
-        C = tick_latest.get('C', 0)
-        VWAP = tick_latest.get('VWAP', 0)
-        RSIT = tick_latest.get('RSIT', 50)
-        MACDT = tick_latest.get('MACDT', 0)
-        OSCT = tick_latest.get('OSCT', 0)
-        STOCHK = tick_latest.get('STOCHK', 50)
-        STOCHD = tick_latest.get('STOCHD', 50)
-        ATR = tick_latest.get('ATR', 0)
-        BB_POSITION = tick_latest.get('BB_POSITION', 0)
-        BB_BANDWIDTH = tick_latest.get('BB_BANDWIDTH', 0)
+        # === 전략 평가 (공통 함수 사용) ===
+        matched, strategy = evaluate_strategies(
+            buy_strategies,
+            safe_locals,
+            code=code,
+            strategy_type="매수"
+        )
         
-        MAM5 = min_latest.get('MAM5', 0)
-        MAM10 = min_latest.get('MAM10', 0)
-        MAM20 = min_latest.get('MAM20', 0)
-        min_close = min_latest.get('C', 0)
-        min_RSI = min_latest.get('RSI', 50)
-        min_STOCHK = min_latest.get('STOCHK', 50)
-        min_STOCHD = min_latest.get('STOCHD', 50)
-        
-        # === 새로운 지표들 ===
-        WILLIAMS_R = tick_latest.get('WILLIAMS_R', -50)
-        ROC = tick_latest.get('ROC', 0)
-        OBV = tick_latest.get('OBV', 0)
-        OBV_MA20 = tick_latest.get('OBV_MA20', 0)
-        VP_POC = tick_latest.get('VP_POC', 0)
-        VP_POSITION = tick_latest.get('VP_POSITION', 0)
-        
-        min_WILLIAMS_R = min_latest.get('WILLIAMS_R', -50)
-        min_ROC = min_latest.get('ROC', 0)
-        min_OBV = min_latest.get('OBV', 0)
-        min_OBV_MA20 = min_latest.get('OBV_MA20', 0)
-        
-        # === 기타 변수 ===
-        strength = self.trader.tickdata.get_strength(code)
-        momentum_score = 0  # ✅ API 호출 제거, 기본값 사용
-        
-        threshold = self.get_threshold_by_hour()
-        
-        volatility_breakout = False
-        if self.volatility_strategy:
-            volatility_breakout = self.volatility_strategy.check_breakout(code)
-        
-        gap_hold = False
-        if hasattr(self.window, 'gap_scanner'):
-            gap_hold = self.window.gap_scanner.check_gap_hold(code)
-        
-        # === ROC 최근 추이 ===
-        tick_recent = self.trader.tickdata.get_recent_data(code, 5)
-        ROC_recent = tick_recent.get('ROC', [0] * 5)
-        
-        # === Volume Profile 돌파 여부 ===
-        volume_profile_breakout = (VP_POSITION > 0)  # 현재가가 POC 위
-        
-        # === 허용된 변수 딕셔너리 ===
-        safe_locals = {
-            # 틱 데이터 - 기본
-            'MAT5': MAT5, 'MAT20': MAT20, 'MAT60': MAT60, 'MAT120': MAT120,
-            'C': C, 'VWAP': VWAP, 'RSIT': RSIT,
-            'MACDT': MACDT, 'OSCT': OSCT,
-            'STOCHK': STOCHK, 'STOCHD': STOCHD,
-            'ATR': ATR, 'BB_POSITION': BB_POSITION, 'BB_BANDWIDTH': BB_BANDWIDTH,
+        if matched:
+            buy_reason = strategy.get('name', '통합 전략')
             
-            # 틱 데이터 - 새 지표
-            'WILLIAMS_R': WILLIAMS_R,
-            'ROC': ROC,
-            'ROC_recent': ROC_recent,
-            'OBV': OBV,
-            'OBV_MA20': OBV_MA20,
-            'VP_POC': VP_POC,
-            'VP_POSITION': VP_POSITION,
-            'volume_profile_breakout': volume_profile_breakout,
+            # 로그용 변수 추출
+            strength = safe_locals.get('strength', 0)
+            momentum_score = safe_locals.get('momentum_score', 0)
+            WILLIAMS_R = safe_locals.get('WILLIAMS_R', -50)
+            ROC = safe_locals.get('ROC', 0)
             
-            # 분봉 데이터 - 기본
-            'MAM5': MAM5, 'MAM10': MAM10, 'MAM20': MAM20,
-            'min_close': min_close, 'min_RSI': min_RSI,
-            'min_STOCHK': min_STOCHK, 'min_STOCHD': min_STOCHD,
-            
-            # 분봉 데이터 - 새 지표
-            'min_WILLIAMS_R': min_WILLIAMS_R,
-            'min_ROC': min_ROC,
-            'min_OBV': min_OBV,
-            'min_OBV_MA20': min_OBV_MA20,
-            
-            # 기타
-            'strength': strength,
-            'momentum_score': momentum_score,
-            'threshold': threshold,
-            'volatility_breakout': volatility_breakout,
-            'gap_hold': gap_hold,
-            'code': code
-        }
-        
-        # === 전략 평가 ===
-        for strategy in buy_strategies:
-            try:
-                condition = strategy.get('content', '')
-                
-                if eval(condition, safe_globals, safe_locals):
-                    buy_reason = strategy.get('name', '통합 전략')
-                    logging.info(
-                        f"{cpCodeMgr.CodeToName(code)}({code}): {buy_reason} 매수 "
-                        f"(체결강도: {strength:.0f}, 점수: {momentum_score}, "
-                        f"Williams %R: {WILLIAMS_R:.1f}, ROC: {ROC:.2f}%)"
-                    )
-                    self.buy_signal.emit(code, buy_reason, "0", "03")
-                    return True
-                    
-            except Exception as ex:
-                logging.error(f"{code} 매수 전략 '{strategy.get('name')}' 오류: {ex}")
+            logging.info(
+                f"{cpCodeMgr.CodeToName(code)}({code}): {buy_reason} 매수 "
+                f"(체결강도: {strength:.0f}, 점수: {momentum_score}, "
+                f"Williams %R: {WILLIAMS_R:.1f}, ROC: {ROC:.2f}%)"
+            )
+            self.buy_signal.emit(code, buy_reason, "0", "03")
+            return True
         
         return False
 
@@ -4566,135 +4485,59 @@ class AutoTraderThread(QThread):
 
     def _evaluate_integrated_sell(self, code, sell_strategies, tick_latest, min_latest,
                               current_profit_pct, from_peak_pct, hold_minutes):
-        """매도 평가 - 새 지표 포함"""
+        """매도 평가 - 공통 함수 사용"""
+        from strategy_utils import (
+            STRATEGY_SAFE_GLOBALS,
+            evaluate_strategies,
+            build_realtime_sell_locals
+        )
         
-        safe_globals = {
-            '__builtins__': {
-                'min': min, 'max': max, 'abs': abs, 'round': round,
-                'int': int, 'float': float, 'bool': bool, 'str': str,
-                'len': len, 'sum': sum, 'all': all, 'any': any,
-                'True': True, 'False': False, 'None': None
-            }
-        }
-        
-        # === 기존 변수들 ===
-        tick_close = tick_latest.get('C', 0)
-        MAT5 = tick_latest.get('MAT5', 0)
-        MAT20 = tick_latest.get('MAT20', 0)
-        RSIT = tick_latest.get('RSIT', 50)
-        OSCT = tick_latest.get('OSCT', 0)
-        STOCHK = tick_latest.get('STOCHK', 50)
-        STOCHD = tick_latest.get('STOCHD', 50)
-        ATR = tick_latest.get('ATR', 0)
-        BB_POSITION = tick_latest.get('BB_POSITION', 0)
-        CCI = tick_latest.get('CCI', 0)
-        
-        min_close = min_latest.get('C', 0)
-        MAM5 = min_latest.get('MAM5', 0)
-        MAM10 = min_latest.get('MAM10', 0)
-        min_RSI = min_latest.get('RSI', 50)
-        min_STOCHK = min_latest.get('STOCHK', 50)
-        min_STOCHD = min_latest.get('STOCHD', 50)
-        min_CCI = min_latest.get('CCI', 0)
-        
-        # === 새로운 지표들 ===
-        WILLIAMS_R = tick_latest.get('WILLIAMS_R', -50)
-        ROC = tick_latest.get('ROC', 0)
-        OBV = tick_latest.get('OBV', 0)
-        OBV_MA20 = tick_latest.get('OBV_MA20', 0)
-        
-        min_WILLIAMS_R = min_latest.get('WILLIAMS_R', -50)
-        min_ROC = min_latest.get('ROC', 0)
-        min_OBV = min_latest.get('OBV', 0)
-        min_OBV_MA20 = min_latest.get('OBV_MA20', 0)
-        
-        # === 파생 지표 ===
-        osct_negative = False
-        tick_recent = self.trader.tickdata.get_recent_data(code, 3)
-        OSCT_recent = tick_recent.get('OSCT', [0, 0, 0])
-        if len(OSCT_recent) >= 2:
-            osct_negative = OSCT_recent[-2] < 0 and OSCT_recent[-1] < 0
-        
-        after_market_close = self.is_after_time(14, 45)
+        # 매수 시간 가져오기
+        buy_time_str = self.trader.starting_time.get(code, '')
         buy_price = self.trader.buy_price.get(code, 0)
         highest_price = self.trader.highest_price.get(code, buy_price)
         
-        # === OBV 다이버전스 감지 ===
-        obv_divergence = (OBV < OBV_MA20 and current_profit_pct > 0)
-        min_obv_divergence = (min_OBV < min_OBV_MA20 and current_profit_pct > 0)
+        # ===== 공통 함수로 변수 구성 =====
+        safe_locals = build_realtime_sell_locals(
+            code=code,
+            tick_latest=tick_latest,
+            min_latest=min_latest,
+            trader=self.trader,
+            buy_price=buy_price,
+            highest_price=highest_price,
+            buy_time_str=buy_time_str,
+            window=self.window
+        )
         
-        # === Williams %R 과매수/과매도 ===
-        williams_overbought = (WILLIAMS_R > -20)  # 과매수
-        williams_oversold = (WILLIAMS_R < -80)    # 과매도
+        # === 전략 평가 (공통 함수 사용) ===
+        matched, strategy = evaluate_strategies(
+            sell_strategies,
+            safe_locals,
+            code=code,
+            strategy_type="매도"
+        )
         
-        # === 허용된 변수 딕셔너리 ===
-        safe_locals = {
-            # 틱 데이터 - 기본
-            'tick_close': tick_close, 'C': tick_close,
-            'MAT5': MAT5, 'MAT20': MAT20,
-            'RSIT': RSIT, 'OSCT': OSCT, 'osct_negative': osct_negative,
-            'STOCHK': STOCHK, 'STOCHD': STOCHD,
-            'ATR': ATR, 'BB_POSITION': BB_POSITION, 'CCI': CCI,
+        if matched:
+            sell_reason = strategy.get('name', '통합 전략')
             
-            # 틱 데이터 - 새 지표
-            'WILLIAMS_R': WILLIAMS_R,
-            'williams_overbought': williams_overbought,
-            'williams_oversold': williams_oversold,
-            'ROC': ROC,
-            'OBV': OBV,
-            'OBV_MA20': OBV_MA20,
-            'obv_divergence': obv_divergence,
+            # 로그용 변수 추출
+            WILLIAMS_R = safe_locals.get('WILLIAMS_R', -50)
+            ROC = safe_locals.get('ROC', 0)
+            current_profit_pct = safe_locals.get('current_profit_pct', 0)
+            hold_minutes = safe_locals.get('hold_minutes', 0)
             
-            # 분봉 데이터 - 기본
-            'min_close': min_close,
-            'MAM5': MAM5, 'MAM10': MAM10,
-            'min_RSI': min_RSI,
-            'min_STOCHK': min_STOCHK, 'min_STOCHD': min_STOCHD,
-            'min_CCI': min_CCI,
+            logging.info(
+                f"{cpCodeMgr.CodeToName(code)}({code}): {sell_reason} "
+                f"({current_profit_pct:+.2f}%, {hold_minutes:.0f}분 보유, "
+                f"Williams %R: {WILLIAMS_R:.1f}, ROC: {ROC:.2f}%)"
+            )
             
-            # 분봉 데이터 - 새 지표
-            'min_WILLIAMS_R': min_WILLIAMS_R,
-            'min_ROC': min_ROC,
-            'min_OBV': min_OBV,
-            'min_OBV_MA20': min_OBV_MA20,
-            'min_obv_divergence': min_obv_divergence,
+            if '분할' in sell_reason:
+                self.sell_half_signal.emit(code, sell_reason)
+            else:
+                self.sell_signal.emit(code, sell_reason)
             
-            # 수익률 정보
-            'current_profit_pct': current_profit_pct,
-            'from_peak_pct': from_peak_pct,
-            'hold_minutes': hold_minutes,
-            'buy_price': buy_price,
-            'highest_price': highest_price,
-            
-            # 기타
-            'after_market_close': after_market_close,
-            'code': code,
-            'self': self
-        }
-        
-        # === 전략 평가 ===
-        for strategy in sell_strategies:
-            try:
-                condition = strategy.get('content', '')
-                
-                if eval(condition, safe_globals, safe_locals):
-                    sell_reason = strategy.get('name', '통합 전략')
-                    
-                    logging.info(
-                        f"{cpCodeMgr.CodeToName(code)}({code}): {sell_reason} "
-                        f"({current_profit_pct:+.2f}%, {hold_minutes:.0f}분 보유, "
-                        f"Williams %R: {WILLIAMS_R:.1f}, ROC: {ROC:.2f}%)"
-                    )
-                    
-                    if '분할' in sell_reason:
-                        self.sell_half_signal.emit(code, sell_reason)
-                    else:
-                        self.sell_signal.emit(code, sell_reason)
-                    
-                    return True
-                    
-            except Exception as ex:
-                logging.error(f"{code} 매도 전략 '{strategy.get('name')}' 오류: {ex}")
+            return True
         
         return False
 
@@ -5016,7 +4859,8 @@ class ChartDrawer(QObject):
 class LoginHandler:
     def __init__(self, parent_window):
         self.parent = parent_window
-        self.config = configparser.ConfigParser(interpolation=None)
+        # ✅ RawConfigParser 사용 (% 문자 이슈 완전 해결)
+        self.config = configparser.RawConfigParser()
         self.config_file = 'settings.ini'
         self.process = None
         self.slack = None
@@ -6140,6 +5984,18 @@ class MyWindow(QWidget):
             for stgname in existing_stgnames:
                 self.comboStg.addItem(stgname)
             
+            # ===== 5-1. 백테스팅 탭 전략 콤보박스에도 추가 =====
+            if hasattr(self, 'bt_strategy_combo'):
+                self.bt_strategy_combo.clear()
+                for stgname in existing_stgnames:
+                    self.bt_strategy_combo.addItem(stgname)
+                
+                # 기본값: 통합 전략
+                index = self.bt_strategy_combo.findText("통합 전략")
+                if index != -1:
+                    self.bt_strategy_combo.setCurrentIndex(index)
+                logging.info(f"✅ 백테스팅 전략 콤보박스 초기화 완료 ({len(existing_stgnames)}개)")
+            
             # ===== 6. 마지막 선택 전략 복원 =====
             last_strategy = self.login_handler.config.get('SETTINGS', 'last_strategy', fallback='통합 전략')
             index = self.comboStg.findText(last_strategy)
@@ -6719,7 +6575,38 @@ class MyWindow(QWidget):
                         logging.warning(f"전략 '{stgName}'을 조건검색 리스트에서 찾을 수 없음")
                 else:
                     logging.info(f"조건검색 리스트 로드 대기 중... ({stgName})")
-                    # 조건검색 리스트가 로드될 때까지 대기하지 않고 기본 처리만 수행
+                    # 조건검색 리스트가 없으면 로드 시도
+                    logging.info("📋 조건검색 리스트 로드 시도...")
+                    try:
+                        # API 제한 확인
+                        remain_time = cpStatus.GetLimitRemainTime(0)
+                        if remain_time > 0:
+                            wait_sec = remain_time / 1000 + 0.1
+                            logging.debug(f"API 제한: {wait_sec:.1f}초 대기")
+                            time.sleep(wait_sec)
+                        
+                        # 조건검색 리스트 로드
+                        self.data8537 = self.objstg.requestList()
+                        self._condition_list_loaded = True
+                        logging.info("✅ 조건검색 리스트 로드 완료")
+                        
+                        # 로드 후 다시 확인하여 조건검색 시작
+                        if hasattr(self, 'data8537') and self.data8537:
+                            item = self.data8537.get(stgName)
+                            if item:
+                                id = item['ID']
+                                name = item['전략명']
+                                strategy_type = self.get_strategy_type(name)
+                                
+                                if strategy_type == 'static':
+                                    self._load_static_strategy(id, name)
+                                
+                                time.sleep(0.5)
+                                self._start_condition_search(stgName)
+                            else:
+                                logging.warning(f"전략 '{stgName}'을 조건검색 리스트에서 찾을 수 없음")
+                    except Exception as ex:
+                        logging.error(f"조건검색 리스트 로드 실패: {ex}")
             
             logging.info(f"{stgName} 전략 감시 시작")
             
@@ -7575,6 +7462,12 @@ class MyWindow(QWidget):
         self.bt_end_date.setFixedWidth(150)
         settings_layout.addWidget(self.bt_end_date, 0, 3)
         
+        # DB 기간 불러오기 버튼
+        self.bt_load_period_button = QPushButton("DB 기간 불러오기")
+        self.bt_load_period_button.setFixedWidth(130)
+        self.bt_load_period_button.clicked.connect(self.load_db_period)
+        settings_layout.addWidget(self.bt_load_period_button, 0, 4)
+        
         # 초기 자금
         settings_layout.addWidget(QLabel("초기 자금:"), 1, 0)
         self.bt_initial_cash = QLineEdit("10000000")
@@ -7596,8 +7489,12 @@ class MyWindow(QWidget):
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
         
-        # ===== 결과 영역 =====
-        results_splitter = QSplitter(Qt.Horizontal)
+        # ===== 결과 영역 (탭 구조) =====
+        results_tab_widget = QTabWidget()
+        
+        # 탭 1: 전체 결과
+        overall_tab = QWidget()
+        overall_layout = QHBoxLayout()
         
         # 왼쪽: 결과 요약
         left_widget = QWidget()
@@ -7610,7 +7507,6 @@ class MyWindow(QWidget):
         left_layout.addWidget(self.bt_results_text)
         
         left_widget.setLayout(left_layout)
-        results_splitter.addWidget(left_widget)
         
         # 오른쪽: 차트
         right_widget = QWidget()
@@ -7621,14 +7517,56 @@ class MyWindow(QWidget):
         right_layout.addWidget(self.bt_canvas)
         
         right_widget.setLayout(right_layout)
-        results_splitter.addWidget(right_widget)
         
-        results_splitter.setStretchFactor(0, 1)
-        results_splitter.setStretchFactor(1, 2)
+        overall_layout.addWidget(left_widget, 1)
+        overall_layout.addWidget(right_widget, 2)
+        overall_tab.setLayout(overall_layout)
         
-        layout.addWidget(results_splitter)
+        # 탭 2: 일별 성과
+        daily_tab = QWidget()
+        daily_layout = QHBoxLayout()
+        
+        # 왼쪽: 일별 성과 테이블
+        daily_left_widget = QWidget()
+        daily_left_layout = QVBoxLayout()
+        
+        daily_left_layout.addWidget(QLabel("일별 성과 내역:"))
+        self.bt_daily_table = QTableWidget()
+        self.bt_daily_table.setColumnCount(8)
+        self.bt_daily_table.setHorizontalHeaderLabels([
+            "날짜", "일손익", "수익률(%)", "거래수", "승", "패", "누적손익", "포트폴리오"
+        ])
+        self.bt_daily_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.bt_daily_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.bt_daily_table.setMaximumWidth(600)
+        daily_left_layout.addWidget(self.bt_daily_table)
+        
+        daily_left_widget.setLayout(daily_left_layout)
+        
+        # 오른쪽: 일별 차트
+        daily_right_widget = QWidget()
+        daily_right_layout = QVBoxLayout()
+        
+        self.bt_daily_fig = Figure(figsize=(10, 8))
+        self.bt_daily_canvas = FigureCanvas(self.bt_daily_fig)
+        daily_right_layout.addWidget(self.bt_daily_canvas)
+        
+        daily_right_widget.setLayout(daily_right_layout)
+        
+        daily_layout.addWidget(daily_left_widget, 1)
+        daily_layout.addWidget(daily_right_widget, 2)
+        daily_tab.setLayout(daily_layout)
+        
+        # 탭 추가
+        results_tab_widget.addTab(overall_tab, "전체 성과")
+        results_tab_widget.addTab(daily_tab, "일별 성과")
+        
+        layout.addWidget(results_tab_widget)
         
         self.backtest_tab.setLayout(layout)
+        
+        # 초기화 시 DB 기간 자동 로드
+        QTimer.singleShot(100, self.load_db_period)
 
     def run_backtest(self):
         """백테스팅 실행"""
@@ -7645,9 +7583,23 @@ class MyWindow(QWidget):
                 QMessageBox.warning(self, "입력 오류", "날짜 형식: YYYYMMDD (예: 20250101)")
                 return
             
+            # 전략 콤보박스가 비어있으면 전략 로드 시도
+            if self.bt_strategy_combo.count() == 0:
+                self.load_strategies_for_backtest()
+                if self.bt_strategy_combo.count() == 0:
+                    QMessageBox.warning(self, "오류", "전략을 불러올 수 없습니다.\nsettings.ini 파일을 확인해주세요.")
+                    return
+            
+            # DB 파일 경로 확인
             if not hasattr(self, 'trader'):
-                QMessageBox.warning(self, "오류", "먼저 로그인해주세요.")
-                return
+                # 로그인하지 않은 경우 기본 DB 경로 사용
+                import os
+                db_path = 'vi_stock_data.db'
+                if not os.path.exists(db_path):
+                    QMessageBox.warning(self, "오류", f"데이터베이스 파일을 찾을 수 없습니다.\n경로: {db_path}")
+                    return
+            else:
+                db_path = self.trader.db_name
             
             self.bt_results_text.clear()
             self.bt_results_text.append(f"백테스팅 시작: {start_date} ~ {end_date}")
@@ -7658,8 +7610,8 @@ class MyWindow(QWidget):
             
             # 백테스팅 실행 (settings.ini 포함)
             bt = Backtester(
-                db_path=self.trader.db_name,
-                config_file=self.login_handler.config_file,
+                db_path=db_path,
+                config_file='settings.ini',
                 initial_cash=initial_cash
             )
             
@@ -7703,9 +7655,17 @@ MDD (최대 낙폭): {results['mdd']:.2f}%
             
             self.bt_results_text.setPlainText(result_text)
             
-            # 차트 그리기
+            # 전체 성과 차트 그리기
             bt.plot_results(self.bt_fig)
             self.bt_canvas.draw()
+            
+            # 일별 성과 테이블 업데이트
+            self.update_daily_results_table(results.get('daily_results', []))
+            
+            # 일별 성과 차트 그리기
+            if len(results.get('daily_results', [])) > 0:
+                bt.plot_daily_results(self.bt_daily_fig)
+                self.bt_daily_canvas.draw()
             
             QMessageBox.information(self, "완료", "백테스팅이 완료되었습니다!")
             
@@ -7714,6 +7674,166 @@ MDD (최대 낙폭): {results['mdd']:.2f}%
         except Exception as ex:
             logging.error(f"run_backtest -> {ex}\n{traceback.format_exc()}")
             QMessageBox.critical(self, "오류", f"백테스팅 실패:\n{str(ex)}")
+    
+    def update_daily_results_table(self, daily_results):
+        """일별 성과 테이블 업데이트"""
+        try:
+            self.bt_daily_table.setRowCount(0)
+            
+            if not daily_results:
+                return
+            
+            self.bt_daily_table.setRowCount(len(daily_results))
+            
+            for row_idx, daily in enumerate(daily_results):
+                # 날짜 (YYYYMMDD -> YYYY-MM-DD)
+                date_str = daily['date']
+                formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+                self.bt_daily_table.setItem(row_idx, 0, QTableWidgetItem(formatted_date))
+                
+                # 일손익
+                daily_profit = daily['daily_profit']
+                profit_item = QTableWidgetItem(f"{daily_profit:,.0f}")
+                profit_item.setForeground(QColor('green') if daily_profit > 0 else QColor('red'))
+                profit_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.bt_daily_table.setItem(row_idx, 1, profit_item)
+                
+                # 수익률
+                daily_return = daily['daily_return_pct']
+                return_item = QTableWidgetItem(f"{daily_return:.2f}")
+                return_item.setForeground(QColor('green') if daily_return > 0 else QColor('red'))
+                return_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.bt_daily_table.setItem(row_idx, 2, return_item)
+                
+                # 거래수
+                trades_item = QTableWidgetItem(f"{daily['total_trades']}")
+                trades_item.setTextAlignment(Qt.AlignCenter)
+                self.bt_daily_table.setItem(row_idx, 3, trades_item)
+                
+                # 승
+                win_item = QTableWidgetItem(f"{daily['win_trades']}")
+                win_item.setTextAlignment(Qt.AlignCenter)
+                self.bt_daily_table.setItem(row_idx, 4, win_item)
+                
+                # 패
+                lose_item = QTableWidgetItem(f"{daily['lose_trades']}")
+                lose_item.setTextAlignment(Qt.AlignCenter)
+                self.bt_daily_table.setItem(row_idx, 5, lose_item)
+                
+                # 누적손익
+                cumulative = daily['cumulative_profit']
+                cumulative_item = QTableWidgetItem(f"{cumulative:,.0f}")
+                cumulative_item.setForeground(QColor('blue'))
+                cumulative_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.bt_daily_table.setItem(row_idx, 6, cumulative_item)
+                
+                # 포트폴리오 가치
+                portfolio_item = QTableWidgetItem(f"{daily['portfolio_value']:,.0f}")
+                portfolio_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.bt_daily_table.setItem(row_idx, 7, portfolio_item)
+            
+            logging.info(f"일별 성과 테이블 업데이트 완료: {len(daily_results)}건")
+            
+        except Exception as ex:
+            logging.error(f"update_daily_results_table -> {ex}\n{traceback.format_exc()}")
+    
+    def load_strategies_for_backtest(self):
+        """백테스팅용 전략 로드 (로그인 없이도 가능)"""
+        try:
+            import configparser
+            import os
+            
+            # ✅ RawConfigParser 사용 (% 문자 이슈 완전 해결)
+            config = configparser.RawConfigParser()
+            if not os.path.exists('settings.ini'):
+                logging.warning("settings.ini 파일이 없습니다.")
+                return
+            
+            config.read('settings.ini', encoding='utf-8')
+            
+            # STRATEGIES 섹션에서 전략 목록 읽기
+            if config.has_section('STRATEGIES'):
+                strategy_keys = sorted(config['STRATEGIES'].keys())
+                existing_stgnames = []
+                seen = set()
+                for key in strategy_keys:
+                    stg_value = config['STRATEGIES'][key]
+                    if stg_value not in seen:
+                        existing_stgnames.append(stg_value)
+                        seen.add(stg_value)
+            else:
+                existing_stgnames = []
+            
+            # 백테스팅 콤보박스에 추가
+            self.bt_strategy_combo.clear()
+            for stgname in existing_stgnames:
+                self.bt_strategy_combo.addItem(stgname)
+            
+            # 기본값: 통합 전략
+            index = self.bt_strategy_combo.findText("통합 전략")
+            if index != -1:
+                self.bt_strategy_combo.setCurrentIndex(index)
+            
+            logging.info(f"✅ 백테스팅 전략 로드 완료: {len(existing_stgnames)}개")
+            
+        except Exception as ex:
+            logging.error(f"load_strategies_for_backtest -> {ex}\n{traceback.format_exc()}")
+    
+    def load_db_period(self):
+        """DB에서 사용 가능한 데이터 기간 조회 및 자동 입력"""
+        try:
+            import sqlite3
+            import os
+            
+            # DB 파일 경로 확인
+            if hasattr(self, 'trader') and hasattr(self.trader, 'db_name'):
+                db_path = self.trader.db_name
+            else:
+                db_path = 'vi_stock_data.db'
+            
+            if not os.path.exists(db_path):
+                logging.debug(f"DB 파일 없음: {db_path}")
+                return
+            
+            # DB 연결 및 기간 조회
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            
+            # combined_tick_data 테이블에서 최소/최대 날짜 조회
+            cursor.execute('''
+                SELECT MIN(date), MAX(date)
+                FROM combined_tick_data
+                WHERE date IS NOT NULL AND date != ''
+            ''')
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result and result[0] and result[1]:
+                start_date = result[0]
+                end_date = result[1]
+                
+                # 입력 필드에 자동 입력
+                self.bt_start_date.setText(start_date)
+                self.bt_end_date.setText(end_date)
+                
+                logging.info(f"✅ DB 기간 로드 완료: {start_date} ~ {end_date}")
+                
+                # 상태 메시지 표시 (선택사항)
+                if hasattr(self, 'bt_results_text'):
+                    self.bt_results_text.clear()
+                    self.bt_results_text.append(f"📅 DB 데이터 기간: {start_date} ~ {end_date}")
+                    self.bt_results_text.append(f"\n백테스팅 기간이 자동으로 설정되었습니다.")
+            else:
+                logging.warning("DB에 데이터가 없습니다.")
+                if hasattr(self, 'bt_results_text'):
+                    self.bt_results_text.clear()
+                    self.bt_results_text.append("⚠️ DB에 데이터가 없습니다.")
+            
+        except sqlite3.Error as ex:
+            logging.error(f"load_db_period (DB 오류) -> {ex}")
+        except Exception as ex:
+            logging.error(f"load_db_period -> {ex}\n{traceback.format_exc()}")
 
 # ==================== QTextEditLogger ====================
 class QTextEditLogger(QObject, logging.Handler):

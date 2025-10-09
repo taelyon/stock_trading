@@ -27,7 +27,8 @@ class Backtester:
         self.initial_cash = initial_cash
         
         # settings.ini 로드
-        self.config = configparser.ConfigParser()
+        # ✅ RawConfigParser 사용 (% 문자 이슈 완전 해결)
+        self.config = configparser.RawConfigParser()
         if config_file:
             try:
                 self.config.read(config_file, encoding='utf-8')
@@ -49,6 +50,11 @@ class Backtester:
         # 거래 기록
         self.trades = []
         self.equity_curve = []
+        
+        # 일별 성과 추적
+        self.daily_results = []
+        self.daily_trades_count = {}
+        self.daily_profit = {}
         
         # 전략 설정
         self.strategy_params = {}
@@ -258,6 +264,14 @@ class Backtester:
             'reason': reason
         })
         
+        # 일별 손익 누적
+        date_str = timestamp.strftime('%Y%m%d')
+        if date_str not in self.daily_profit:
+            self.daily_profit[date_str] = 0
+            self.daily_trades_count[date_str] = 0
+        self.daily_profit[date_str] += profit
+        self.daily_trades_count[date_str] += 1
+        
         logging.debug(f"{timestamp}: {code} 매도 {qty}주 @{price:,.0f}원 ({profit_pct:+.2f}%) - {reason}")
     
     def calculate_portfolio_value(self, current_prices):
@@ -284,6 +298,13 @@ class Backtester:
         self.highest_prices = {}
         self.trades = []
         self.equity_curve = []
+        
+        # 일별 성과 초기화
+        self.daily_results = []
+        self.daily_trades_count = {}
+        self.daily_profit = {}
+        self.current_date = None
+        self.daily_start_cash = self.initial_cash
         
         # ===== 전략 로드 =====
         self.current_strategy_name = strategy_name
@@ -339,6 +360,24 @@ class Backtester:
             if processed % 10000 == 0:
                 logging.info(f"처리 중: {processed}/{len(all_events)} ({processed/len(all_events)*100:.1f}%)")
             
+            # 날짜가 바뀌면 전일 성과 계산
+            current_date_str = timestamp.strftime('%Y%m%d')
+            if self.current_date and self.current_date != current_date_str:
+                # 모든 보유 종목의 현재가 업데이트
+                prev_date_prices = {}
+                for held_code in self.holdings.keys():
+                    if held_code in all_data:
+                        code_data = all_data[held_code]
+                        recent = code_data[code_data['timestamp'] < timestamp]
+                        if len(recent) > 0:
+                            prev_date_prices[held_code] = recent.iloc[-1]['tick_C']
+                
+                # 전일 종료 시점 일별 성과 저장
+                self.save_daily_result(self.current_date, prev_date_prices, strategy_name)
+                self.daily_start_cash = self.cash
+            
+            self.current_date = current_date_str
+            
             current_price = row['tick_C']
             
             # 현재 가격 정보
@@ -381,16 +420,28 @@ class Backtester:
         
         # 최종 청산
         final_timestamp = all_events[-1][0] if all_events else pd.Timestamp.now()
+        
+        # 최종 가격 수집
+        final_prices = {}
         for code in list(self.holdings.keys()):
             code_data = all_data[code]
             final_price = code_data.iloc[-1]['tick_C']
+            final_prices[code] = final_price
             self.execute_sell(code, final_price, final_timestamp, "백테스팅 종료")
+        
+        # 마지막 날 성과 저장
+        if self.current_date:
+            self.save_daily_result(self.current_date, final_prices, strategy_name)
         
         # 결과 계산
         results = self.calculate_results(strategy_name, start_date, end_date)
         
+        # 일별 성과 추가
+        results['daily_results'] = self.daily_results
+        
         # DB에 저장
         self.save_results(results)
+        self.save_daily_results_to_db(strategy_name)
         
         logging.info("=== 백테스팅 완료 ===")
         
@@ -398,6 +449,28 @@ class Backtester:
        
     def calculate_results(self, strategy_name, start_date, end_date):
         """결과 계산"""
+        
+        # ✅ 거래 내역이 없을 때 처리
+        if len(self.trades) == 0:
+            return {
+                'strategy': strategy_name,
+                'start_date': start_date,
+                'end_date': end_date,
+                'initial_cash': self.initial_cash,
+                'final_cash': self.cash,
+                'total_profit': 0,
+                'total_return_pct': 0,
+                'total_trades': 0,
+                'win_trades': 0,
+                'lose_trades': 0,
+                'win_rate': 0,
+                'avg_profit_pct': 0,
+                'max_profit_pct': 0,
+                'max_loss_pct': 0,
+                'mdd': 0,
+                'sharpe_ratio': 0,
+                'avg_hold_minutes': 0
+            }
         
         df_trades = pd.DataFrame(self.trades)
         sell_trades = df_trades[df_trades['action'] == 'SELL']
@@ -471,6 +544,85 @@ class Backtester:
             'avg_hold_minutes': avg_hold_minutes
         }
     
+    def save_daily_result(self, date_str, current_prices, strategy_name):
+        """일별 성과 저장"""
+        try:
+            # 포트폴리오 가치 계산
+            portfolio_value = self.calculate_portfolio_value(current_prices)
+            
+            # 일별 손익
+            daily_profit = self.daily_profit.get(date_str, 0)
+            daily_trades = self.daily_trades_count.get(date_str, 0)
+            
+            # 일일 수익률 계산
+            daily_return_pct = ((portfolio_value - self.daily_start_cash) / self.daily_start_cash * 100) if self.daily_start_cash > 0 else 0
+            
+            # 일별 승/패 계산
+            df_trades = pd.DataFrame(self.trades)
+            if len(df_trades) > 0:
+                daily_sell_trades = df_trades[
+                    (df_trades['action'] == 'SELL') & 
+                    (df_trades['timestamp'].dt.strftime('%Y%m%d') == date_str)
+                ]
+                win_trades = len(daily_sell_trades[daily_sell_trades['profit'] > 0])
+                lose_trades = len(daily_sell_trades[daily_sell_trades['profit'] <= 0])
+            else:
+                win_trades = 0
+                lose_trades = 0
+            
+            daily_result = {
+                'date': date_str,
+                'strategy': strategy_name,
+                'portfolio_value': portfolio_value,
+                'cash': self.cash,
+                'holdings_value': portfolio_value - self.cash,
+                'daily_profit': daily_profit,
+                'daily_return_pct': daily_return_pct,
+                'total_trades': daily_trades,
+                'win_trades': win_trades,
+                'lose_trades': lose_trades,
+                'cumulative_profit': portfolio_value - self.initial_cash
+            }
+            
+            self.daily_results.append(daily_result)
+            logging.debug(f"{date_str}: 일별 성과 저장 (수익: {daily_profit:,.0f}원, 수익률: {daily_return_pct:.2f}%)")
+            
+        except Exception as ex:
+            logging.error(f"save_daily_result({date_str}) -> {ex}")
+    
+    def save_daily_results_to_db(self, strategy_name):
+        """일별 성과 DB 저장"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            for daily in self.daily_results:
+                cursor.execute('''
+                    INSERT OR REPLACE INTO daily_summary (
+                        date, strategy, total_trades, win_trades, lose_trades,
+                        total_profit, total_return_pct, portfolio_value, cash, holdings_value
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    daily['date'],
+                    daily['strategy'],
+                    daily['total_trades'],
+                    daily['win_trades'],
+                    daily['lose_trades'],
+                    daily['daily_profit'],
+                    daily['daily_return_pct'],
+                    daily['portfolio_value'],
+                    daily['cash'],
+                    daily['holdings_value']
+                ))
+            
+            conn.commit()
+            conn.close()
+            
+            logging.info(f"일별 성과 {len(self.daily_results)}건 DB 저장 완료")
+            
+        except Exception as ex:
+            logging.error(f"save_daily_results_to_db -> {ex}")
+    
     def save_results(self, results):
         """결과 DB 저장"""
         
@@ -521,7 +673,8 @@ class Backtester:
         # 1. 수익률 곡선
         if len(self.equity_curve) > 0:
             equity_df = pd.DataFrame(self.equity_curve)
-            ax1.plot(equity_df['timestamp'], equity_df['value'], label='포트폴리오 가치', linewidth=2)
+            # numpy 배열로 변환하여 플롯
+            ax1.plot(equity_df['timestamp'].values, equity_df['value'].values, label='포트폴리오 가치', linewidth=2)
             ax1.axhline(y=self.initial_cash, color='r', linestyle='--', label='초기 자금', alpha=0.5)
             ax1.set_title('포트폴리오 가치 변화', fontsize=12, fontweight='bold')
             ax1.set_ylabel('가치 (원)')
@@ -533,19 +686,23 @@ class Backtester:
         if len(self.equity_curve) > 0:
             equity_df['peak'] = equity_df['value'].cummax()
             equity_df['drawdown'] = (equity_df['value'] - equity_df['peak']) / equity_df['peak'] * 100
-            ax2.fill_between(equity_df['timestamp'], 0, equity_df['drawdown'], color='red', alpha=0.3)
-            ax2.plot(equity_df['timestamp'], equity_df['drawdown'], color='red', linewidth=1)
+            # numpy 배열로 변환
+            ax2.fill_between(equity_df['timestamp'].values, 0, equity_df['drawdown'].values, color='red', alpha=0.3)
+            ax2.plot(equity_df['timestamp'].values, equity_df['drawdown'].values, color='red', linewidth=1)
             ax2.set_title('Drawdown', fontsize=12, fontweight='bold')
             ax2.set_ylabel('Drawdown (%)')
             ax2.grid(True, alpha=0.3)
         
         # 3. 거래별 손익
-        df_trades = pd.DataFrame(self.trades)
-        sell_trades = df_trades[df_trades['action'] == 'SELL']
+        if len(self.trades) > 0:
+            df_trades = pd.DataFrame(self.trades)
+            sell_trades = df_trades[df_trades['action'] == 'SELL']
+        else:
+            sell_trades = pd.DataFrame()
         
         if len(sell_trades) > 0:
-            colors = ['green' if p > 0 else 'red' for p in sell_trades['profit_pct']]
-            ax3.bar(range(len(sell_trades)), sell_trades['profit_pct'], color=colors, alpha=0.6)
+            colors = ['green' if p > 0 else 'red' for p in sell_trades['profit_pct'].values]
+            ax3.bar(range(len(sell_trades)), sell_trades['profit_pct'].values, color=colors, alpha=0.6)
             ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
             ax3.set_title('거래별 수익률', fontsize=12, fontweight='bold')
             ax3.set_ylabel('수익률 (%)')
@@ -554,7 +711,7 @@ class Backtester:
         
         # 4. 누적 손익
         if len(sell_trades) > 0:
-            cumulative_profit = sell_trades['profit'].cumsum()
+            cumulative_profit = sell_trades['profit'].cumsum().values
             ax4.plot(range(len(cumulative_profit)), cumulative_profit, color='blue', linewidth=2)
             ax4.axhline(y=0, color='black', linestyle='--', linewidth=0.5)
             ax4.fill_between(range(len(cumulative_profit)), 0, cumulative_profit, 
@@ -566,6 +723,82 @@ class Backtester:
             ax4.set_xlabel('거래 번호')
             ax4.grid(True, alpha=0.3)
             ax4.ticklabel_format(style='plain', axis='y')
+        
+        fig.tight_layout()
+        
+        return fig
+    
+    def plot_daily_results(self, fig=None):
+        """일별 성과 시각화"""
+        
+        if len(self.daily_results) == 0:
+            logging.warning("일별 성과 데이터가 없습니다.")
+            # 빈 차트 표시
+            if fig is not None:
+                fig.clear()
+                ax = fig.add_subplot(1, 1, 1)
+                ax.text(0.5, 0.5, '일별 데이터가 없습니다.', 
+                       ha='center', va='center', fontsize=14)
+                ax.axis('off')
+                fig.tight_layout()
+            return fig
+        
+        if fig is None:
+            fig = plt.figure(figsize=(14, 10))
+        else:
+            fig.clear()
+        
+        df_daily = pd.DataFrame(self.daily_results)
+        df_daily['date'] = pd.to_datetime(df_daily['date'], format='%Y%m%d')
+        
+        # 4개 차트
+        ax1 = fig.add_subplot(4, 1, 1)
+        ax2 = fig.add_subplot(4, 1, 2)
+        ax3 = fig.add_subplot(4, 1, 3)
+        ax4 = fig.add_subplot(4, 1, 4)
+        
+        # 1. 일별 수익/손실
+        colors = ['green' if p > 0 else 'red' for p in df_daily['daily_profit'].values]
+        ax1.bar(df_daily['date'].values, df_daily['daily_profit'].values, color=colors, alpha=0.6, width=0.8)
+        ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax1.set_title('일별 손익', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('손익 (원)')
+        ax1.grid(True, alpha=0.3)
+        ax1.ticklabel_format(style='plain', axis='y')
+        
+        # 2. 일별 수익률
+        colors = ['green' if p > 0 else 'red' for p in df_daily['daily_return_pct'].values]
+        ax2.bar(df_daily['date'].values, df_daily['daily_return_pct'].values, color=colors, alpha=0.6, width=0.8)
+        ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax2.set_title('일별 수익률', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('수익률 (%)')
+        ax2.grid(True, alpha=0.3)
+        
+        # 3. 누적 수익
+        ax3.plot(df_daily['date'].values, df_daily['cumulative_profit'].values, color='blue', linewidth=2, marker='o', markersize=4)
+        ax3.axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+        cumulative_vals = df_daily['cumulative_profit'].values
+        ax3.fill_between(df_daily['date'].values, 0, cumulative_vals, 
+                        where=(cumulative_vals >= 0), color='green', alpha=0.3)
+        ax3.fill_between(df_daily['date'].values, 0, cumulative_vals, 
+                        where=(cumulative_vals < 0), color='red', alpha=0.3)
+        ax3.set_title('누적 손익', fontsize=12, fontweight='bold')
+        ax3.set_ylabel('누적 손익 (원)')
+        ax3.grid(True, alpha=0.3)
+        ax3.ticklabel_format(style='plain', axis='y')
+        
+        # 4. 일별 거래 횟수
+        ax4.bar(df_daily['date'].values, df_daily['total_trades'].values, color='steelblue', alpha=0.6, width=0.8)
+        ax4.set_title('일별 거래 횟수', fontsize=12, fontweight='bold')
+        ax4.set_ylabel('거래 횟수')
+        ax4.set_xlabel('날짜')
+        ax4.grid(True, alpha=0.3)
+        
+        # x축 날짜 포맷 설정
+        import matplotlib.dates as mdates
+        for ax in [ax1, ax2, ax3, ax4]:
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%m/%d'))
+            ax.tick_params(axis='x', rotation=45)
         
         fig.tight_layout()
         
