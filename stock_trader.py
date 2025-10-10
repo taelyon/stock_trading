@@ -903,16 +903,16 @@ class CpStrategy:
             stock_name = cpCodeMgr.CodeToName(code)
             
             logging.info(f"{'='*50}")
-            logging.info(f"📋 {stock_name}({code}) 처리 시작 - 전략: {stgname}")
+            logging.info(f"🔍 [{stgname}] {stock_name}({code}) 검증 시작 - 가격: {stgprice:,}원")
             logging.info(f"{'='*50}")
             
             # 중복 확인
             if code in self.trader.monistock_set:
-                logging.info(f"{stock_name}({code}): 이미 모니터링 중, 스킵")
+                logging.info(f"⚠️ [{stgname}] {stock_name}({code}): 이미 모니터링 중, 스킵")
                 return True
             
             if code in self.trader.bought_set:
-                logging.info(f"{stock_name}({code}): 이미 보유 중, 스킵")
+                logging.info(f"⚠️ [{stgname}] {stock_name}({code}): 이미 보유 중, 스킵")
                 return True
             
             # ===== ✅ 대신증권 API 제한만 확인 =====
@@ -931,11 +931,26 @@ class CpStrategy:
             
             # 전략별 처리
             if stgname == '급등주':
-                return self._process_momentum_stock(code, stgprice, time_str)
+                result = self._process_momentum_stock(code, stgprice, time_str)
+                if result:
+                    logging.info(f"✅ [{stgname}] {stock_name}({code}): 검증 완료 → 투자대상 추가")
+                else:
+                    logging.info(f"❌ [{stgname}] {stock_name}({code}): 검증 실패 → 제외")
+                return result
             elif stgname == '갭상승':
-                return self._process_gap_stock(code, stgprice, time_str)
+                result = self._process_gap_stock(code, stgprice, time_str)
+                if result:
+                    logging.info(f"✅ [{stgname}] {stock_name}({code}): 검증 완료 → 투자대상 추가")
+                else:
+                    logging.info(f"❌ [{stgname}] {stock_name}({code}): 검증 실패 → 제외")
+                return result
             else:
-                return self._process_other_stock(code, stgprice, time_str)
+                result = self._process_other_stock(code, stgprice, time_str)
+                if result:
+                    logging.info(f"✅ [{stgname}] {stock_name}({code}): 검증 완료 → 투자대상 추가")
+                else:
+                    logging.info(f"❌ [{stgname}] {stock_name}({code}): 검증 실패 → 제외")
+                return result
                 
         except Exception as ex:
             logging.error(f"_process_single_stock({code}): {ex}\n{traceback.format_exc()}")
@@ -947,8 +962,8 @@ class CpStrategy:
             stock_name = cpCodeMgr.CodeToName(code)
             
             if not self.momentum_scanner:
-                logging.warning("MomentumScanner가 초기화되지 않음")
-                return
+                logging.warning(f"❌ [{stock_name}] MomentumScanner가 초기화되지 않음")
+                return False
             
             # 급등주 조건 재확인 (타임아웃 10초)
             try:
@@ -958,22 +973,22 @@ class CpStrategy:
                     timeout=10.0
                 )
             except Exception as ex:
-                logging.error(f"{stock_name}({code}): 검증 중 오류: {ex}")
-                return
+                logging.error(f"❌ [급등주] {stock_name}({code}): 검증 중 오류: {ex}")
+                return False
             
             if not is_valid:
-                logging.debug(f"{stock_name}({code}): 급등주 재검증 실패 - {message}")
-                return
+                logging.info(f"❌ [급등주] {stock_name}({code}): 재검증 실패 - {message}")
+                return False
             
             logging.info(
-                f"{stock_name}({code}) -> 급등주 조건검색 편입 "
-                f"(검증: {message})"
+                f"✅ [급등주] {stock_name}({code}) → 재검증 통과 "
+                f"({message})"
             )
             
             # 일봉 데이터 로드
             if not self.trader.daydata.select_code(code):
-                logging.warning(f"{stock_name}({code}): 일봉 로드 실패")
-                return
+                logging.warning(f"❌ [급등주] {stock_name}({code}): 일봉 로드 실패")
+                return False
             
             # 틱/분 데이터 로드 (타임아웃 30초)
             try:
@@ -988,14 +1003,14 @@ class CpStrategy:
                     timeout=30.0
                 )
             except Exception as ex:
-                logging.error(f"{stock_name}({code}): 데이터 로드 중 오류: {ex}")
+                logging.error(f"❌ [급등주] {stock_name}({code}): 데이터 로드 중 오류: {ex}")
                 self.trader.daydata.monitor_stop(code)
-                return
+                return False
             
             if not (tick_ok and min_ok):
-                logging.warning(f"{stock_name}({code}): 틱/분 로드 실패")
+                logging.warning(f"❌ [급등주] {stock_name}({code}): 틱/분 로드 실패")
                 self.trader.daydata.monitor_stop(code)
-                return
+                return False
             
             # 체결강도 확인
             time.sleep(0.5)
@@ -1004,25 +1019,28 @@ class CpStrategy:
             if strength >= 120:
                 # 투자대상 추가
                 self._add_to_monitoring(code, stgprice, time_str, f"급등주 (점수: {score}, 체결강도: {strength:.0f})")
+                return True
             else:
-                logging.debug(f"{stock_name}({code}): 체결강도 부족 ({strength:.0f})")
+                logging.info(f"❌ [급등주] {stock_name}({code}): 체결강도 부족 ({strength:.0f} < 120)")
                 self.trader.daydata.monitor_stop(code)
                 self.trader.tickdata.monitor_stop(code)
                 self.trader.mindata.monitor_stop(code)
+                return False
                 
         except Exception as ex:
-            logging.error(f"_process_momentum_stock({code}): {ex}\n{traceback.format_exc()}")
+            logging.error(f"❌ [급등주] _process_momentum_stock({code}): {ex}\n{traceback.format_exc()}")
+            return False
 
     def _process_gap_stock(self, code, stgprice, time_str):
         """갭상승 처리 (안전성 대폭 강화)"""
         stock_name = cpCodeMgr.CodeToName(code)
         
         try:
-            logging.info(f"🔍 {stock_name}({code}): 갭상승 검증 시작")
+            logging.info(f"🔍 [갭상승] {stock_name}({code}): 검증 시작")
             
             # ===== ✅ GapUpScanner 확인 =====
             if not self.gap_scanner:
-                logging.error(f"{stock_name}({code}): GapUpScanner 미초기화")
+                logging.error(f"❌ [갭상승] {stock_name}({code}): GapUpScanner 미초기화")
                 return False
             
             # ===== ✅ 일봉 데이터 먼저 로드 (검증 전) =====
@@ -1058,11 +1076,11 @@ class CpStrategy:
                 return False
             
             if not is_valid:
-                logging.info(f"{stock_name}({code}): 갭상승 재검증 실패 - {message}")
+                logging.info(f"❌ [갭상승] {stock_name}({code}): 재검증 실패 - {message}")
                 self.trader.daydata.monitor_stop(code)
                 return False
             
-            logging.info(f"✅ {stock_name}({code}): 갭상승 검증 통과 - {message}")
+            logging.info(f"✅ [갭상승] {stock_name}({code}): 재검증 통과 - {message}")
             
             # ===== ✅ 틱/분 데이터 로드 (타임아웃 40초) =====
             logging.debug(f"{stock_name}({code}): 틱/분 데이터 로드 중...")
@@ -1107,7 +1125,7 @@ class CpStrategy:
             # ===== ✅ 투자대상 추가 =====
             try:
                 self._add_to_monitoring(code, stgprice, time_str, f"갭상승 ({gap_pct:.2f}%)")
-                logging.info(f"✅ {stock_name}({code}): 투자대상 추가 완료")
+                logging.info(f"✅ [갭상승] {stock_name}({code}): 투자대상 추가 완료")
                 return True
             except Exception as ex:
                 logging.error(f"{stock_name}({code}): 투자대상 추가 실패: {ex}")
@@ -1135,19 +1153,21 @@ class CpStrategy:
             
             # 데이터 로드
             if not self.trader.daydata.select_code(code):
-                logging.warning(f"{stock_name}({code}): 일봉 로드 실패")
-                return
+                logging.warning(f"❌ [기타] {stock_name}({code}): 일봉 로드 실패")
+                return False
             
             if not (self.trader.tickdata.monitor_code(code) and self.trader.mindata.monitor_code(code)):
-                logging.warning(f"{stock_name}({code}): 틱/분 로드 실패")
+                logging.warning(f"❌ [기타] {stock_name}({code}): 틱/분 로드 실패")
                 self.trader.daydata.monitor_stop(code)
-                return
+                return False
             
             # 투자대상 추가
             self._add_to_monitoring(code, stgprice, time_str, "기타 전략")
+            return True
             
         except Exception as ex:
-            logging.error(f"_process_other_stock({code}): {ex}")
+            logging.error(f"❌ [기타] _process_other_stock({code}): {ex}")
+            return False
 
     def _verify_with_timeout(self, func, code, timeout=10.0):
         """검증 (메인 스레드에서 직접 실행)"""
@@ -1311,6 +1331,10 @@ class CpStrategy:
             return
         
         stgname = self.stgname.get(stgid, '')
+        stock_name = cpCodeMgr.CodeToName(code)
+        
+        # ===== ✅ 조건검색 편입 로그 (로그창 표시) =====
+        logging.info(f"📢 [{stgname}] 조건검색 편입: {stock_name}({code}) @{stgprice:,}원 ({time})")
         
         # ===== ✅ 큐에 추가 (즉시 반환) =====
         stock_data = {
@@ -1323,7 +1347,7 @@ class CpStrategy:
         }
         
         self.stock_queue.put(stock_data)
-        logging.debug(f"{code}: 처리 큐에 추가 (대기: {self.stock_queue.qsize()}개)")
+        logging.info(f"🔄 {stock_name}({code}): 처리 큐에 추가됨 (대기: {self.stock_queue.qsize()}개)")
 
     def Clear(self):
         """정리 (큐 종료 포함)"""
@@ -1999,17 +2023,16 @@ class CpData(QObject):
                             "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"  # 추가
                         ]
                         
-                        results = [
-                            self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
-                            for ind in indicator_types
-                        ]
+                        # ✅ 안전하게 지표 계산
+                        for ind in indicator_types:
+                            try:
+                                result = self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
+                                if result:
+                                    self.stockdata[code].update(result)
+                            except Exception as ind_ex:
+                                logging.debug(f"{code}: {ind} 계산 실패: {ind_ex}")
                         
-                        if all(results):
-                            for result in results:
-                                self.stockdata[code].update(result)
-                            self._update_snapshot(code)
-                        else:
-                            logging.warning(f"{code}: 지표 생성 실패")
+                        self._update_snapshot(code)
                             
         except Exception as ex:
             logging.error(f"periodic_update_data -> {ex}")
@@ -2087,7 +2110,7 @@ class CpData(QObject):
             else:
                 self.is_initial_loaded[code] = True
 
-            # 지표 계산
+            # 지표 계산 (데이터가 부족해도 실시간 구독은 시작)
             with self.stockdata_lock:
                 if code not in self.objIndicators:
                     self.objIndicators[code] = CpIndicators(self.chart_type)
@@ -2098,23 +2121,43 @@ class CpData(QObject):
                         "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"
                     ]
                     
-                    results = [
-                        self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
-                        for ind in indicator_types
-                    ]
+                    # ✅ 데이터 길이 확인
+                    data_length = len(self.stockdata[code].get('C', []))
                     
-                    if all(results):
-                        for result in results:
-                            self.stockdata[code].update(result)
+                    if data_length < 20:
+                        # 데이터 부족 - 경고 1회만 출력
+                        logging.info(f"⚠️ {code}: 초기 데이터 부족 ({data_length}개), 실시간 구독 시작 후 지표 계산 예정")
                         
-                        self._update_snapshot(code)
-                        
+                        # ✅ 실시간 구독만 시작 (지표는 나중에)
                         if code not in self.objCur:
                             self.objCur[code] = CpPBStockCur()
                             self.objCur[code].Subscribe(code, self)
+                        
                         return True
-                    else:
-                        return False
+                    
+                    # 데이터 충분 - 지표 계산 시도
+                    results = []
+                    for ind in indicator_types:
+                        try:
+                            result = self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
+                            results.append(result)
+                        except Exception as ind_ex:
+                            logging.debug(f"{code}: {ind} 계산 실패: {ind_ex}")
+                            results.append({})
+                    
+                    # ✅ 성공한 지표만 업데이트
+                    for result in results:
+                        if result:
+                            self.stockdata[code].update(result)
+                    
+                    self._update_snapshot(code)
+                    
+                    # ✅ 실시간 구독 시작 (지표 계산 성공 여부와 무관)
+                    if code not in self.objCur:
+                        self.objCur[code] = CpPBStockCur()
+                        self.objCur[code].Subscribe(code, self)
+                    
+                    return True
             
             return True
             
@@ -2369,123 +2412,180 @@ class CpData(QObject):
             logging.error(f"verify_data_coverage -> {ex}")
             return False
 
+    def _safe_get_last(self, data, key, default=0):
+        """안전하게 마지막 값 추출 (리스트/스칼라 자동 처리)"""
+        try:
+            value = data.get(key)
+            if value is None:
+                return default
+            
+            # 리스트인 경우
+            if isinstance(value, (list, tuple)):
+                if len(value) == 0:
+                    return default
+                return value[-1]
+            
+            # 스칼라인 경우 (int, float, bool 등)
+            if isinstance(value, (int, float, bool, str)):
+                return value
+            
+            # 기타 (dict 등)
+            return default
+            
+        except Exception as ex:
+            logging.debug(f"_safe_get_last({key}): {ex}")
+            return default
+    
+    def _safe_get_recent(self, data, key, count=3, default_list=None):
+        """안전하게 최근 N개 값 추출 (리스트만 처리)"""
+        try:
+            value = data.get(key)
+            if value is None:
+                return default_list or [0] * count
+            
+            # 리스트인 경우
+            if isinstance(value, (list, tuple)):
+                if len(value) == 0:
+                    return default_list or [0] * count
+                elif len(value) >= count:
+                    return list(value[-count:])
+                else:
+                    # 부족한 경우 앞을 0으로 채움
+                    padding = [0] * (count - len(value))
+                    return padding + list(value)
+            
+            # 스칼라인 경우 복제
+            if isinstance(value, (int, float)):
+                return [value] * count
+            
+            # 기타 (dict, str 등)
+            return default_list or [0] * count
+            
+        except Exception as ex:
+            logging.debug(f"_safe_get_recent({key}): {ex}")
+            return default_list or [0] * count
+
     def _update_snapshot(self, code):
-        """읽기 전용 스냅샷 업데이트 (수정 버전)"""
+        """읽기 전용 스냅샷 업데이트 (안전 버전)"""
         try:
             if code not in self.stockdata:
                 return
             
             data = self.stockdata[code]
             
+            # ✅ 기본 데이터가 없으면 스킵
+            if not data.get('C') or len(data.get('C', [])) == 0:
+                return
+            
             if self.chart_type == 'T':
                 self.latest_snapshot[code] = {
                     # 기본 가격
-                    'C': data.get('C', [0])[-1] if data.get('C') else 0,
-                    'O': data.get('O', [0])[-1] if data.get('O') else 0,
-                    'H': data.get('H', [0])[-1] if data.get('H') else 0,
-                    'L': data.get('L', [0])[-1] if data.get('L') else 0,
-                    'V': data.get('V', [0])[-1] if data.get('V') else 0,
+                    'C': self._safe_get_last(data, 'C', 0),
+                    'O': self._safe_get_last(data, 'O', 0),
+                    'H': self._safe_get_last(data, 'H', 0),
+                    'L': self._safe_get_last(data, 'L', 0),
+                    'V': self._safe_get_last(data, 'V', 0),
                     
                     # 이동평균
-                    'MAT5': data.get('MAT5', [0])[-1] if data.get('MAT5') else 0,
-                    'MAT20': data.get('MAT20', [0])[-1] if data.get('MAT20') else 0,
-                    'MAT60': data.get('MAT60', [0])[-1] if data.get('MAT60') else 0,
-                    'MAT120': data.get('MAT120', [0])[-1] if data.get('MAT120') else 0,
+                    'MAT5': self._safe_get_last(data, 'MAT5', 0),
+                    'MAT20': self._safe_get_last(data, 'MAT20', 0),
+                    'MAT60': self._safe_get_last(data, 'MAT60', 0),
+                    'MAT120': self._safe_get_last(data, 'MAT120', 0),
                     
                     # RSI
-                    'RSIT': data.get('RSIT', [0])[-1] if data.get('RSIT') else 0,
-                    'RSIT_SIGNAL': data.get('RSIT_SIGNAL', [0])[-1] if data.get('RSIT_SIGNAL') else 0,
+                    'RSIT': self._safe_get_last(data, 'RSIT', 0),
+                    'RSIT_SIGNAL': self._safe_get_last(data, 'RSIT_SIGNAL', 0),
                     
                     # MACD
-                    'MACDT': data.get('MACDT', [0])[-1] if data.get('MACDT') else 0,
-                    'MACDT_SIGNAL': data.get('MACDT_SIGNAL', [0])[-1] if data.get('MACDT_SIGNAL') else 0,
-                    'OSCT': data.get('OSCT', [0])[-1] if data.get('OSCT') else 0,
+                    'MACDT': self._safe_get_last(data, 'MACDT', 0),
+                    'MACDT_SIGNAL': self._safe_get_last(data, 'MACDT_SIGNAL', 0),
+                    'OSCT': self._safe_get_last(data, 'OSCT', 0),
                     
                     # Stochastic
-                    'STOCHK': data.get('STOCHK', [0])[-1] if data.get('STOCHK') else 0,
-                    'STOCHD': data.get('STOCHD', [0])[-1] if data.get('STOCHD') else 0,
+                    'STOCHK': self._safe_get_last(data, 'STOCHK', 0),
+                    'STOCHD': self._safe_get_last(data, 'STOCHD', 0),
                     
                     # 기타
-                    'ATR': data.get('ATR', [0])[-1] if data.get('ATR') else 0,
-                    'CCI': data.get('CCI', [0])[-1] if data.get('CCI') else 0,
-                    'BB_UPPER': data.get('BB_UPPER', [0])[-1] if data.get('BB_UPPER') else 0,
-                    'BB_MIDDLE': data.get('BB_MIDDLE', [0])[-1] if data.get('BB_MIDDLE') else 0,
-                    'BB_LOWER': data.get('BB_LOWER', [0])[-1] if data.get('BB_LOWER') else 0,
-                    'BB_POSITION': data.get('BB_POSITION', [0])[-1] if data.get('BB_POSITION') else 0,
-                    'BB_BANDWIDTH': data.get('BB_BANDWIDTH', [0])[-1] if data.get('BB_BANDWIDTH') else 0,
-                    'VWAP': data.get('VWAP', [0])[-1] if data.get('VWAP') else 0,
+                    'ATR': self._safe_get_last(data, 'ATR', 0),
+                    'CCI': self._safe_get_last(data, 'CCI', 0),
+                    'BB_UPPER': self._safe_get_last(data, 'BB_UPPER', 0),
+                    'BB_MIDDLE': self._safe_get_last(data, 'BB_MIDDLE', 0),
+                    'BB_LOWER': self._safe_get_last(data, 'BB_LOWER', 0),
+                    'BB_POSITION': self._safe_get_last(data, 'BB_POSITION', 0),
+                    'BB_BANDWIDTH': self._safe_get_last(data, 'BB_BANDWIDTH', 0),
+                    'VWAP': self._safe_get_last(data, 'VWAP', 0),
                     
                     # === 새로운 지표들 ===
-                    'WILLIAMS_R': data.get('WILLIAMS_R', [0])[-1] if data.get('WILLIAMS_R') else -50,
-                    'ROC': data.get('ROC', [0])[-1] if data.get('ROC') else 0,
-                    'OBV': data.get('OBV', [0])[-1] if data.get('OBV') else 0,
-                    'OBV_MA20': data.get('OBV_MA20', [0])[-1] if data.get('OBV_MA20') else 0,
-                    'VP_POC': data.get('VP_POC', 0),
-                    'VP_POSITION': data.get('VP_POSITION', 0),
+                    'WILLIAMS_R': self._safe_get_last(data, 'WILLIAMS_R', -50),
+                    'ROC': self._safe_get_last(data, 'ROC', 0),
+                    'OBV': self._safe_get_last(data, 'OBV', 0),
+                    'OBV_MA20': self._safe_get_last(data, 'OBV_MA20', 0),
+                    'VP_POC': self._safe_get_last(data, 'VP_POC', 0),
+                    'VP_POSITION': self._safe_get_last(data, 'VP_POSITION', 0),
                     
                     # 최근 추이
-                    'C_recent': data.get('C', [0])[-3:] if data.get('C') else [0, 0, 0],
-                    'H_recent': data.get('H', [0])[-3:] if data.get('H') else [0, 0, 0],
-                    'L_recent': data.get('L', [0])[-3:] if data.get('L') else [0, 0, 0],
+                    'C_recent': self._safe_get_recent(data, 'C', 3, [0, 0, 0]),
+                    'H_recent': self._safe_get_recent(data, 'H', 3, [0, 0, 0]),
+                    'L_recent': self._safe_get_recent(data, 'L', 3, [0, 0, 0]),
                 }
             
             elif self.chart_type == 'm':
                 self.latest_snapshot[code] = {
                     # 기본 가격
-                    'C': data.get('C', [0])[-1] if data.get('C') else 0,
-                    'O': data.get('O', [0])[-1] if data.get('O') else 0,
-                    'H': data.get('H', [0])[-1] if data.get('H') else 0,
-                    'L': data.get('L', [0])[-1] if data.get('L') else 0,
-                    'V': data.get('V', [0])[-1] if data.get('V') else 0,
+                    'C': self._safe_get_last(data, 'C', 0),
+                    'O': self._safe_get_last(data, 'O', 0),
+                    'H': self._safe_get_last(data, 'H', 0),
+                    'L': self._safe_get_last(data, 'L', 0),
+                    'V': self._safe_get_last(data, 'V', 0),
                     
                     # 이동평균
-                    'MAM5': data.get('MAM5', [0])[-1] if data.get('MAM5') else 0,
-                    'MAM10': data.get('MAM10', [0])[-1] if data.get('MAM10') else 0,
-                    'MAM20': data.get('MAM20', [0])[-1] if data.get('MAM20') else 0,
+                    'MAM5': self._safe_get_last(data, 'MAM5', 0),
+                    'MAM10': self._safe_get_last(data, 'MAM10', 0),
+                    'MAM20': self._safe_get_last(data, 'MAM20', 0),
                     
                     # RSI
-                    'RSI': data.get('RSI', [0])[-1] if data.get('RSI') else 0,
-                    'RSI_SIGNAL': data.get('RSI_SIGNAL', [0])[-1] if data.get('RSI_SIGNAL') else 0,
+                    'RSI': self._safe_get_last(data, 'RSI', 0),
+                    'RSI_SIGNAL': self._safe_get_last(data, 'RSI_SIGNAL', 0),
                     
                     # MACD
-                    'MACD': data.get('MACD', [0])[-1] if data.get('MACD') else 0,
-                    'MACD_SIGNAL': data.get('MACD_SIGNAL', [0])[-1] if data.get('MACD_SIGNAL') else 0,
-                    'OSC': data.get('OSC', [0])[-1] if data.get('OSC') else 0,
+                    'MACD': self._safe_get_last(data, 'MACD', 0),
+                    'MACD_SIGNAL': self._safe_get_last(data, 'MACD_SIGNAL', 0),
+                    'OSC': self._safe_get_last(data, 'OSC', 0),
                     
                     # Stochastic
-                    'STOCHK': data.get('STOCHK', [0])[-1] if data.get('STOCHK') else 0,
-                    'STOCHD': data.get('STOCHD', [0])[-1] if data.get('STOCHD') else 0,
+                    'STOCHK': self._safe_get_last(data, 'STOCHK', 0),
+                    'STOCHD': self._safe_get_last(data, 'STOCHD', 0),
                     
                     # 기타
-                    'CCI': data.get('CCI', [0])[-1] if data.get('CCI') else 0,
-                    'VWAP': data.get('VWAP', [0])[-1] if data.get('VWAP') else 0,
+                    'CCI': self._safe_get_last(data, 'CCI', 0),
+                    'VWAP': self._safe_get_last(data, 'VWAP', 0),
                     
                     # === 새로운 지표들 ===
-                    'WILLIAMS_R': data.get('WILLIAMS_R', [0])[-1] if data.get('WILLIAMS_R') else -50,
-                    'ROC': data.get('ROC', [0])[-1] if data.get('ROC') else 0,
-                    'OBV': data.get('OBV', [0])[-1] if data.get('OBV') else 0,
-                    'OBV_MA20': data.get('OBV_MA20', [0])[-1] if data.get('OBV_MA20') else 0,
-                    'VP_POC': data.get('VP_POC', 0),
-                    'VP_POSITION': data.get('VP_POSITION', 0),
+                    'WILLIAMS_R': self._safe_get_last(data, 'WILLIAMS_R', -50),
+                    'ROC': self._safe_get_last(data, 'ROC', 0),
+                    'OBV': self._safe_get_last(data, 'OBV', 0),
+                    'OBV_MA20': self._safe_get_last(data, 'OBV_MA20', 0),
+                    'VP_POC': self._safe_get_last(data, 'VP_POC', 0),
+                    'VP_POSITION': self._safe_get_last(data, 'VP_POSITION', 0),
                     
                     # 최근 추이
-                    'C_recent': data.get('C', [0])[-2:] if data.get('C') else [0, 0],
-                    'O_recent': data.get('O', [0])[-2:] if data.get('O') else [0, 0],
-                    'H_recent': data.get('H', [0])[-2:] if data.get('H') else [0, 0],
-                    'L_recent': data.get('L', [0])[-2:] if data.get('L') else [0, 0],
+                    'C_recent': self._safe_get_recent(data, 'C', 2, [0, 0]),
+                    'O_recent': self._safe_get_recent(data, 'O', 2, [0, 0]),
+                    'H_recent': self._safe_get_recent(data, 'H', 2, [0, 0]),
+                    'L_recent': self._safe_get_recent(data, 'L', 2, [0, 0]),
                 }
             
             elif self.chart_type == 'D':
                 self.latest_snapshot[code] = {
-                    'C': data.get('C', [0])[-1] if data.get('C') else 0,
-                    'V': data.get('V', [0])[-1] if data.get('V') else 0,
-                    'MAD5': data.get('MAD5', [0])[-1] if data.get('MAD5') else 0,
-                    'MAD10': data.get('MAD10', [0])[-1] if data.get('MAD10') else 0,
-                    'VWAP': data.get('VWAP', [0])[-1] if data.get('VWAP') else 0,
+                    'C': self._safe_get_last(data, 'C', 0),
+                    'V': self._safe_get_last(data, 'V', 0),
+                    'MAD5': self._safe_get_last(data, 'MAD5', 0),
+                    'MAD10': self._safe_get_last(data, 'MAD10', 0),
+                    'VWAP': self._safe_get_last(data, 'VWAP', 0),
                 }
                 
         except Exception as ex:
-            logging.error(f"_update_snapshot -> {code}, {ex}")
+            logging.error(f"_update_snapshot -> {code}, {ex}\n{traceback.format_exc()}")
 
     def get_latest_data(self, code):
         """빠른 읽기 - 스냅샷 반환 (락 불필요)"""
@@ -2514,20 +2614,34 @@ class CpData(QObject):
     def updateCurData(self, item):
         """실시간 체결 데이터 업데이트"""
         try:
-            if self.is_updating.get(item['code'], False):
+            code = item.get('code')
+            if not code:
                 return
             
-            code = item['code']
-            time_val = item['time']
-            cur = item['cur']
-            vol = item['vol']
+            if self.is_updating.get(code, False):
+                return
+            
+            # ✅ stockdata에 종목이 없으면 스킵
+            if code not in self.stockdata:
+                return
+            
+            time_val = item.get('time', 0)
+            cur = item.get('cur', 0)
+            vol = item.get('vol', 0)
+            
+            # ✅ 유효한 데이터인지 확인
+            if cur <= 0 or time_val <= 0:
+                return
+            
             current_time = time.time()
             
             # 체결강도 업데이트
             with self.stockdata_lock:
                 if code in self.buy_volumes:
-                    if len(self.stockdata.get(code, {}).get('C', [])) > 0:
-                        prev_price = self.stockdata[code]['C'][-1]
+                    # ✅ 안전하게 이전 가격 가져오기
+                    c_data = self.stockdata.get(code, {}).get('C')
+                    if c_data and isinstance(c_data, list) and len(c_data) > 0:
+                        prev_price = c_data[-1]
                         if cur > prev_price:
                             self.buy_volumes[code].append(vol)
                             self.sell_volumes[code].append(0)
@@ -2581,22 +2695,27 @@ class CpData(QObject):
 
                         desired_length = 600
                         for key in self.stockdata[code]:
-                            self.stockdata[code][key] = self.stockdata[code][key][-desired_length:]
+                            # ✅ 리스트인 경우에만 슬라이싱
+                            if isinstance(self.stockdata[code][key], list):
+                                self.stockdata[code][key] = self.stockdata[code][key][-desired_length:]
 
                         self._update_snapshot(code)
 
                         last_update = self.last_indicator_update.get(code, 0)
                         if current_time - last_update >= self.indicator_update_interval:
                             if code in self.objIndicators:
-                                results = [
-                                    self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
-                                    for ind in ["MA", "RSI", "MACD", "STOCH", "ATR", "CCI", "BBANDS", "VWAP",
-                                               "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"]
-                                ]
-                                if all(results):
-                                    for result in results:
-                                        self.stockdata[code].update(result)
-                                    self._update_snapshot(code)
+                                # ✅ 안전하게 지표 업데이트
+                                indicator_types = ["MA", "RSI", "MACD", "STOCH", "ATR", "CCI", "BBANDS", "VWAP",
+                                                 "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"]
+                                for ind in indicator_types:
+                                    try:
+                                        result = self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
+                                        if result:
+                                            self.stockdata[code].update(result)
+                                    except Exception as ind_ex:
+                                        logging.debug(f"{code}: {ind} 업데이트 실패: {ind_ex}")
+                                
+                                self._update_snapshot(code)
                             
                             self.last_indicator_update[code] = current_time
                     
@@ -2641,21 +2760,26 @@ class CpData(QObject):
 
                         desired_length = 150
                         for key in self.stockdata[code]:
-                            self.stockdata[code][key] = self.stockdata[code][key][-desired_length:]
+                            # ✅ 리스트인 경우에만 슬라이싱
+                            if isinstance(self.stockdata[code][key], list):
+                                self.stockdata[code][key] = self.stockdata[code][key][-desired_length:]
 
                         self._update_snapshot(code)
 
                         last_update = self.last_indicator_update.get(code, 0)
                         if current_time - last_update >= self.indicator_update_interval:
                             if code in self.objIndicators:
-                                results = [
-                                    self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
-                                    for ind in ["MA", "MACD", "RSI", "STOCH", "ATR", "CCI", "BBANDS", "VWAP"]
-                                ]
-                                if all(results):
-                                    for result in results:
-                                        self.stockdata[code].update(result)
-                                    self._update_snapshot(code)
+                                # ✅ 안전하게 지표 업데이트
+                                indicator_types = ["MA", "MACD", "RSI", "STOCH", "ATR", "CCI", "BBANDS", "VWAP"]
+                                for ind in indicator_types:
+                                    try:
+                                        result = self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
+                                        if result:
+                                            self.stockdata[code].update(result)
+                                    except Exception as ind_ex:
+                                        logging.debug(f"{code}: {ind} 업데이트 실패: {ind_ex}")
+                                
+                                self._update_snapshot(code)
                             
                             self.last_indicator_update[code] = current_time
                 
@@ -2664,7 +2788,7 @@ class CpData(QObject):
                     self.new_bar_completed.emit(code)
         
         except Exception as ex:
-            logging.error(f"updateCurData -> {ex}")
+            logging.error(f"updateCurData -> {ex}\n{traceback.format_exc()}")
 
 # ==================== CTrader (계속) ====================
 class CTrader(QObject):
@@ -6669,7 +6793,7 @@ class MyWindow(QWidget):
         try:
             stg_item = self.data8537.get(strategy_name)
             if not stg_item:
-                logging.warning(f"조건검색 '{strategy_name}'을 찾을 수 없습니다. HTS에서 생성하세요.")
+                logging.warning(f"⚠️ 조건검색 '{strategy_name}'을 찾을 수 없습니다. HTS에서 생성하세요.")
                 return False
             
             id = stg_item['ID']
@@ -6677,15 +6801,19 @@ class MyWindow(QWidget):
             
             ret, monid = self.objstg.requestMonitorID(id)
             if not ret:
-                logging.warning(f"조건검색 '{name}' 모니터 ID 획득 실패")
+                logging.warning(f"❌ 조건검색 '{name}' 모니터 ID 획득 실패")
                 return False
             
             ret, status = self.objstg.requestStgControl(id, monid, True, name)
             if ret:
-                logging.info(f"✅ 조건검색 '{name}' 감시 시작")
+                logging.info(f"{'='*60}")
+                logging.info(f"🎯 조건검색 감시 시작: [{name}]")
+                logging.info(f"{'='*60}")
+                logging.info(f"💡 대신증권 HTS에서 [{name}] 조건에 맞는 종목이 발견되면 실시간으로 이 화면에 표시됩니다!")
+                logging.info(f"{'='*60}")
                 return True
             else:
-                logging.warning(f"조건검색 '{name}' 시작 실패")
+                logging.warning(f"❌ 조건검색 '{name}' 시작 실패")
                 return False
                 
         except Exception as ex:
