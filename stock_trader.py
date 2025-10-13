@@ -7206,7 +7206,7 @@ class MyWindow(QWidget):
             total_codes = len(codes_to_load)
             
             if total_codes == 0:
-                logging.info("DB에 저장된 종목 없음")
+                logging.info("mylist.db에 저장된 종목 없음")
                 return
             
             logging.info(f"DB에서 {total_codes}개 종목 로드...")
