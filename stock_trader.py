@@ -7153,7 +7153,6 @@ class MyWindow(QWidget):
                 logging.info(f"{'='*40}")
                 logging.info(f"🎯 조건검색 감시 시작: [{name}]")
                 logging.info(f"📊 현재 편입 종목: {stock_count}개 / 200개")
-                logging.info(f"💡 대신증권 HTS에서 [{name}] 조건에 맞는 종목이 발견되면 실시간으로 이 화면에 표시됩니다!")
                 logging.info(f"{'='*40}")
                 
                 # ===== ✅ 기존 편입 종목 검증 처리 (프로그램 시작 시) =====
