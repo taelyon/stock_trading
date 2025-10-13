@@ -1,3 +1,4 @@
+
 import sys
 import ctypes
 import matplotlib
@@ -318,23 +319,38 @@ class MomentumScanner(QObject):
             if cached_score is not None:
                 return (cached_score >= 70, cached_score, "캐시에서 조회")
             
-            # ===== ✅ 메모리 데이터 기반 검증 =====
-            tick_data = self.trader.tickdata.get_latest_data(code)
-            min_data = self.trader.mindata.get_latest_data(code)
-            day_data = self.trader.daydata.stockdata.get(code, {})
+            # ===== ✅ 메모리 데이터 기반 검증 (stockdata 직접 조회) =====
+            with self.trader.tickdata.stockdata_lock:
+                tick_data = self.trader.tickdata.stockdata.get(code, {})
             
+            with self.trader.mindata.stockdata_lock:
+                min_data = self.trader.mindata.stockdata.get(code, {})
+            
+            with self.trader.daydata.stockdata_lock:
+                day_data = self.trader.daydata.stockdata.get(code, {})
+            
+            # 최소 데이터 확인
             if not tick_data or not min_data or not day_data:
                 return (False, 0, "메모리 데이터 없음")
             
+            if len(tick_data.get('C', [])) == 0 or len(min_data.get('C', [])) == 0 or len(day_data.get('C', [])) < 2:
+                return (False, 0, f"데이터 부족 (틱:{len(tick_data.get('C', []))}, 분:{len(min_data.get('C', []))}, 일:{len(day_data.get('C', []))})")
+            
             # ===== 데이터 추출 (메모리에서) =====
             try:
-                current_price = tick_data.get('C', 0)
+                # 틱 데이터에서 현재가 (최신 값)
+                current_price = tick_data.get('C', [0])[-1] if tick_data.get('C') else 0
+                
+                # 일봉 데이터에서 당일 정보
                 open_price = day_data.get('O', [0])[-1] if day_data.get('O') else 0
                 high_price = day_data.get('H', [0])[-1] if day_data.get('H') else 0
                 low_price = day_data.get('L', [0])[-1] if day_data.get('L') else 0
                 volume = day_data.get('V', [0])[-1] if day_data.get('V') else 0
+                
+                # 전일 데이터
                 prev_close = day_data.get('C', [0])[-2] if len(day_data.get('C', [])) >= 2 else 0
                 prev_volume = day_data.get('V', [0])[-2] if len(day_data.get('V', [])) >= 2 else 0
+                
                 market_cap = 0  # 일봉 데이터에는 시가총액 정보가 없음
                 
                 if current_price == 0 or open_price == 0:
@@ -348,8 +364,9 @@ class MomentumScanner(QObject):
             if current_price < 2000 or current_price > 50000:
                 return (False, 0, f"가격대 미달 ({current_price}원)")
             
-            if market_cap < 50000 or market_cap > 500000:
-                return (False, 0, f"시가총액 미달 ({market_cap/10000:.0f}억)")
+            # 시가총액 체크 (일봉 데이터에는 시가총액 정보가 없으므로 0일 때는 스킵)
+            # if market_cap > 0 and (market_cap < 50000 or market_cap > 500000):
+            #     return (False, 0, f"시가총액 미달 ({market_cap/10000:.0f}억)")
             
             score = 0
             
@@ -450,16 +467,23 @@ class GapUpScanner:
                         logging.debug(f"{code}: 캐시에서 조회 (5초 이내)")
                         return cached
             
-            # ===== ✅ 메모리 데이터 기반 검증 =====
-            tick_data = self.trader.tickdata.get_latest_data(code)
-            day_data = self.trader.daydata.stockdata.get(code, {})
+            # ===== ✅ 메모리 데이터 기반 검증 (stockdata 직접 조회) =====
+            with self.trader.tickdata.stockdata_lock:
+                tick_data = self.trader.tickdata.stockdata.get(code, {})
             
+            with self.trader.daydata.stockdata_lock:
+                day_data = self.trader.daydata.stockdata.get(code, {})
+            
+            # 최소 데이터 확인
             if not tick_data or not day_data:
                 return (False, 0, "메모리 데이터 없음")
             
+            if len(tick_data.get('C', [])) == 0 or len(day_data.get('C', [])) < 2:
+                return (False, 0, f"데이터 부족 (틱:{len(tick_data.get('C', []))}, 일:{len(day_data.get('C', []))})")
+            
             # ===== ✅ 데이터 안전하게 추출 (메모리에서) =====
             try:
-                current_price = tick_data.get('C', 0)  # 현재가
+                current_price = tick_data.get('C', [0])[-1] if tick_data.get('C') else 0  # 현재가 (최신 값)
                 open_price = day_data.get('O', [0])[-1] if day_data.get('O') else 0  # 시가
                 prev_close = day_data.get('C', [0])[-2] if len(day_data.get('C', [])) >= 2 else 0  # 전일종가
                 
@@ -694,11 +718,31 @@ class CpEvent:
             inoutflag = self.client.GetHeaderValue(3)
             stgtime = self.client.GetHeaderValue(4)
             stgprice = self.client.GetHeaderValue(5)
-            time_str = datetime.strptime(stgtime.zfill(6), '%H%M%S')
-            combined_datetime = datetime.now().replace(hour=time_str.hour, minute=time_str.minute, second=time_str.second)
-            time = combined_datetime.strftime('%m/%d %H:%M:%S')
+            time_obj = datetime.strptime(stgtime.zfill(6), '%H%M%S')
+            combined_datetime = datetime.now().replace(hour=time_obj.hour, minute=time_obj.minute, second=time_obj.second)
+            time_str = combined_datetime.strftime('%m/%d %H:%M:%S')
+            
+            # 진입 처리
             if inoutflag == ord('1') and combined_datetime < combined_datetime.replace(hour=15, minute=15, second=0):
-                self.caller.checkRealtimeStg(stgid, stgmonid, code, stgprice, time)
+                self.caller.checkRealtimeStg(stgid, stgmonid, code, stgprice, time_str)
+            # 퇴출 처리 (로그만 기록, 중복 필터링)
+            elif inoutflag == ord('2'):
+                # ===== ✅ 퇴출 이벤트도 중복 필터링 =====
+                import time as time_module  # 모듈 이름 충돌 방지
+                event_key = f"exit_{stgid}_{code}"
+                current_time = time_module.time()
+                
+                if hasattr(self.caller, 'last_event_time'):
+                    if event_key in self.caller.last_event_time:
+                        elapsed = current_time - self.caller.last_event_time[event_key]
+                        if elapsed < self.caller.event_dedup_seconds:
+                            return  # 3초 이내 중복 퇴출 이벤트 무시
+                    
+                    self.caller.last_event_time[event_key] = current_time
+                
+                stock_name = cpCodeMgr.CodeToName(code)
+                stgname = self.caller.stgname.get(stgid, '알 수 없음') if hasattr(self.caller, 'stgname') else '알 수 없음'
+                logging.info(f"📤 [{stgname}] 조건검색 퇴출: {stock_name}({code}) @{stgprice:,}원")
             return
         
         if self.name == 'conclusion':
@@ -804,8 +848,9 @@ class CpStrategy:
         self.stgname = {}
         self.objpb = CpPBCssAlert()
         
-        self.momentum_scanner = None
-        self.gap_scanner = None
+        # ===== ✅ Scanner 즉시 초기화 (타이밍 문제 해결) =====
+        self.momentum_scanner = MomentumScanner(trader)
+        self.gap_scanner = GapUpScanner(trader)
         
         # ===== ✅ 큐 처리 강화 =====
         self.stock_queue = queue.Queue()
@@ -818,15 +863,23 @@ class CpStrategy:
         self.max_concurrent_stocks = 1  # 동시 처리 종목 수 제한
         self.processing_stocks = set()  # 현재 처리 중인 종목
         self.failed_stocks = {}  # 실패한 종목 기록
+        
+        # ===== ✅ 중복 이벤트 필터링 =====
+        self.last_event_time = {}  # 종목별 마지막 이벤트 시간
+        self.event_dedup_seconds = 3.0  # 3초 이내 중복 이벤트 무시
 
     def start_processing_queue(self):
-        """큐 처리 시작 (메인 스레드에서 직접 처리)"""
+        """큐 처리 시작 (워커 스레드 시작)"""
         if self.is_thread_started:
             logging.debug("큐 처리는 이미 시작됨")
             return
         
         self.is_thread_started = True  # ✅ 플래그 설정
-        logging.info("✅ 종목 처리 큐 시작 (메인 스레드)")
+        
+        # ✅ 워커 스레드 시작
+        self.processing_thread = threading.Thread(target=self._process_stock_queue, daemon=True)
+        self.processing_thread.start()
+        logging.info("✅ 종목 처리 큐 워커 스레드 시작")
 
     def _process_stock_queue(self):
         """큐에서 종목 순차 처리 (안전성 강화)"""
@@ -902,9 +955,12 @@ class CpStrategy:
             
             stock_name = cpCodeMgr.CodeToName(code)
             
-            logging.info(f"{'='*50}")
-            logging.info(f"🔍 [{stgname}] {stock_name}({code}) 검증 시작 - 가격: {stgprice:,}원")
-            logging.info(f"{'='*50}")
+            logging.info(f"{'='*40}")
+            if stgprice > 0:
+                logging.info(f"🔍 [{stgname}] {stock_name}({code}) 검증 시작 - 가격: {stgprice:,}원")
+            else:
+                logging.info(f"🔍 [{stgname}] {stock_name}({code}) 검증 시작 (기존 편입 종목)")
+            logging.info(f"{'='*40}")
             
             # 중복 확인
             if code in self.trader.monistock_set:
@@ -965,32 +1021,17 @@ class CpStrategy:
                 logging.warning(f"❌ [{stock_name}] MomentumScanner가 초기화되지 않음")
                 return False
             
-            # 급등주 조건 재확인 (타임아웃 10초)
-            try:
-                is_valid, score, message = self._verify_with_timeout(
-                    self.momentum_scanner.verify_momentum_conditions,
-                    code,
-                    timeout=10.0
-                )
-            except Exception as ex:
-                logging.error(f"❌ [급등주] {stock_name}({code}): 검증 중 오류: {ex}")
-                return False
-            
-            if not is_valid:
-                logging.info(f"❌ [급등주] {stock_name}({code}): 재검증 실패 - {message}")
-                return False
-            
-            logging.info(
-                f"✅ [급등주] {stock_name}({code}) → 재검증 통과 "
-                f"({message})"
-            )
-            
-            # 일봉 데이터 로드
+            # ===== ✅ 1단계: 일봉 데이터 먼저 로드 =====
+            logging.info(f"📊 [급등주] {stock_name}({code}): 일봉 데이터 로드 중...")
             if not self.trader.daydata.select_code(code):
                 logging.warning(f"❌ [급등주] {stock_name}({code}): 일봉 로드 실패")
                 return False
             
-            # 틱/분 데이터 로드 (타임아웃 30초)
+            # 일봉 로드 후 대기
+            time.sleep(0.3)
+            
+            # ===== ✅ 2단계: 틱/분 데이터 로드 (타임아웃 30초) =====
+            logging.info(f"📊 [급등주] {stock_name}({code}): 틱/분 데이터 로드 중...")
             try:
                 tick_ok = self._load_with_timeout(
                     self.trader.tickdata.monitor_code,
@@ -1012,6 +1053,63 @@ class CpStrategy:
                 self.trader.daydata.monitor_stop(code)
                 return False
             
+            # ===== ✅ 데이터 준비 대기 (최대 15초, 조건 완화) =====
+            logging.info(f"⏳ [급등주] {stock_name}({code}): 데이터 준비 대기 시작...")
+            data_ready = False
+            for attempt in range(15):  # 최대 15회 시도 (15초)
+                time.sleep(1.0)
+                
+                # 데이터 확인 (조건 완화: 최소 데이터만 있으면 OK)
+                tick_data = self.trader.tickdata.stockdata.get(code, {})
+                min_data = self.trader.mindata.stockdata.get(code, {})
+                day_data = self.trader.daydata.stockdata.get(code, {})
+                
+                # 최소 조건: 각 데이터에 종가(C)가 있고, 일봉에 최소 2개 이상의 데이터 (전일종가 필요)
+                tick_has_data = tick_data and len(tick_data.get('C', [])) > 0
+                min_has_data = min_data and len(min_data.get('C', [])) > 0
+                day_has_data = day_data and len(day_data.get('C', [])) >= 2
+                
+                if tick_has_data and min_has_data and day_has_data:
+                    data_ready = True
+                    logging.info(f"✅ [급등주] {stock_name}({code}): 데이터 준비 완료 ({attempt+1}초, 틱:{len(tick_data.get('C', []))}개, 분:{len(min_data.get('C', []))}개, 일:{len(day_data.get('C', []))}개)")
+                    break
+                else:
+                    logging.info(f"⏳ [급등주] {stock_name}({code}): 데이터 대기 중... ({attempt+1}/15초) - 틱:{len(tick_data.get('C', []))}개, 분:{len(min_data.get('C', []))}개, 일:{len(day_data.get('C', []))}개)")
+            
+            if not data_ready:
+                logging.warning(f"❌ [급등주] {stock_name}({code}): 데이터 준비 시간 초과 (15초)")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
+            
+            # ===== ✅ 3단계: 급등주 조건 재확인 (메모리 데이터 기반) =====
+            logging.info(f"🔍 [급등주] {stock_name}({code}): 조건 검증 시작...")
+            try:
+                is_valid, score, message = self._verify_with_timeout(
+                    self.momentum_scanner.verify_momentum_conditions,
+                    code,
+                    timeout=10.0
+                )
+            except Exception as ex:
+                logging.error(f"❌ [급등주] {stock_name}({code}): 검증 중 오류: {ex}")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
+            
+            if not is_valid:
+                logging.info(f"❌ [급등주] {stock_name}({code}): 재검증 실패 - {message}")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
+            
+            logging.info(
+                f"✅ [급등주] {stock_name}({code}) → 재검증 통과 "
+                f"({message})"
+            )
+            
             # 체결강도 확인
             time.sleep(0.5)
             strength = self.trader.tickdata.get_strength(code)
@@ -1021,7 +1119,7 @@ class CpStrategy:
                 self._add_to_monitoring(code, stgprice, time_str, f"급등주 (점수: {score}, 체결강도: {strength:.0f})")
                 return True
             else:
-                logging.info(f"❌ [급등주] {stock_name}({code}): 체결강도 부족 ({strength:.0f} < 120)")
+                logging.info(f"❌ [급등주] {stock_name}({code}): 체결강도 부족 (현재: {strength:.0f}, 최소: 120)")
                 self.trader.daydata.monitor_stop(code)
                 self.trader.tickdata.monitor_stop(code)
                 self.trader.mindata.monitor_stop(code)
@@ -1043,47 +1141,22 @@ class CpStrategy:
                 logging.error(f"❌ [갭상승] {stock_name}({code}): GapUpScanner 미초기화")
                 return False
             
-            # ===== ✅ 일봉 데이터 먼저 로드 (검증 전) =====
-            logging.debug(f"{stock_name}({code}): 일봉 로드 중...")
+            # ===== ✅ 1단계: 일봉 데이터 먼저 로드 =====
+            logging.info(f"📊 [갭상승] {stock_name}({code}): 일봉 로드 중...")
             
             try:
                 if not self.trader.daydata.select_code(code):
-                    logging.warning(f"{stock_name}({code}): 일봉 로드 실패")
+                    logging.warning(f"❌ [갭상승] {stock_name}({code}): 일봉 로드 실패")
                     return False
                 
                 # 일봉 로드 후 대기
                 time.sleep(0.3)
             except Exception as ex:
-                logging.error(f"{stock_name}({code}): 일봉 로드 중 오류: {ex}")
+                logging.error(f"❌ [갭상승] {stock_name}({code}): 일봉 로드 중 오류: {ex}")
                 return False
             
-            # ===== ✅ 갭상승 조건 재확인 (타임아웃 15초) =====
-            logging.debug(f"{stock_name}({code}): 갭상승 조건 검증 중...")
-            
-            try:
-                is_valid, gap_pct, message = self._verify_with_timeout(
-                    self.gap_scanner.verify_gap_conditions,
-                    code,
-                    timeout=15.0
-                )
-            except TimeoutError:
-                logging.error(f"{stock_name}({code}): 검증 타임아웃")
-                self.trader.daydata.monitor_stop(code)
-                return False
-            except Exception as ex:
-                logging.error(f"{stock_name}({code}): 검증 중 오류: {ex}")
-                self.trader.daydata.monitor_stop(code)
-                return False
-            
-            if not is_valid:
-                logging.info(f"❌ [갭상승] {stock_name}({code}): 재검증 실패 - {message}")
-                self.trader.daydata.monitor_stop(code)
-                return False
-            
-            logging.info(f"✅ [갭상승] {stock_name}({code}): 재검증 통과 - {message}")
-            
-            # ===== ✅ 틱/분 데이터 로드 (타임아웃 40초) =====
-            logging.debug(f"{stock_name}({code}): 틱/분 데이터 로드 중...")
+            # ===== ✅ 2단계: 틱/분 데이터 로드 (타임아웃 40초) =====
+            logging.info(f"📊 [갭상승] {stock_name}({code}): 틱/분 데이터 로드 중...")
             
             try:
                 tick_ok = self._load_with_timeout(
@@ -1093,7 +1166,7 @@ class CpStrategy:
                 )
                 
                 if not tick_ok:
-                    logging.warning(f"{stock_name}({code}): 틱 데이터 로드 실패")
+                    logging.warning(f"❌ [갭상승] {stock_name}({code}): 틱 데이터 로드 실패")
                     self.trader.daydata.monitor_stop(code)
                     return False
                 
@@ -1106,21 +1179,82 @@ class CpStrategy:
                 )
                 
                 if not min_ok:
-                    logging.warning(f"{stock_name}({code}): 분 데이터 로드 실패")
+                    logging.warning(f"❌ [갭상승] {stock_name}({code}): 분 데이터 로드 실패")
                     self.trader.daydata.monitor_stop(code)
                     self.trader.tickdata.monitor_stop(code)
                     return False
                 
             except TimeoutError:
-                logging.error(f"{stock_name}({code}): 데이터 로드 타임아웃")
+                logging.error(f"❌ [갭상승] {stock_name}({code}): 데이터 로드 타임아웃")
                 self.trader.daydata.monitor_stop(code)
                 self.trader.tickdata.monitor_stop(code)
                 return False
             except Exception as ex:
-                logging.error(f"{stock_name}({code}): 데이터 로드 중 오류: {ex}")
+                logging.error(f"❌ [갭상승] {stock_name}({code}): 데이터 로드 중 오류: {ex}")
                 self.trader.daydata.monitor_stop(code)
                 self.trader.tickdata.monitor_stop(code)
                 return False
+            
+            # ===== ✅ 데이터 준비 대기 (최대 15초, 조건 완화) =====
+            logging.info(f"⏳ [갭상승] {stock_name}({code}): 데이터 준비 대기 시작...")
+            data_ready = False
+            for attempt in range(15):  # 최대 15회 시도 (15초)
+                time.sleep(1.0)
+                
+                # 데이터 확인 (조건 완화: 최소 데이터만 있으면 OK)
+                tick_data = self.trader.tickdata.stockdata.get(code, {})
+                min_data = self.trader.mindata.stockdata.get(code, {})
+                day_data = self.trader.daydata.stockdata.get(code, {})
+                
+                # 최소 조건: 각 데이터에 종가(C)가 있고, 일봉에 최소 2개 이상의 데이터 (전일종가 필요)
+                tick_has_data = tick_data and len(tick_data.get('C', [])) > 0
+                min_has_data = min_data and len(min_data.get('C', [])) > 0
+                day_has_data = day_data and len(day_data.get('C', [])) >= 2
+                
+                if tick_has_data and min_has_data and day_has_data:
+                    data_ready = True
+                    logging.info(f"✅ [갭상승] {stock_name}({code}): 데이터 준비 완료 ({attempt+1}초, 틱:{len(tick_data.get('C', []))}개, 분:{len(min_data.get('C', []))}개, 일:{len(day_data.get('C', []))}개)")
+                    break
+                else:
+                    logging.info(f"⏳ [갭상승] {stock_name}({code}): 데이터 대기 중... ({attempt+1}/15초) - 틱:{len(tick_data.get('C', []))}개, 분:{len(min_data.get('C', []))}개, 일:{len(day_data.get('C', []))}개)")
+            
+            if not data_ready:
+                logging.warning(f"❌ [갭상승] {stock_name}({code}): 데이터 준비 시간 초과 (15초)")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
+            
+            # ===== ✅ 3단계: 갭상승 조건 재확인 (타임아웃 15초) =====
+            logging.info(f"🔍 [갭상승] {stock_name}({code}): 갭상승 조건 검증 시작...")
+            
+            try:
+                is_valid, gap_pct, message = self._verify_with_timeout(
+                    self.gap_scanner.verify_gap_conditions,
+                    code,
+                    timeout=15.0
+                )
+            except TimeoutError:
+                logging.error(f"❌ [갭상승] {stock_name}({code}): 검증 타임아웃")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
+            except Exception as ex:
+                logging.error(f"❌ [갭상승] {stock_name}({code}): 검증 중 오류: {ex}")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
+            
+            if not is_valid:
+                logging.info(f"❌ [갭상승] {stock_name}({code}): 재검증 실패 - {message}")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
+            
+            logging.info(f"✅ [갭상승] {stock_name}({code}): 재검증 통과 - {message}")
             
             # ===== ✅ 투자대상 추가 =====
             try:
@@ -1312,29 +1446,52 @@ class CpStrategy:
 
         status = objRq.GetHeaderValue(0)
 
-        self.objpb.Subscribe('', self)
-
+        # ===== ✅ Subscribe는 첫 조건검색 시작 시 한 번만 호출 =====
         if bStart == True:
+            # 아직 구독하지 않은 경우에만 Subscribe
+            if not self.objpb.bIsSB:
+                self.objpb.Subscribe('', self)
+                logging.debug(f"조건검색 이벤트 구독 시작 (CssAlert)")
+            
             self.monList[id] = monID
         else:
             if id in self.monList:
                 del self.monList[id]
+            
+            # ===== ✅ 모든 조건검색이 종료되면 Unsubscribe =====
+            if len(self.monList) == 0 and self.objpb.bIsSB:
+                self.objpb.Unsubscribe()
+                logging.debug(f"모든 조건검색 종료 - 이벤트 구독 해제")
 
         return (True, status)
 
-    def checkRealtimeStg(self, stgid, stgmonid, code, stgprice, time):
-        """조건검색 편입 시 호출 - 큐에 추가"""
+    def checkRealtimeStg(self, stgid, stgmonid, code, stgprice, time_str):
+        """조건검색 편입 시 호출 - 큐에 추가 (중복 필터링)"""
         
         if stgid not in self.monList:
             return
         if stgmonid != self.monList[stgid]:
             return
         
+        # ===== ✅ 중복 이벤트 필터링 (3초 이내 중복 무시) =====
+        import time as time_module  # 모듈 이름 충돌 방지
+        event_key = f"{stgid}_{code}"
+        current_time = time_module.time()
+        
+        if event_key in self.last_event_time:
+            elapsed = current_time - self.last_event_time[event_key]
+            if elapsed < self.event_dedup_seconds:
+                # 3초 이내 중복 이벤트 무시
+                return
+        
+        # 마지막 이벤트 시간 기록
+        self.last_event_time[event_key] = current_time
+        
         stgname = self.stgname.get(stgid, '')
         stock_name = cpCodeMgr.CodeToName(code)
         
         # ===== ✅ 조건검색 편입 로그 (로그창 표시) =====
-        logging.info(f"📢 [{stgname}] 조건검색 편입: {stock_name}({code}) @{stgprice:,}원 ({time})")
+        logging.info(f"📢 [{stgname}] 조건검색 편입: {stock_name}({code}) @{stgprice:,}원")
         
         # ===== ✅ 큐에 추가 (즉시 반환) =====
         stock_data = {
@@ -1342,7 +1499,7 @@ class CpStrategy:
             'stgmonid': stgmonid,
             'code': code,
             'stgprice': stgprice,
-            'time': time,
+            'time': time_str,
             'stgname': stgname
         }
         
@@ -1358,13 +1515,34 @@ class CpStrategy:
         for item in delitem:
             self.requestStgControl(item[0], item[1], False, "Unknown")
 
-        self.objpb.Unsubscribe()
+        # ===== ✅ Subscribe 확실하게 정리 =====
+        if self.objpb.bIsSB:
+            self.objpb.Unsubscribe()
+            logging.debug("조건검색 이벤트 구독 해제")
+        
+        # 중복 필터링 변수 초기화
+        self.last_event_time.clear()
         
         # 큐 종료
         if self.processing_thread and self.processing_thread.is_alive():
             self.stock_queue.put(None)  # 종료 신호
             self.processing_thread.join(timeout=5.0)
             logging.info("종목 처리 큐 종료")
+        
+        # ===== ✅ 큐 비우기 (남은 데이터 제거) =====
+        while not self.stock_queue.empty():
+            try:
+                self.stock_queue.get_nowait()
+            except:
+                break
+        
+        # ===== ✅ 플래그 초기화 (다음 전략에서 워커 스레드 재시작 가능) =====
+        self.is_thread_started = False
+        self.processing_thread = None
+        
+        # ===== ✅ 처리 중 종목 및 실패 기록 초기화 =====
+        self.processing_stocks.clear()
+        self.failed_stocks.clear()
 
 # ==================== CpIndicators (유지) ====================
 class CpIndicators:
@@ -2171,10 +2349,23 @@ class CpData(QObject):
                 logging.debug(f"{code}: 데이터 업데이트 진행 중, 1초 후 재시도")
                 QTimer.singleShot(1000, lambda: self.monitor_stop(code))
                 return
+            
             with self.stockdata_lock:
+                # ===== ✅ COM 객체 Unsubscribe (스레드 에러 무시) =====
                 if code in self.objCur:
-                    self.objCur[code].Unsubscribe()
-                    del self.objCur[code]
+                    try:
+                        self.objCur[code].Unsubscribe()
+                    except Exception as com_ex:
+                        # COM 스레드 에러는 무시 (다른 스레드에서 호출 시 발생)
+                        logging.debug(f"{code}: Unsubscribe COM 에러 무시 (스레드 충돌)")
+                    
+                    # Unsubscribe 실패해도 객체는 삭제
+                    try:
+                        del self.objCur[code]
+                    except:
+                        pass
+                
+                # ===== ✅ 나머지 데이터 정리 (안전) =====
                 if code in self.stockdata:
                     del self.stockdata[code]
                 if code in self.objIndicators:
@@ -2193,8 +2384,9 @@ class CpData(QObject):
                     del self.sell_volumes[code]
                 if code in self.strength_cache:
                     del self.strength_cache[code]
+                    
         except Exception as ex:
-            logging.error(f"monitor_stop -> {code}, {ex}")
+            logging.debug(f"{code}: monitor_stop 정리 중 에러 (무시): {ex}")
             return False
 
     def _request_chart_data(self, code, request_type='count', count=None, start_date=None, end_date=None):
@@ -2289,16 +2481,31 @@ class CpData(QObject):
                         last_time = self.stockdata[code]['T'][-1]
                         last_date = self.stockdata[code]['D'][-1]
                         
+                        # ===== ✅ 안전한 인덱스 생성 (배열 길이 확인) =====
+                        max_len = min(len(new_data.get('T', [])), len(new_data.get('D', [])))
+                        if max_len == 0:
+                            logging.debug(f"{code}: 업데이트할 데이터 없음")
+                            self.is_updating[code] = False
+                            return False
+                        
                         new_indices = [
-                            i for i in range(len(new_data['T']))
+                            i for i in range(max_len)
                             if (new_data['D'][i] > last_date) or 
                                (new_data['D'][i] == last_date and new_data['T'][i] > last_time)
                         ]
                         
                         if new_indices:
                             for key in new_data:
-                                filtered_data = [new_data[key][i] for i in new_indices]
-                                self.stockdata[code][key].extend(filtered_data)
+                                # ===== ✅ 인덱스 범위 확인 =====
+                                arr = new_data[key]
+                                if not isinstance(arr, list) or len(arr) == 0:
+                                    continue
+                                
+                                # 유효한 인덱스만 필터링
+                                valid_indices = [i for i in new_indices if i < len(arr)]
+                                if valid_indices:
+                                    filtered_data = [arr[i] for i in valid_indices]
+                                    self.stockdata[code][key].extend(filtered_data)
                             
                             if self.chart_type == 'T':
                                 max_length = 400
@@ -4805,12 +5012,37 @@ class ChartDrawer(QObject):
                     logging.debug(f"{code}: 틱 차트 데이터 부족")
                     return
 
+                # ===== ✅ 배열 길이 확인 및 조정 =====
+                base_length = len(filtered_data['C'])
+                
+                # 모든 배열을 base_length로 맞춤
+                def ensure_length(data, key, default_value=0):
+                    arr = data.get(key, [])
+                    if len(arr) == base_length:
+                        return arr
+                    elif len(arr) > base_length:
+                        return arr[-base_length:]
+                    else:
+                        # 부족한 경우 앞을 default_value로 채움
+                        return [default_value] * (base_length - len(arr)) + list(arr)
+                
                 df = pd.DataFrame({
-                    'Open': filtered_data['O'], 'High': filtered_data['H'], 'Low': filtered_data['L'], 'Close': filtered_data['C'], 'Volume': filtered_data['V'], 
-                    'Date': filtered_data['D'], 'Time': filtered_data['T'], 'MAT5': filtered_data['MAT5'], 
-                    'MAT20': filtered_data['MAT20'], 'MAT60': filtered_data['MAT60'], 'MAT120': filtered_data['MAT120'], 
-                    'RSIT': filtered_data['RSIT'], 'RSIT_SIGNAL': filtered_data['RSIT_SIGNAL'], 'MACDT': filtered_data['MACDT'], 
-                    'MACDT_SIGNAL': filtered_data['MACDT_SIGNAL'], 'OSCT': filtered_data['OSCT']
+                    'Open': ensure_length(filtered_data, 'O'), 
+                    'High': ensure_length(filtered_data, 'H'), 
+                    'Low': ensure_length(filtered_data, 'L'), 
+                    'Close': ensure_length(filtered_data, 'C'), 
+                    'Volume': ensure_length(filtered_data, 'V'), 
+                    'Date': ensure_length(filtered_data, 'D'), 
+                    'Time': ensure_length(filtered_data, 'T'), 
+                    'MAT5': ensure_length(filtered_data, 'MAT5'), 
+                    'MAT20': ensure_length(filtered_data, 'MAT20'), 
+                    'MAT60': ensure_length(filtered_data, 'MAT60'), 
+                    'MAT120': ensure_length(filtered_data, 'MAT120'), 
+                    'RSIT': ensure_length(filtered_data, 'RSIT', 50), 
+                    'RSIT_SIGNAL': ensure_length(filtered_data, 'RSIT_SIGNAL', 50), 
+                    'MACDT': ensure_length(filtered_data, 'MACDT'), 
+                    'MACDT_SIGNAL': ensure_length(filtered_data, 'MACDT_SIGNAL'), 
+                    'OSCT': ensure_length(filtered_data, 'OSCT')
                 })
                 df.index = pd.to_datetime(df['Date'].astype(str) + df['Time'].astype(str), format='%Y%m%d%H%M', errors='coerce')
 
@@ -4827,6 +5059,18 @@ class ChartDrawer(QObject):
                 ]
                 mpf.plot(df, ax=axes[0], type='candle', style='yahoo', addplot=addplots)
 
+                # ===== ✅ Y축 범위를 현재 주가 수준에 맞게 조정 =====
+                price_high = df['High'].max()
+                price_low = df['Low'].min()
+                price_range = price_high - price_low
+                
+                # 여유 공간 추가 (위아래 5%)
+                margin = price_range * 0.05 if price_range > 0 else price_low * 0.05
+                y_min = max(0, price_low - margin)  # 0 이하로 내려가지 않도록
+                y_max = price_high + margin
+                
+                axes[0].set_ylim(y_min, y_max)
+                
                 current_price = df['Close'].iloc[-1]
                 axes[0].text(
                     1.01, current_price, f'{current_price}',
@@ -4860,10 +5104,36 @@ class ChartDrawer(QObject):
                     logging.debug(f"{code}: 분봉 차트 데이터 부족")
                     return
 
+                # ===== ✅ 배열 길이 확인 및 조정 =====
+                base_length = len(filtered_data['C'])
+                
+                # 모든 배열을 base_length로 맞춤
+                def ensure_length_min(data, key, default_value=0):
+                    arr = data.get(key, [])
+                    if len(arr) == base_length:
+                        return arr
+                    elif len(arr) > base_length:
+                        return arr[-base_length:]
+                    else:
+                        # 부족한 경우 앞을 default_value로 채움
+                        return [default_value] * (base_length - len(arr)) + list(arr)
+                
                 df = pd.DataFrame({
-                    'Open': filtered_data['O'], 'High': filtered_data['H'], 'Low': filtered_data['L'], 'Close': filtered_data['C'], 'Volume': filtered_data['V'],
-                    'Date': filtered_data['D'], 'Time': filtered_data['T'], 'MAM5': filtered_data['MAM5'], 'MAM10': filtered_data['MAM10'], 'MAM20': filtered_data['MAM20'],
-                    'RSI': filtered_data['RSI'], 'RSI_SIGNAL': filtered_data['RSI_SIGNAL'], 'MACD': filtered_data['MACD'], 'MACD_SIGNAL': filtered_data['MACD_SIGNAL'], 'OSC': filtered_data['OSC']
+                    'Open': ensure_length_min(filtered_data, 'O'), 
+                    'High': ensure_length_min(filtered_data, 'H'), 
+                    'Low': ensure_length_min(filtered_data, 'L'), 
+                    'Close': ensure_length_min(filtered_data, 'C'), 
+                    'Volume': ensure_length_min(filtered_data, 'V'),
+                    'Date': ensure_length_min(filtered_data, 'D'), 
+                    'Time': ensure_length_min(filtered_data, 'T'), 
+                    'MAM5': ensure_length_min(filtered_data, 'MAM5'), 
+                    'MAM10': ensure_length_min(filtered_data, 'MAM10'), 
+                    'MAM20': ensure_length_min(filtered_data, 'MAM20'),
+                    'RSI': ensure_length_min(filtered_data, 'RSI', 50), 
+                    'RSI_SIGNAL': ensure_length_min(filtered_data, 'RSI_SIGNAL', 50), 
+                    'MACD': ensure_length_min(filtered_data, 'MACD'), 
+                    'MACD_SIGNAL': ensure_length_min(filtered_data, 'MACD_SIGNAL'), 
+                    'OSC': ensure_length_min(filtered_data, 'OSC')
                 })
                 df.index = pd.to_datetime(df['Date'].astype(str) + df['Time'].astype(str), format='%Y%m%d%H%M')
 
@@ -4879,6 +5149,18 @@ class ChartDrawer(QObject):
                 ]
                 mpf.plot(df, ax=axes[0], type='candle', style='yahoo', volume=axes[1], addplot=addplots)
 
+                # ===== ✅ Y축 범위를 현재 주가 수준에 맞게 조정 =====
+                price_high = df['High'].max()
+                price_low = df['Low'].min()
+                price_range = price_high - price_low
+                
+                # 여유 공간 추가 (위아래 5%)
+                margin = price_range * 0.05 if price_range > 0 else price_low * 0.05
+                y_min = max(0, price_low - margin)  # 0 이하로 내려가지 않도록
+                y_max = price_high + margin
+                
+                axes[0].set_ylim(y_min, y_max)
+                
                 current_price = df['Close'].iloc[-1]
                 axes[0].text(
                     1.01, current_price, f'<{current_price}>',
@@ -4909,18 +5191,29 @@ class ChartDrawer(QObject):
 
             if code in self.trader.starting_price:
                 starting_price_line = self.trader.starting_price[code]
-                y_min, y_max = axes[0].get_ylim()
-                if data_type == 'tick':
-                    if y_min <= starting_price_line <= y_max:
-                        axes[0].axhline(y=starting_price_line, color='orangered', linestyle='--', linewidth=1, label='Starting Price')
-                elif data_type == 'min':
+                
+                # ===== ✅ Starting Price가 0이 아닌 경우만 처리 =====
+                if starting_price_line > 0:
+                    y_min, y_max = axes[0].get_ylim()
+                    
+                    # Starting Price가 범위 밖이면 범위 확장
                     if starting_price_line < y_min or starting_price_line > y_max:
-                        axes[0].set_ylim(min(y_min, starting_price_line), max(y_max, starting_price_line))
+                        axes[0].set_ylim(min(y_min, starting_price_line * 0.99), max(y_max, starting_price_line * 1.01))
+                    
                     axes[0].axhline(y=starting_price_line, color='orangered', linestyle='--', linewidth=1, label='Starting Price')
 
             if code in self.trader.buy_price:
                 buy_price_line = self.trader.buy_price[code]
-                axes[0].axhline(y=buy_price_line, color='red', linestyle='-', linewidth=1, label='Buy Price')
+                
+                # ===== ✅ Buy Price가 0이 아닌 경우만 처리 =====
+                if buy_price_line > 0:
+                    y_min, y_max = axes[0].get_ylim()
+                    
+                    # Buy Price가 범위 밖이면 범위 확장
+                    if buy_price_line < y_min or buy_price_line > y_max:
+                        axes[0].set_ylim(min(y_min, buy_price_line * 0.99), max(y_max, buy_price_line * 1.01))
+                    
+                    axes[0].axhline(y=buy_price_line, color='red', linestyle='-', linewidth=1, label='Buy Price')
 
         except Exception as ex:
             logging.error(f"draw_chart_data -> {code}, {ex}\n{traceback.format_exc()}")
@@ -6652,8 +6945,9 @@ class MyWindow(QWidget):
                 logging.info(f"=== 통합 전략 시작 ===")
                 self.trader.init_stock_balance()
                 
-                self.objstg.momentum_scanner = MomentumScanner(self.trader)
-                self.objstg.gap_scanner = GapUpScanner(self.trader)
+                # ✅ Scanner는 CpStrategy.__init__에서 이미 초기화됨 (중복 제거)
+                # self.objstg.momentum_scanner = MomentumScanner(self.trader)
+                # self.objstg.gap_scanner = GapUpScanner(self.trader)
                 
                 self._load_stocks_from_db_safely('mylist.db')
                 
@@ -6669,12 +6963,44 @@ class MyWindow(QWidget):
                 
                 self.gap_scanner = self.objstg.gap_scanner
                 logging.info("✅ 통합 전략 초기화 완료")
-                logging.info("📋 조건검색 리스트 로드 대기 중... (급등주, 갭상승)")
+                
+                # ===== ✅ 조건검색 리스트 로드 및 시작 =====
+                if hasattr(self, 'data8537') and self.data8537:
+                    # 이미 로드된 경우 바로 시작
+                    logging.info("📋 조건검색 리스트 이미 로드됨 - 급등주, 갭상승 시작")
+                    self._start_condition_search("급등주")
+                    time.sleep(0.5)
+                    self._start_condition_search("갭상승")
+                else:
+                    # 로드되지 않은 경우 로드 시도
+                    logging.info("📋 조건검색 리스트 로드 시도...")
+                    try:
+                        # API 제한 확인
+                        remain_time = cpStatus.GetLimitRemainTime(0)
+                        if remain_time > 0:
+                            wait_sec = remain_time / 1000 + 0.1
+                            logging.debug(f"API 제한: {wait_sec:.1f}초 대기")
+                            time.sleep(wait_sec)
+                        
+                        # 조건검색 리스트 로드
+                        self.data8537 = self.objstg.requestList()
+                        self._condition_list_loaded = True
+                        logging.info("✅ 조건검색 리스트 로드 완료")
+                        
+                        # 로드 후 바로 시작
+                        self._start_condition_search("급등주")
+                        time.sleep(0.5)
+                        self._start_condition_search("갭상승")
+                    except Exception as ex:
+                        logging.error(f"조건검색 리스트 로드 실패: {ex}")
 
             # ===== 기타 전략 =====
             else:
                 if hasattr(self, 'pb9619'):
                     self.pb9619.Unsubscribe()
+                
+                # ===== ✅ 기존 조건검색 모두 정리 =====
+                self.objstg.Clear()
                 
                 logging.info(f"전략 초기화: {stgName}")
                 self.trader.init_stock_balance()
@@ -6799,6 +7125,24 @@ class MyWindow(QWidget):
             id = stg_item['ID']
             name = stg_item['전략명']
             
+            # ===== ✅ 200종목 제한 체크 (실시간 감시 시작 전) =====
+            ret, stockList = self.objstg.requestStgID(id)
+            if not ret:
+                logging.warning(f"❌ 조건검색 '{name}' 종목 조회 실패")
+                return False
+            
+            stock_count = len(stockList)
+            logging.info(f"📊 조건검색 '{name}': 현재 {stock_count}개 종목 검색됨")
+            
+            if stock_count >= 200:
+                logging.warning(f"{'='*40}")
+                logging.warning(f"⚠️  경고: 조건검색 '{name}' 종목 수 초과!")
+                logging.warning(f"⚠️  검색된 종목: {stock_count}개 (제한: 200개)")
+                logging.warning(f"⚠️  실시간 감시가 불가능합니다.")
+                logging.warning(f"⚠️  대신증권 HTS에서 조건을 더 엄격하게 수정하세요.")
+                logging.warning(f"{'='*40}")
+                return False
+            
             ret, monid = self.objstg.requestMonitorID(id)
             if not ret:
                 logging.warning(f"❌ 조건검색 '{name}' 모니터 ID 획득 실패")
@@ -6806,11 +7150,44 @@ class MyWindow(QWidget):
             
             ret, status = self.objstg.requestStgControl(id, monid, True, name)
             if ret:
-                logging.info(f"{'='*60}")
+                logging.info(f"{'='*40}")
                 logging.info(f"🎯 조건검색 감시 시작: [{name}]")
-                logging.info(f"{'='*60}")
+                logging.info(f"📊 현재 편입 종목: {stock_count}개 / 200개")
                 logging.info(f"💡 대신증권 HTS에서 [{name}] 조건에 맞는 종목이 발견되면 실시간으로 이 화면에 표시됩니다!")
-                logging.info(f"{'='*60}")
+                logging.info(f"{'='*40}")
+                
+                # ===== ✅ 기존 편입 종목 검증 처리 (프로그램 시작 시) =====
+                if stock_count > 0 and stockList:
+                    logging.info(f"🔍 기존 편입 종목 {stock_count}개 검증 시작...")
+                    
+                    # 큐 처리 스레드가 시작되었는지 확인
+                    if not self.objstg.is_thread_started:
+                        self.objstg.start_processing_queue()
+                    
+                    # 각 종목을 처리 큐에 추가
+                    added_count = 0
+                    for stock_info in stockList:
+                        try:
+                            code = stock_info.get('code', '')
+                            price = stock_info.get('price', 0)
+                            
+                            if code:
+                                # 현재 시간 생성
+                                time_str = datetime.now().strftime('%m/%d %H:%M:%S')
+                                
+                                # 큐에 추가
+                                self.objstg.checkRealtimeStg(id, monid, code, price, time_str)
+                                added_count += 1
+                                
+                                # API 제한 고려하여 짧은 대기
+                                time.sleep(0.05)
+                                
+                        except Exception as ex:
+                            logging.error(f"기존 종목 {code} 큐 추가 실패: {ex}")
+                            continue
+                    
+                    logging.info(f"✅ 기존 편입 종목 {added_count}개를 처리 큐에 추가 완료")
+                
                 return True
             else:
                 logging.warning(f"❌ 조건검색 '{name}' 시작 실패")
@@ -7978,7 +8355,20 @@ class QTextEditLogger(QObject, logging.Handler):
         self.text_edit.append(msg)
 
     def emit(self, record):
+        # 빈 로그 메시지 필터링 (더 강력한 필터)
+        message = record.getMessage()
+        if not message or not message.strip() or message.strip() == "":
+            return
+        
         msg = self.format(record)
+        
+        # 포맷팅된 메시지에서도 확인 (타임스탬프 제거 후)
+        # 형식: "2025-10-13 10:14:04,278 - MESSAGE"
+        if " - " in msg:
+            content = msg.split(" - ", 1)[1].strip() if len(msg.split(" - ", 1)) > 1 else ""
+            if not content or content == "":
+                return
+        
         if '매매이익' in msg:
             msg = f"<span style='color:green;'>{msg}</span>"
         elif '매매손실' in msg:
@@ -8079,10 +8469,10 @@ if __name__ == "__main__":
     try:
         # 로그 초기화 (빠름)
         setup_logging()
-        logging.info("=" * 50)
+        logging.info("=" * 40)
         logging.info("=== 초단타 매매 프로그램 시작 ===")
         logging.info(f"실행 경로: {os.getcwd()}")
-        logging.info("=" * 50)
+        logging.info("=" * 40)
 
         # QApplication 생성 (빠름)
         app = QApplication(sys.argv)
