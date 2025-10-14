@@ -14,12 +14,11 @@ last_strategy =
 [STRATEGIES]
 stg_integrated = 통합 전략
 stg_1 = VI 발동
-stg_2 = 전일상한가
-stg_3 = 급등주
-stg_4 = 갭상승
+stg_2 = 급등주
+stg_3 = 갭상승
 
 [STRATEGY_TYPES]
-static = 전일상한가,전일급등,전일거래량급증,52주신고가,이격도상승,신고가돌파
+static = 전일급등,전일거래량급증,52주신고가,이격도상승,신고가돌파
 dynamic = 급등주,갭상승,거래량급증,돌파,급등돌파
 max_static_load = 10
 
@@ -39,19 +38,6 @@ buy_stg_1 = {"name": "골든크로스", "content": "(MAT5[-1] > MAT20[-1] > MAT6
 sell_stg_1 = {"name": "상한가 매도", "content": "all(x == y for x, y in zip(tick_high_price[-3:], tick_low_price[-3:])) and (tick_high_price[-1] == tick_high_price[-2] == tick_high_price[-3])"}
 sell_stg_2 = {"name": "stop_loss 매도", "content": "tick_close_price[-1] < self.trader.highest_price[code] * 0.995 and self.stock_rate > 0.3"}
 sell_stg_3 = {"name": "OSCT 음수 전환", "content": "(OSCT[-2] < OSCT[-1] < 0)"}
-
-[전일상한가]
-# ===== 매수 전략 (3개) =====
-buy_stg_1 = {"name": "시초가 강세 진입", "content": "(MAT5 > MAT20 > MAT60) and (C > MAT5) and (MAM5 > MAM10) and positive_candle and (40 < RSIT < 75) and strength >= 100"}
-buy_stg_2 = {"name": "재상승 신호", "content": "(MAT5 > MAT20) and (C > tick_VWAP) and (OSCT > 0) and (STOCHK > STOCHD) and (STOCHK > 30) and strength >= 110"}
-buy_stg_3 = {"name": "추격 매수 (안전)", "content": "(MAT5 > MAT20 > MAT60) and (C > MAT5 * 1.005) and (MAM5 > MAM10) and (RSIT > 50) and (RSIT < 70) and strength >= 120"}
-
-# ===== 매도 전략 (5개) =====
-sell_stg_1 = {"name": "상한가 도달", "content": "all(x == y for x, y in zip(tick_H_recent[-3:], tick_L_recent[-3:])) and (tick_H_recent[-1] == tick_H_recent[-2] == tick_H_recent[-3])"}
-sell_stg_2 = {"name": "목표 익절 (+4.0%)", "content": "current_profit_pct >= 4.0"}
-sell_stg_3 = {"name": "손절 (-1.0%)", "content": "current_profit_pct < -1.0"}
-sell_stg_4 = {"name": "추적 손절 (고점 대비)", "content": "current_profit_pct > 2.0 and from_peak_pct < -1.0"}
-sell_stg_5 = {"name": "시간 + 기술적 매도", "content": "hold_minutes > 120 and (MAT5 < MAT20 or OSCT < 0) and current_profit_pct < 0.5"}
 
 [급등주]
 # ===== 매수 전략 (5개) =====

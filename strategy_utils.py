@@ -9,8 +9,10 @@ STRATEGY_SAFE_GLOBALS = {
     '__builtins__': {
         'min': min, 'max': max, 'abs': abs, 'round': round,
         'int': int, 'float': float, 'bool': bool, 'str': str,
-        'len': len, 'sum': sum, 'all': all, 'any': any,
-        'True': True, 'False': False, 'None': None
+        'sum': sum, 'all': all, 'any': any,
+        'True': True, 'False': False, 'None': None,
+        # len 함수를 안전하게 래핑
+        'len': lambda x: len(x) if hasattr(x, '__len__') else 1
     }
 }
 
