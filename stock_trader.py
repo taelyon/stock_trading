@@ -1129,12 +1129,12 @@ class CpStrategy(QThread):
             
             stock_name = cpCodeMgr.CodeToName(code)
             
-            logging.info(f"{'='*40}")
+            logging.info(f"{'='*45}")
             if stgprice > 0:
                 logging.info(f"🔍 [{stgname}] {stock_name}({code}) 검증 시작 - 가격: {stgprice:,}원")
             else:
                 logging.info(f"🔍 [{stgname}] {stock_name}({code}) 검증 시작 (기존 편입 종목)")
-            logging.info(f"{'='*40}")
+            logging.info(f"{'='*45}")
             
             # 중복 확인
             if code in self.trader.monistock_set:
@@ -8141,12 +8141,12 @@ class MyWindow(QWidget):
             
             
             if stock_count >= 200:
-                logging.warning(f"{'='*40}")
+                logging.warning(f"{'='*45}")
                 logging.warning(f"⚠️  경고: 조건검색 '{name}' 종목 수 초과!")
                 logging.warning(f"⚠️  검색된 종목: {stock_count}개 (제한: 200개)")
                 logging.warning(f"⚠️  실시간 감시가 불가능합니다.")
                 logging.warning(f"⚠️  대신증권 HTS에서 조건을 더 엄격하게 수정하세요.")
-                logging.warning(f"{'='*40}")
+                logging.warning(f"{'='*45}")
                 return False
             
             # ===== ✅ 기존 편입 종목 검증 처리 (모니터 ID 획득 성공/실패와 무관) =====
@@ -9543,10 +9543,10 @@ if __name__ == "__main__":
     try:
         # 로그 초기화 (빠름)
         setup_logging()
-        logging.info("=" * 40)
+        logging.info("=" * 45)
         logging.info("=== 초단타 매매 프로그램 시작 ===")
         logging.info(f"실행 경로: {os.getcwd()}")
-        logging.info("=" * 40)
+        logging.info("=" * 45)
 
         # QApplication 생성 (빠름)
         app = QApplication(sys.argv)
