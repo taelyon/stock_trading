@@ -1197,9 +1197,7 @@ class CpStrategy(QThread):
                 logging.warning(f"❌ [{stock_name}] MomentumScanner가 초기화되지 않음")
                 return False
             
-            # ===== ✅ 1단계: 일봉 데이터 먼저 로드 =====
-            logging.info(f"📊 [급등주] {stock_name}({code}): 일봉 데이터 로드 중...")
-            
+            # ===== ✅ 1단계: 일봉 데이터 먼저 로드 =====            
             # API 제한 확인
             if not self._check_api_limit_and_wait("일봉 데이터 로드"):
                 logging.warning(f"❌ [급등주] {stock_name}({code}): API 제한으로 일봉 로드 거부")
@@ -1217,7 +1215,6 @@ class CpStrategy(QThread):
             time.sleep(0.5)
             
             # ===== ✅ 2단계: 틱/분 데이터 로드 (순차 로드로 변경) =====
-            logging.info(f"📊 [급등주] {stock_name}({code}): 틱/분 데이터 로드 중...")
             try:
                 # ✅ 틱 데이터 먼저 로드 (API 제한 고려)
                 logging.debug(f"🔍 [급등주] {stock_name}({code}): 틱 데이터 로드 시작...")
@@ -1290,7 +1287,6 @@ class CpStrategy(QThread):
                 logging.warning(f"⚠️ [급등주] {stock_name}({code}): 일부 데이터 로드 실패 (틱:{tick_ok}, 분:{min_ok}), 일봉 데이터로 검증 진행")
             
             # ===== ✅ 데이터 준비 대기 (최대 15초, 조건 완화) =====
-            logging.info(f"⏳ [급등주] {stock_name}({code}): 데이터 준비 대기 시작...")
             data_ready = False
             for attempt in range(12):  # 최대 12회 시도 (12초로 단축)
                 time.sleep(1.0)
@@ -1308,7 +1304,6 @@ class CpStrategy(QThread):
                 # 일봉 데이터만 있어도 진행
                 if day_has_data and (tick_has_data or not tick_ok) and (min_has_data or not min_ok):
                     data_ready = True
-                    logging.info(f"✅ [급등주] {stock_name}({code}): 데이터 준비 완료 ({attempt+1}초, 일봉:{len(day_data.get('C', []))}개, 틱:{len(tick_data.get('C', [])) if tick_ok else '스킵'}개, 분:{len(min_data.get('C', [])) if min_ok else '스킵'}개)")
                     break
                 else:
                     logging.info(f"⏳ [급등주] {stock_name}({code}): 데이터 대기 중... ({attempt+1}/15초) - 틱:{len(tick_data.get('C', []))}개, 분:{len(min_data.get('C', []))}개, 일:{len(day_data.get('C', []))}개)")
@@ -1424,9 +1419,7 @@ class CpStrategy(QThread):
                 logging.error(f"❌ [갭상승] {stock_name}({code}): 일봉 로드 중 오류: {ex}")
                 return False
             
-            # ===== ✅ 2단계: 틱/분 데이터 로드 (순차 로드로 변경) =====
-            logging.info(f"📊 [갭상승] {stock_name}({code}): 틱/분 데이터 로드 중...")
-            
+            # ===== ✅ 2단계: 틱/분 데이터 로드 (순차 로드로 변경) =====            
             try:
                 # ✅ 틱 데이터 먼저 로드 (API 제한 고려)
                 # API 제한 확인
@@ -1487,7 +1480,6 @@ class CpStrategy(QThread):
                 return False
             
             # ===== ✅ 데이터 준비 대기 (최대 15초, 조건 완화) =====
-            logging.info(f"⏳ [갭상승] {stock_name}({code}): 데이터 준비 대기 시작...")
             data_ready = False
             for attempt in range(12):  # 최대 12회 시도 (12초로 단축)
                 time.sleep(1.0)
@@ -1504,7 +1496,6 @@ class CpStrategy(QThread):
                 
                 if tick_has_data and min_has_data and day_has_data:
                     data_ready = True
-                    logging.info(f"✅ [갭상승] {stock_name}({code}): 데이터 준비 완료 ({attempt+1}초, 틱:{len(tick_data.get('C', []))}개, 분:{len(min_data.get('C', []))}개, 일:{len(day_data.get('C', []))}개)")
                     break
                 else:
                     logging.info(f"⏳ [갭상승] {stock_name}({code}): 데이터 대기 중... ({attempt+1}/15초) - 틱:{len(tick_data.get('C', []))}개, 분:{len(min_data.get('C', []))}개, 일:{len(day_data.get('C', []))}개)")
