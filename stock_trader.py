@@ -1072,9 +1072,8 @@ class CpStrategy(QThread):
         try:
             # 시세 조회 제한 상태 확인 (문서 기준 올바른 함수명 사용)
             remain_count = cpCybos.GetLimitRemainCount(rqtype)   # 시세 조회 남은 횟수 (0: 시세 조회)
-            remain_time = cpCybos.GetLimitRemainTime(rqtype)     # 제한 해제까지 남은 시간
-            
-            logging.debug(f"🔍 {operation_name} 전 API 상태 - 남은 요청: {remain_count}건, 제한 해제까지: {remain_time}ms")
+
+            logging.debug(f"🔍 {operation_name} 전 API 상태 - 남은 요청: {remain_count}건")
             
             if remain_count > 0:
                 # ✅ 요청 가능: 남은 건수가 있음
@@ -1083,7 +1082,7 @@ class CpStrategy(QThread):
                 return True
             else:
                 # ❌ 요청 불가: 남은 건수가 0건
-                logging.warning(f"🚫 {operation_name} 거부: 요청 제한 (남은 요청: {remain_count}건, 제한 해제까지: {remain_time}ms)")
+                logging.warning(f"🚫 {operation_name} 거부: 요청 제한 (남은 요청: {remain_count}건)")
                 return False
             
         except Exception as ex:
@@ -1094,17 +1093,14 @@ class CpStrategy(QThread):
         """API 상태 로깅"""
         try:
             remain_count = cpCybos.GetLimitRemainCount(0)
-            remain_time = cpCybos.GetLimitRemainTime(0)
             
             if success:
-                logging.debug(f"✅ {operation_name} 완료 - API 상태: 남은 요청 {remain_count}건, 제한 해제까지 {remain_time}ms")
+                logging.debug(f"✅ {operation_name} 완료 - API 상태: 남은 요청 {remain_count}건")
             else:
-                logging.warning(f"❌ {operation_name} 실패 - API 상태: 남은 요청 {remain_count}건, 제한 해제까지 {remain_time}ms")
+                logging.warning(f"❌ {operation_name} 실패 - API 상태: 남은 요청 {remain_count}건")
                 
             # API 제한 상태 경고
-            if remain_time > 0:
-                logging.warning(f"🚫 API 제한 활성화: {remain_time}ms 후 해제 예정")
-            elif remain_count <= 10:
+            if remain_count <= 10:
                 logging.warning(f"⚠️ API 요청 한계 근접: 남은 요청 {remain_count}건")
                 
         except Exception as ex:
@@ -2472,9 +2468,8 @@ class CpData(QObject):
         try:
             # 시세 조회 제한 상태 확인 (문서 기준 올바른 함수명 사용)
             remain_count = cpCybos.GetLimitRemainCount(rqtype)   # 시세 조회 남은 횟수 (0: 시세 조회)
-            remain_time = cpCybos.GetLimitRemainTime(rqtype)     # 제한 해제까지 남은 시간
-            
-            logging.debug(f"🔍 {operation_name} 전 API 상태 - 남은 요청: {remain_count}건, 제한 해제까지: {remain_time}ms")
+
+            logging.debug(f"🔍 {operation_name} 전 API 상태 - 남은 요청: {remain_count}건")
             
             if remain_count > 0:
                 # ✅ 요청 가능: 남은 건수가 있음
@@ -2483,7 +2478,7 @@ class CpData(QObject):
                 return True
             else:
                 # ❌ 요청 불가: 남은 건수가 0건
-                logging.warning(f"🚫 {operation_name} 거부: 요청 제한 (남은 요청: {remain_count}건, 제한 해제까지: {remain_time}ms)")
+                logging.warning(f"🚫 {operation_name} 거부: 요청 제한 (남은 요청: {remain_count}건)")
                 return False
             
         except Exception as ex:
