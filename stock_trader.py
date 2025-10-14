@@ -314,9 +314,13 @@ class MomentumScanner(QObject):
             (is_valid, score, message): (검증 통과 여부, 점수, 메시지)
         """
         try:
+            stock_name = cpCodeMgr.CodeToName(code)
+            logging.debug(f"🔍 [MomentumScanner] {stock_name}({code}): 검증 시작")
+            
             # 캐시 확인
             cached_score = stock_info_cache.get(f"score_{code}")
             if cached_score is not None:
+                logging.debug(f"🔍 [MomentumScanner] {stock_name}({code}): 캐시에서 조회 (점수: {cached_score})")
                 return (cached_score >= 70, cached_score, "캐시에서 조회")
             
             # ===== ✅ 메모리 데이터 기반 검증 (stockdata 직접 조회) =====
@@ -329,11 +333,15 @@ class MomentumScanner(QObject):
             with self.trader.daydata.stockdata_lock:
                 day_data = self.trader.daydata.stockdata.get(code, {})
             
+            logging.debug(f"🔍 [MomentumScanner] {stock_name}({code}): 데이터 확인 - 틱:{len(tick_data.get('C', []))}개, 분:{len(min_data.get('C', []))}개, 일:{len(day_data.get('C', []))}개")
+            
             # 최소 데이터 확인
             if not tick_data or not min_data or not day_data:
+                logging.debug(f"❌ [MomentumScanner] {stock_name}({code}): 메모리 데이터 없음")
                 return (False, 0, "메모리 데이터 없음")
             
             if len(tick_data.get('C', [])) == 0 or len(min_data.get('C', [])) == 0 or len(day_data.get('C', [])) < 2:
+                logging.debug(f"❌ [MomentumScanner] {stock_name}({code}): 데이터 부족")
                 return (False, 0, f"데이터 부족 (틱:{len(tick_data.get('C', []))}, 분:{len(min_data.get('C', []))}, 일:{len(day_data.get('C', []))})")
             
             # ===== 데이터 추출 (메모리에서) =====
@@ -355,6 +363,15 @@ class MomentumScanner(QObject):
                 
                 if current_price == 0 or open_price == 0:
                     return (False, 0, "가격 데이터 없음")
+                
+                # ✅ 거래량 데이터 유효성 확인
+                if volume <= 0:
+                    logging.warning(f"🔍 {code}: 당일 거래량이 0 또는 음수 ({volume})")
+                    return (False, 0, f"당일 거래량 오류 ({volume})")
+                
+                if prev_volume < 0:
+                    logging.warning(f"🔍 {code}: 전일 거래량이 음수 ({prev_volume})")
+                    prev_volume = 0  # 음수는 0으로 처리
                     
             except Exception as ex:
                 logging.error(f"{code}: 메모리 데이터 추출 실패: {ex}")
@@ -370,31 +387,70 @@ class MomentumScanner(QObject):
             
             score = 0
             
-            # ===== 1. 시가 대비 상승률 (0-30점) =====
+            # ===== 1. 시가 대비 상승률 (장초반 가중치 증가) =====
             if open_price > 0:
                 price_change_pct = (current_price - open_price) / open_price * 100
                 
+                # 장초반(9-10시)에는 상승률에 더 높은 가중치 부여
+                max_price_score = 30 if 9 <= now.hour < 10 else 30
+                
                 if 2.0 <= price_change_pct < 3.5:
-                    score += 30
+                    score += max_price_score
                 elif 3.5 <= price_change_pct < 5.0:
-                    score += 20
+                    score += max_price_score * 0.7  # 21점
                 elif 5.0 <= price_change_pct < 7.0:
-                    score += 10
+                    score += max_price_score * 0.4  # 12점
                 elif price_change_pct < 0:
                     return (False, 0, "시가 대비 하락")
             
             # ===== 2. 거래량 비율 (0-25점) =====
-            if prev_volume > 0:
-                volume_ratio = volume / prev_volume
-                
-                if volume_ratio >= 5.0:
-                    score += 25
-                elif volume_ratio >= 3.0:
-                    score += 20
-                elif volume_ratio >= 2.0:
-                    score += 10
-                elif volume_ratio < 1.5:
-                    return (False, 0, f"거래량 부족 ({volume_ratio:.1f}배)")
+            # ✅ 개선: 장초반에는 거래량 검증 스킵, 다른 지표로 대체
+            now = datetime.now()
+            volume_score = 0
+            
+            # 장초반(9-10시)에는 거래량 검증 스킵하고 기본 점수 부여
+            if 9 <= now.hour < 10:
+                logging.info(f"🔍 {code}: 장초반 거래량 검증 스킵 (시간: {now.hour:02d}:{now.minute:02d})")
+                volume_score = 15  # 장초반 기본 점수
+            else:
+                # 10시 이후부터는 정상적인 거래량 검증
+                if prev_volume > 0:
+                    volume_ratio = volume / prev_volume
+                    
+                    # 시간대별 보정 (10시 이후)
+                    time_factor = 1.0
+                    if 10 <= now.hour < 11:  # 10-11시
+                        time_factor = 0.6  # 60%만 거래되어도 정상
+                    elif 11 <= now.hour < 12:  # 11-12시
+                        time_factor = 0.8  # 80%만 거래되어도 정상
+                    
+                    # 보정된 거래량 비율
+                    adjusted_ratio = volume_ratio / time_factor
+                    
+                    if adjusted_ratio >= 5.0:
+                        volume_score = 25
+                    elif adjusted_ratio >= 3.0:
+                        volume_score = 20
+                    elif adjusted_ratio >= 2.0:
+                        volume_score = 15
+                    elif adjusted_ratio >= 1.0:
+                        volume_score = 10
+                    elif adjusted_ratio >= 0.7:  # 70% 이상이면 통과
+                        volume_score = 5
+                    else:
+                        # 거래량 부족이지만 탈락하지는 않음 (점수만 낮게)
+                        logging.warning(f"🔍 {code}: 거래량 부족 ({adjusted_ratio:.1f}배, 원래:{volume_ratio:.1f}배)")
+                        volume_score = 0
+                else:
+                    # 전일 거래량이 없는 경우
+                    if volume > 0:
+                        logging.info(f"🔍 {code}: 전일 거래량 없음, 당일 거래량으로 판단 ({volume:,}주)")
+                        volume_score = 15  # 기본 점수
+                    else:
+                        logging.warning(f"🔍 {code}: 거래량 데이터 없음")
+                        volume_score = 0
+            
+            score += volume_score
             
             # ===== 3. 당일 고가 근처 유지 (0-20점) =====
             if high_price > 0 and low_price > 0:
@@ -416,14 +472,23 @@ class MomentumScanner(QObject):
             elif current_price > open_price:
                 score += 10
             
-            # ===== 5. 시간대 가중치 (0-10점) =====
-            now = datetime.now()
+            # ===== 5. 시간대 가중치 (장초반 가중치 증가) =====
             if 9 <= now.hour < 10:
-                score += 10
+                score += 15  # 장초반 가중치 증가 (10→15점)
             elif 10 <= now.hour < 12:
-                score += 7
+                score += 10  # 오전 가중치 증가 (7→10점)
             elif 13 <= now.hour < 14:
-                score += 5
+                score += 7   # 오후 가중치 증가 (5→7점)
+            
+            # ===== 6. 장초반 급등주 보너스 (0-10점) =====
+            if 9 <= now.hour < 10 and price_change_pct >= 2.0:
+                # 장초반에 2% 이상 상승한 종목에 보너스 점수
+                if price_change_pct >= 5.0:
+                    score += 10  # 5% 이상 급등
+                elif price_change_pct >= 3.5:
+                    score += 7   # 3.5% 이상 급등
+                elif price_change_pct >= 2.0:
+                    score += 5   # 2% 이상 상승
             
             # 캐시 저장
             stock_info_cache.set(f"score_{code}", score)
@@ -431,6 +496,16 @@ class MomentumScanner(QObject):
             is_valid = score >= 70
             message = f"급등주 점수: {score}/100"
             
+            # ✅ 장초반 급등주 검증 로깅 개선
+            time_info = f"시간: {now.hour:02d}:{now.minute:02d}"
+            volume_info = f"거래량: {volume:,}주"
+            if prev_volume > 0 and 9 < now.hour:  # 10시 이후만 거래량 비율 표시
+                volume_ratio = volume / prev_volume
+                volume_info += f" (전일:{prev_volume:,}주, 비율:{volume_ratio:.1f}배)"
+            else:
+                volume_info += " (거래량 검증 스킵)" if 9 <= now.hour < 10 else " (전일거래량 없음)"
+            
+            logging.info(f"🚀 [급등주검증] {stock_name}({code}): {time_info}, 상승률:{price_change_pct:.1f}%, 점수:{score}/100, 유효:{is_valid}, {volume_info}")
             return (is_valid, score, message)
             
         except Exception as ex:
@@ -1033,23 +1108,28 @@ class CpStrategy:
             # ===== ✅ 2단계: 틱/분 데이터 로드 (타임아웃 30초) =====
             logging.info(f"📊 [급등주] {stock_name}({code}): 틱/분 데이터 로드 중...")
             try:
+                logging.debug(f"🔍 [급등주] {stock_name}({code}): 틱 데이터 로드 시작...")
                 tick_ok = self._load_with_timeout(
                     self.trader.tickdata.monitor_code,
                     code,
                     timeout=30.0
                 )
+                logging.debug(f"🔍 [급등주] {stock_name}({code}): 틱 데이터 로드 결과: {tick_ok}")
+                
+                logging.debug(f"🔍 [급등주] {stock_name}({code}): 분봉 데이터 로드 시작...")
                 min_ok = self._load_with_timeout(
                     self.trader.mindata.monitor_code,
                     code,
                     timeout=30.0
                 )
+                logging.debug(f"🔍 [급등주] {stock_name}({code}): 분봉 데이터 로드 결과: {min_ok}")
             except Exception as ex:
                 logging.error(f"❌ [급등주] {stock_name}({code}): 데이터 로드 중 오류: {ex}")
                 self.trader.daydata.monitor_stop(code)
                 return False
             
             if not (tick_ok and min_ok):
-                logging.warning(f"❌ [급등주] {stock_name}({code}): 틱/분 로드 실패")
+                logging.warning(f"❌ [급등주] {stock_name}({code}): 틱/분 로드 실패 (틱:{tick_ok}, 분:{min_ok})")
                 self.trader.daydata.monitor_stop(code)
                 return False
             
@@ -1086,11 +1166,13 @@ class CpStrategy:
             # ===== ✅ 3단계: 급등주 조건 재확인 (메모리 데이터 기반) =====
             logging.info(f"🔍 [급등주] {stock_name}({code}): 조건 검증 시작...")
             try:
+                logging.debug(f"🔍 [급등주] {stock_name}({code}): MomentumScanner 검증 호출...")
                 is_valid, score, message = self._verify_with_timeout(
                     self.momentum_scanner.verify_momentum_conditions,
                     code,
                     timeout=10.0
                 )
+                logging.debug(f"🔍 [급등주] {stock_name}({code}): 검증 결과 - 유효:{is_valid}, 점수:{score}, 메시지:{message}")
             except Exception as ex:
                 logging.error(f"❌ [급등주] {stock_name}({code}): 검증 중 오류: {ex}")
                 self.trader.daydata.monitor_stop(code)
@@ -1111,13 +1193,31 @@ class CpStrategy:
             )
             
             # 체결강도 확인
+            logging.info(f"🔍 [급등주] {stock_name}({code}): 체결강도 확인 중...")
             time.sleep(0.5)
-            strength = self.trader.tickdata.get_strength(code)
+            try:
+                strength = self.trader.tickdata.get_strength(code)
+                logging.debug(f"🔍 [급등주] {stock_name}({code}): 체결강도 조회 결과: {strength}")
+            except Exception as ex:
+                logging.error(f"❌ [급등주] {stock_name}({code}): 체결강도 조회 실패: {ex}")
+                self.trader.daydata.monitor_stop(code)
+                self.trader.tickdata.monitor_stop(code)
+                self.trader.mindata.monitor_stop(code)
+                return False
             
             if strength >= 120:
                 # 투자대상 추가
-                self._add_to_monitoring(code, stgprice, time_str, f"급등주 (점수: {score}, 체결강도: {strength:.0f})")
-                return True
+                logging.info(f"✅ [급등주] {stock_name}({code}): 투자대상 추가 시작...")
+                try:
+                    self._add_to_monitoring(code, stgprice, time_str, f"급등주 (점수: {score}, 체결강도: {strength:.0f})")
+                    logging.info(f"✅ [급등주] {stock_name}({code}): 투자대상 추가 완료!")
+                    return True
+                except Exception as ex:
+                    logging.error(f"❌ [급등주] {stock_name}({code}): 투자대상 추가 실패: {ex}")
+                    self.trader.daydata.monitor_stop(code)
+                    self.trader.tickdata.monitor_stop(code)
+                    self.trader.mindata.monitor_stop(code)
+                    return False
             else:
                 logging.info(f"❌ [급등주] {stock_name}({code}): 체결강도 부족 (현재: {strength:.0f}, 최소: 120)")
                 self.trader.daydata.monitor_stop(code)
@@ -1304,22 +1404,62 @@ class CpStrategy:
             return False
 
     def _verify_with_timeout(self, func, code, timeout=10.0):
-        """검증 (메인 스레드에서 직접 실행)"""
-        try:
-            # 메인 스레드에서 직접 실행
-            return func(code)
-        except Exception as ex:
-            logging.warning(f"{code}: 검증 실패 - {ex}")
-            return (False, 0, str(ex))
+        """검증 (타임아웃 포함)"""
+        import threading
+        import time
+        
+        result = [None]
+        exception = [None]
+        
+        def target():
+            try:
+                result[0] = func(code)
+            except Exception as ex:
+                exception[0] = ex
+        
+        thread = threading.Thread(target=target)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            logging.warning(f"{code}: 검증 타임아웃 ({timeout}초)")
+            return (False, 0, f"타임아웃 ({timeout}초)")
+        
+        if exception[0]:
+            logging.warning(f"{code}: 검증 실패 - {exception[0]}")
+            return (False, 0, str(exception[0]))
+        
+        return result[0]
 
     def _load_with_timeout(self, func, code, timeout=30.0):
-        """로드 (메인 스레드에서 직접 실행)"""
-        try:
-            # 메인 스레드에서 직접 실행
-            return func(code)
-        except Exception as ex:
-            logging.warning(f"{code}: 로드 실패 - {ex}")
+        """로드 (타임아웃 포함)"""
+        import threading
+        import time
+        
+        result = [None]
+        exception = [None]
+        
+        def target():
+            try:
+                result[0] = func(code)
+            except Exception as ex:
+                exception[0] = ex
+        
+        thread = threading.Thread(target=target)
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout)
+        
+        if thread.is_alive():
+            logging.warning(f"{code}: 로드 타임아웃 ({timeout}초)")
             return False
+        
+        if exception[0]:
+            logging.warning(f"{code}: 로드 실패 - {exception[0]}")
+            return False
+        
+        return result[0]
 
     def _add_to_monitoring(self, code, price, time_str, reason):
         """투자대상 종목 추가"""
@@ -2277,12 +2417,10 @@ class CpData(QObject):
             self.buy_volumes[code] = deque(maxlen=10)
             self.sell_volumes[code] = deque(maxlen=10)
 
-            # ===== ✅ 영업일 데이터 로드 시도 =====
+            # ===== ✅ 모든 차트 타입: 충분한 과거 데이터 로드 =====
             success = self.update_chart_data_from_market_open(code)
-            
             if not success:
-                # ===== ✅ 실패 시 개수 기준으로 폴백 =====
-                logging.warning(f"{code}: 영업일 데이터 로드 실패, 개수 기준 폴백")
+                logging.warning(f"{code}: 과거 데이터 로드 실패, 일반 개수 기준 폴백")
                 self.update_chart_data(code, self.interval, self.number)
                 self.is_initial_loaded[code] = False
             else:
@@ -2508,9 +2646,11 @@ class CpData(QObject):
                                     self.stockdata[code][key].extend(filtered_data)
                             
                             if self.chart_type == 'T':
-                                max_length = 400
+                                max_length = 600
                             elif self.chart_type == 'm':
                                 max_length = 150
+                            elif self.chart_type == 'D':
+                                max_length = 80
                             else:
                                 max_length = 50
                             
@@ -2533,18 +2673,82 @@ class CpData(QObject):
             return False
 
     def update_chart_data_from_market_open(self, code):
-        """장 시작부터 전체 로딩 (영업일 사용)
+        """충분한 과거 데이터 로드 (현시점 기준으로 지정된 개수만큼)
         
-        ✅ 개선: 이미 찾은 영업일(self.todayDate) 사용
+        ✅ 개선: 모든 차트 타입(틱봉/분봉/일봉)에서 과거 데이터 포함하여 충분한 데이터 확보
         """
         try:
             self.is_updating[code] = True
             
-            # ===== ✅ 이미 찾은 영업일 사용 (중복 검색 제거) =====
+            # ===== ✅ 개수 기준으로 충분한 데이터 로드 =====
+            chart_type_name = {'T': '틱봉', 'm': '분봉', 'D': '일봉'}.get(self.chart_type, self.chart_type)
+            logging.debug(f"{code}: {self.number}개 {chart_type_name} 데이터 로드 시도")
+            
+            # 개수 기준으로 데이터 조회 (과거 데이터 포함)
+            new_data = self._request_chart_data(
+                code,
+                request_type='count',
+                count=self.number
+            )
+            
+            if new_data is None:
+                logging.warning(f"{code}: API 조회 실패")
+                self.is_updating[code] = False
+                return False
+            
+            # 데이터 확인
+            if len(new_data.get('D', [])) == 0:
+                logging.warning(f"{code}: 데이터 없음")
+                self.is_updating[code] = False
+                return False
+            
+            # 데이터 적용
+            with self.stockdata_lock:
+                if code not in self.stockdata:
+                    logging.debug(f"{code}: stockdata에 없음, 중단")
+                    self.is_updating[code] = False
+                    return False
+                
+                for key in new_data:
+                    self.stockdata[code][key] = new_data[key]
+            
+            data_count = len(new_data['D'])
+            chart_type_name = {'T': '틱봉', 'm': '분봉', 'D': '일봉'}.get(self.chart_type, self.chart_type)
+            logging.debug(
+                f"✅ {code}: {data_count}개 {chart_type_name} 데이터 로드 완료 "
+                f"(요청: {self.number}개)"
+            )
+            
+            # ===== ✅ 데이터 충분성 확인 =====
+            if data_count < self.number * 0.8:  # 80% 미만이면 경고
+                logging.warning(
+                    f"⚠️ {code}: {chart_type_name} 데이터 부족 "
+                    f"(로드: {data_count}개, 요청: {self.number}개, 부족률: {(1-data_count/self.number)*100:.1f}%)"
+                )
+            else:
+                logging.info(
+                    f"✅ {code}: {chart_type_name} 데이터 충분 "
+                    f"(로드: {data_count}개, 요청: {self.number}개)"
+                )
+            
+            self.is_updating[code] = False
+            return True
+            
+        except Exception as ex:
+            logging.error(f"update_chart_data_from_market_open({code}): {ex}\n{traceback.format_exc()}")
+            self.is_updating[code] = False
+            return False
+
+    def update_chart_data_from_today_only(self, code):
+        """일봉용: 당일 영업일 데이터만 로드"""
+        try:
+            self.is_updating[code] = True
+            
+            # ===== ✅ 일봉은 당일 영업일만 로드 =====
             date_str = str(self.todayDate)
             formatted_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
             
-            logging.debug(f"{code}: {formatted_date} 데이터 로드 시도")
+            logging.debug(f"{code}: {formatted_date} 일봉 데이터 로드 시도")
             
             # 데이터 조회
             new_data = self._request_chart_data(
@@ -2555,13 +2759,13 @@ class CpData(QObject):
             )
             
             if new_data is None:
-                logging.warning(f"{code}: API 조회 실패")
+                logging.warning(f"{code}: 일봉 API 조회 실패")
                 self.is_updating[code] = False
                 return False
             
             # 데이터 확인
             if len(new_data.get('D', [])) == 0:
-                logging.warning(f"{code}: {formatted_date} 데이터 없음")
+                logging.warning(f"{code}: {formatted_date} 일봉 데이터 없음")
                 self.is_updating[code] = False
                 return False
             
@@ -2576,15 +2780,15 @@ class CpData(QObject):
                     self.stockdata[code][key] = new_data[key]
             
             logging.debug(
-                f"✅ {code}: {formatted_date} 데이터 로드 완료 "
-                f"({len(new_data['D'])}개, {self.chart_type})"
+                f"✅ {code}: {formatted_date} 일봉 데이터 로드 완료 "
+                f"({len(new_data['D'])}개)"
             )
             
             self.is_updating[code] = False
             return True
             
         except Exception as ex:
-            logging.error(f"update_chart_data_from_market_open({code}): {ex}\n{traceback.format_exc()}")
+            logging.error(f"update_chart_data_from_today_only({code}): {ex}\n{traceback.format_exc()}")
             self.is_updating[code] = False
             return False
         
@@ -2990,6 +3194,38 @@ class CpData(QObject):
                             
                             self.last_indicator_update[code] = current_time
                 
+                elif self.chart_type == 'D':
+                    # 일봉은 당일 데이터만 업데이트 (실시간 OHLC 업데이트)
+                    if code in self.stockdata and len(self.stockdata[code]['T']) > 0:
+                        # 현재 봉의 OHLC 업데이트
+                        self.stockdata[code]['C'][-1] = cur
+                        if self.stockdata[code]['H'][-1] < cur:
+                            self.stockdata[code]['H'][-1] = cur
+                        if self.stockdata[code]['L'][-1] > cur:
+                            self.stockdata[code]['L'][-1] = cur
+                        self.stockdata[code]['V'][-1] += vol
+                        
+                        # 스냅샷 업데이트
+                        self._update_snapshot(code)
+                        
+                        # 지표 업데이트 (1초 간격)
+                        last_update = self.last_indicator_update.get(code, 0)
+                        if current_time - last_update >= self.indicator_update_interval:
+                            if code in self.objIndicators:
+                                indicator_types = ["MA", "RSI", "MACD", "STOCH", "ATR", "CCI", "BBANDS", "VWAP",
+                                                 "WILLIAMS_R", "ROC", "OBV", "VOLUME_PROFILE"]
+                                for ind in indicator_types:
+                                    try:
+                                        result = self.objIndicators[code].make_indicator(ind, code, self.stockdata[code])
+                                        if result:
+                                            self.stockdata[code].update(result)
+                                    except Exception as ind_ex:
+                                        logging.debug(f"{code}: {ind} 업데이트 실패: {ind_ex}")
+                                
+                                self._update_snapshot(code)
+                            
+                            self.last_indicator_update[code] = current_time
+                
                 # ✅ 새 봉 완성 시 signal 발생
                 if bar_completed:
                     self.new_bar_completed.emit(code)
@@ -3040,7 +3276,7 @@ class CTrader(QObject):
 
         self.cp_request = CpRequest()
 
-        self.daydata = CpData(1, 'D', 50, self)
+        self.daydata = CpData(1, 'D', 80, self)
         self.mindata = CpData(3, 'm', 150, self)
         self.tickdata = CpData(30, 'T', 600, self)
 
